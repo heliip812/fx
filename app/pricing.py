@@ -1,268 +1,386 @@
-"""Position pricing for the app  **[interim: see the seam note below]**.
+"""The app's **single** pricing route.
 
-`fxgamma/portfolio/risk.py` owns `price_book` / `book_greeks` in the frozen contract
-(section 5) and is being written concurrently.  The Book page must nevertheless price the
-trades it captures, so this module prices one position at a time straight through
-`models.gk` and aggregates with `Greeks.__add__`.
+Every number on every page that is a price, a Greek or an aggregate comes through
+here, and everything here delegates to :mod:`fxgamma.portfolio.risk` -- the frozen
+contract section 5 owner of ``price_book`` / ``book_greeks``.  The interim
+direct-``models.gk`` path this module used to carry while the risk engine was being
+written is **gone**: ``app/`` no longer calls ``gk_greeks`` anywhere, so there is
+exactly one pricing route and one aggregation rule in the application.
 
-**The seam.**  :func:`price_positions` returns the column set the contract gives
-``price_book`` - one row per position, plus ``ccy`` and ``fx_to_report`` and ``*_rep``
-copies of every monetary Greek (amendment v1.1 CG-1) - so when `portfolio.risk` lands
-the call site swaps and the pages do not change.  :func:`fx_rate` mirrors CG-1's rule
-exactly: route through USD, **raise** if a leg is missing, never default to 1.0.
+What this module is allowed to do
+---------------------------------
+1. **Adapt shapes.**  ``price_book`` returns a DataFrame in the library's column
+   names; the blotter and the tables were written against a list of dicts with the
+   app's names.  :func:`price_positions` maps one to the other and adds nothing.
+2. **Degrade.**  ``price_book`` raises (correctly) when a pair has no spot or no
+   surface -- architecture section 7 forbids substituting one.  The app may not show a
+   traceback, so :func:`price_positions` retries pair by pair and renders the pairs it
+   *can* price, marking the rest ``UNPRICED`` with the reason.  It never invents a
+   number to fill the hole.
+3. **Re-export the identities** so no page restates one: ``gamma_pnl_pct`` and
+   ``dhedge_pnl`` from ``portfolio.risk``, the breakeven from ``signals.richness``,
+   the sigma-day from ``portfolio.zones``.
 
-Two identities from requirements section 0 live here, once, and are imported everywhere:
-``gamma_pnl_pct`` and ``breakeven_daily_pct``.  Per trader review W-7 the *distance*
-measure ``sigma_day_move`` annualises on 252 trading days while the *economic* breakeven
-uses 365 calendar days; they are never conflated.
+What this module must never do
+------------------------------
+Sum native-ccy Greeks across pairs (CG-1), or compute a Greek itself.  Aggregation is
+:func:`aggregate`, which is a call to ``risk.book_greeks`` and nothing else.
+
+W-7 bases, stated once and imported everywhere
+----------------------------------------------
+``DISTANCE_BASIS`` = sqrt(252): distance to a level, sigma-days, touch probability.
+``ECONOMICS_BASIS`` = sqrt(365): the daily breakeven and theta.
+Any panel showing either **prints the basis**; the two are never conflated.
 """
 from __future__ import annotations
 
+import logging
 import math
-from dataclasses import dataclass
-from typing import Any, Iterable
+from datetime import datetime
+from typing import Any, Mapping
 
-from fxgamma.conventions import PAIRS, is_expired, pair_spec, year_fraction
-from fxgamma.models.gk import gk_greeks
-from fxgamma.types import Book, Greeks, MarketSnapshot, OptionPosition
+import pandas as pd
 
-MONEY_FIELDS = ("pv", "vega", "theta", "rho_d", "rho_f", "vanna", "volga")
+from fxgamma.conventions import PAIRS, pair_spec
+from fxgamma.models import gk
+from fxgamma.portfolio import risk
+from fxgamma.portfolio.risk import (BASE_CCY_GREEKS, GREEK_COLS, QUOTE_CCY_GREEKS,
+                                    dhedge_pnl, fx_rate, gamma_pnl_pct)
+from fxgamma.portfolio.zones import CALENDAR_DAYS, TRADING_DAYS, sigma_day_pct
+from fxgamma.signals.richness import breakeven_pct, daily_breakeven
+from fxgamma.types import Book, Greeks, MarketSnapshot
 
-__all__ = ["price_positions", "book_greeks", "fx_rate", "gamma_pnl_pct",
-           "breakeven_daily_pct", "sigma_day_move", "PricedRow", "VolPick", "pick_vol"]
+log = logging.getLogger(__name__)
+
+__all__ = ["price_positions", "unattainable_message", "price_frame", "aggregate", "pair_totals", "fx_rate",
+           "gamma_pnl_pct", "dhedge_pnl", "breakeven_daily_pct", "sigma_day_move",
+           "mark_vols", "headline", "days_to_next_mark", "attainable_delta",
+           "DISTANCE_BASIS", "ECONOMICS_BASIS", "MONEY_FIELDS"]
+
+#: W-7 / amendment v1.6: spot travels on trading days
+DISTANCE_BASIS = f"sqrt({TRADING_DAYS:g}) — trading days (distance, sigma-days, touch prob.)"
+#: W-7 / amendment v1.4 ruling 5: theta is paid on calendar days
+ECONOMICS_BASIS = f"sqrt({CALENDAR_DAYS:g}) — calendar days (breakeven, theta)"
+
+MONEY_FIELDS = QUOTE_CCY_GREEKS
 
 
 # ------------------------------------------------------------------ identities
-def gamma_pnl_pct(gamma_1pct: float, spot: float, move_pct: float) -> float:
-    """Gamma P&L in quote ccy for a spot move of ``move_pct`` **percent**.
-
-    ``0.005 * G1 * S * x**2`` (requirements section 0). Written once, used everywhere.
-    """
-    return 0.005 * float(gamma_1pct) * float(spot) * float(move_pct) ** 2
-
-
 def breakeven_daily_pct(gamma_1pct: float, theta: float, spot: float) -> float | None:
-    """Daily breakeven move in **percent**: ``sqrt(|theta| / (0.005*G1*S))``.
+    """Daily breakeven move in percent, or ``None`` when there is not one.
 
-    Economics, so calendar-day based (365).  Returns ``None`` when the book has no
-    gamma or no theta - the honest answer is "—", not 0.
+    Delegates to ``signals.richness.breakeven_pct`` (requirements section 0); the only thing
+    added is the ``nan -> None`` conversion the UI needs so a short-gamma book renders
+    an em dash rather than "nan%".  Economics, therefore ``ECONOMICS_BASIS``.
     """
-    denom = 0.005 * float(gamma_1pct) * float(spot)
-    if not denom or not theta:
+    v = breakeven_pct(theta, gamma_1pct, spot)
+    return None if (v is None or not math.isfinite(v)) else float(v)
+
+
+def sigma_day_move(sigma: float | None) -> float | None:
+    """One sigma-day of spot **distance**, in percent (``DISTANCE_BASIS``)."""
+    if sigma is None or not math.isfinite(float(sigma)) or float(sigma) <= 0:
         return None
-    try:
-        v = math.sqrt(abs(float(theta)) / abs(denom))
-    except (ValueError, ZeroDivisionError):
-        return None
-    return v if math.isfinite(v) else None
+    return sigma_day_pct(float(sigma))
 
 
-def sigma_day_move(sigma: float, *, basis: int = 252) -> float:
-    """One sigma-day of spot **distance**, in percent. W-7: 252, not 365."""
-    return 100.0 * float(sigma) / math.sqrt(basis)
+def days_to_next_mark(asof: datetime) -> float:
+    """Calendar days of theta between now and the next mark (Friday -> Monday = 3).
 
-
-# ------------------------------------------------------------------ fx conversion
-def fx_rate(ccy: str, report_ccy: str, mkt: MarketSnapshot) -> float:
-    """Multiplier from ``ccy`` into ``report_ccy``, routed through USD (CG-1).
-
-    Raises when a leg is missing rather than defaulting to 1.0: a silent 1.0 turns a
-    JPY total into a USD total 150x too large.
+    Trader Q-6: quoting "you pay X today" on a Friday when three days are owed is the
+    recurring error, so the header card names the number of days it charged.
     """
-    ccy, report_ccy = ccy.upper(), report_ccy.upper()
-    if ccy == report_ccy:
-        return 1.0
-    spot = getattr(mkt, "spot", {}) or {}
-
-    def to_usd(c: str) -> float:
-        if c == "USD":
-            return 1.0
-        if f"{c}USD" in spot:
-            return float(spot[f"{c}USD"])
-        if f"USD{c}" in spot:
-            v = float(spot[f"USD{c}"])
-            if not v:
-                raise KeyError(f"USD{c} is zero in this snapshot")
-            return 1.0 / v
-        raise KeyError(f"no USD leg for {c} in this snapshot (need {c}USD or USD{c}); "
-                       "supply it or set a manual spot override")
-
-    return to_usd(ccy) / to_usd(report_ccy)
+    wd = asof.weekday()                     # Mon=0
+    return 3.0 if wd == 4 else 2.0 if wd == 5 else 1.0
 
 
-# ------------------------------------------------------------------ vol selection
-@dataclass(frozen=True)
-class VolPick:
-    vol: float | None
-    source: str          # "mark override" | "surface" | "trade vol" | "unavailable"
-    detail: str = ""
-
-    @property
-    def kind(self) -> str:
-        return {"mark override": "user_override", "surface": "surface",
-                "trade vol": "user_override"}.get(self.source, "unavailable")
-
-
-def pick_vol(pos: OptionPosition, mkt: MarketSnapshot, T: float,
-             marks: dict[str, Any] | None = None) -> VolPick:
-    """Which vol prices this line, and where it came from.
-
-    Order: a per-position mark (CG-2 side table) beats the surface; the surface beats
-    the trade vol; if none exist the row prices to nothing and says so.  It never
-    silently substitutes a flat vol.
-    """
-    mk = (marks or {}).get(pos.id)
-    if mk is not None:
-        return VolPick(float(mk.mark_vol), "mark override",
-                       f"{mk.mark_source}, set {mk.asof:%Y-%m-%d %H:%MZ}"
-                       if getattr(mk, "asof", None) else str(mk.mark_source))
-    surf = (getattr(mkt, "surfaces", {}) or {}).get(pos.pair)
-    if surf is not None and T > 0:
+# ------------------------------------------------------------------ marks (CG-2)
+def mark_vols(marks: Mapping[str, Any] | None) -> dict[str, float]:
+    """``store.marks()`` (``{id: MarkVol}``) -> the ``{id: vol}`` the engine takes."""
+    out: dict[str, float] = {}
+    for pid, mk in (marks or {}).items():
+        v = getattr(mk, "mark_vol", mk)
         try:
-            v = float(surf.vol(pos.strike, T))
-            if math.isfinite(v) and v > 0:
-                return VolPick(v, "surface", f"{pos.pair} surface at K={pos.strike:g}")
-        except Exception as exc:                       # noqa: BLE001
-            return VolPick(None, "unavailable", f"surface.vol failed: {exc}")
-    if pos.trade_vol:
-        return VolPick(float(pos.trade_vol), "trade vol",
-                       "no surface for this pair/tenor; priced at the entry vol")
-    if T <= 0:
-        return VolPick(0.0, "expired", "past the cut: intrinsic only")
-    return VolPick(None, "unavailable", "no surface and no trade vol for this position")
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fv) and fv > 0:
+            out[str(pid)] = fv
+    return out
 
 
-# ------------------------------------------------------------------ rows
-@dataclass
-class PricedRow:
-    id: str
-    kind: str                       # OPTION | SPOT
-    pair: str
-    state: str                      # LIVE | EXPIRED | UNPRICED
-    greeks: Greeks
-    ccy: str
-    fx_to_report: float
-    row: dict[str, Any]
+# ------------------------------------------------------------------ pricing
+def price_frame(book: Book, mkt: MarketSnapshot, *, marks: Mapping[str, Any] | None = None,
+                report_ccy: str = "USD") -> pd.DataFrame:
+    """``risk.price_book`` verbatim.  Raises exactly as the library does."""
+    return risk.price_book(book, mkt, report_ccy=report_ccy, marks=mark_vols(marks))
 
 
-def price_positions(book: Book, mkt: MarketSnapshot, *, marks: dict[str, Any] | None = None,
-                    report_ccy: str = "USD") -> list[dict[str, Any]]:
-    """One row per position with Greeks, in the shape contract section 5 gives ``price_book``.
-
-    Expired options (v1.2 T-3) are priced to intrinsic, flagged ``EXPIRED`` and excluded
-    from the aggregate by :func:`book_greeks`; the delta they hand you is still shown so
-    the inherited spot position is never a surprise.
-    """
-    out: list[dict[str, Any]] = []
-    asof = mkt.asof
+def _unpriced_rows(book: Book, mkt: MarketSnapshot, reason: str,
+                   report_ccy: str) -> list[dict[str, Any]]:
+    """Rows for a pair the engine refused to price. Identity only, never a number."""
+    out = []
     for o in book.options:
         spec = pair_spec(o.pair)
-        S = (mkt.spot or {}).get(o.pair)
-        T = year_fraction(asof, o.expiry, o.cut)
-        expired = is_expired(asof, o.expiry, o.cut)
-        vp = pick_vol(o, mkt, T, marks)
-        rates_ok = spec.quote in mkt.rates and spec.base in mkt.rates
-        state = "EXPIRED" if expired else "LIVE"
-        g = Greeks.zero()
-        if S is None or not rates_ok or (vp.vol is None and not expired):
-            state = "UNPRICED"
-        else:
-            rd, rf = mkt.rd_rf(o.pair, PAIRS)
-            g = gk_greeks(float(S), float(o.strike), max(T, 0.0), rd, rf,
-                          float(vp.vol or 0.0), int(o.cp),
-                          notional_base=abs(float(o.notional_base)),
-                          direction=int(o.direction),
-                          delta_convention=spec.delta_convention)
-        try:
-            fx = fx_rate(spec.quote, report_ccy, mkt)
-        except KeyError:
-            fx = float("nan")
-        prem = float(o.premium_paid)
-        if o.premium_ccy and o.premium_ccy.upper() == spec.base and S:
-            prem = prem * float(o.trade_spot or S)          # premium into quote ccy
-        pnl = (g.pv - prem) if state != "UNPRICED" else float("nan")
-        days = (o.expiry - asof.date()).days
-        row = {
-            "id": o.id, "instrument": "OPTION", "pair": o.pair, "state": state,
-            "structure": (o.tag.split(":")[0] if ":" in (o.tag or "") else ""),
-            "tag": o.tag, "cp": "C" if o.cp > 0 else "P",
-            "dir": "B" if o.direction > 0 else "S",
-            "strike": float(o.strike), "expiry": o.expiry.isoformat(), "cut": o.cut,
-            "days": days, "T": T, "notional_base": float(o.notional_base) * o.direction,
-            "vol": vp.vol, "vol_source": vp.source, "vol_detail": vp.detail,
-            "spot": S, "premium_paid": prem, "pnl_since_trade": pnl,
-            "ccy": spec.quote, "base_ccy": spec.base, "fx_to_report": fx,
-        }
-        row.update({k: getattr(g, k) for k in Greeks._FIELDS})
-        row.update({f"{k}_rep": getattr(g, k) * fx for k in MONEY_FIELDS})
-        row["delta_base_rep"] = g.delta_base * (fx_or_nan(spec.base, report_ccy, mkt))
-        out.append(row)
+        out.append(_blank_row(
+            o.id, "OPTION", o.pair, spec, reason, report_ccy,
+            cp="C" if o.cp > 0 else "P", dir="B" if o.direction > 0 else "S",
+            strike=float(o.strike), expiry=o.expiry.isoformat(), cut=o.cut,
+            days=(o.expiry - mkt.asof.date()).days,
+            notional_base=float(o.notional_base) * o.direction, tag=o.tag,
+            premium_paid=float(o.premium_paid)))
+    for sp in book.spots:
+        spec = pair_spec(sp.pair)
+        out.append(_blank_row(
+            sp.id, "SPOT", sp.pair, spec, reason, report_ccy,
+            dir="B" if sp.notional_base > 0 else "S",
+            notional_base=float(sp.notional_base), tag=sp.tag))
+    return out
 
-    for s in book.spots:
-        spec = pair_spec(s.pair)
-        S = (mkt.spot or {}).get(s.pair)
-        pv = (float(S) - float(s.entry_rate)) * float(s.notional_base) if S else float("nan")
-        g = Greeks(pv=pv if S else 0.0, delta_base=float(s.notional_base),
-                   delta_pct=1.0 if s.notional_base > 0 else -1.0)
-        try:
-            fx = fx_rate(spec.quote, report_ccy, mkt)
-        except KeyError:
-            fx = float("nan")
-        row = {
-            "id": s.id, "instrument": "SPOT", "pair": s.pair,
-            "state": "LIVE" if S else "UNPRICED", "structure": "",
-            "tag": s.tag, "cp": "", "dir": "B" if s.notional_base > 0 else "S",
-            "strike": None, "expiry": "", "cut": "", "days": None, "T": None,
-            "notional_base": float(s.notional_base), "vol": None,
-            "vol_source": "n/a (spot)", "vol_detail": "", "spot": S,
-            "premium_paid": 0.0, "pnl_since_trade": pv,
-            "ccy": spec.quote, "base_ccy": spec.base, "fx_to_report": fx,
-        }
-        row.update({k: getattr(g, k) for k in Greeks._FIELDS})
-        row.update({f"{k}_rep": getattr(g, k) * fx for k in MONEY_FIELDS})
-        row["delta_base_rep"] = g.delta_base * fx_or_nan(spec.base, report_ccy, mkt)
+
+def _blank_row(pid, instrument, pair, spec, reason, report_ccy, **kw) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": pid, "instrument": instrument, "kind": instrument.lower(), "pair": pair,
+        "state": "UNPRICED", "structure": "", "tag": "", "cp": "", "dir": "",
+        "strike": None, "expiry": "", "cut": "", "days": None, "T": None,
+        "notional_base": 0.0, "vol": None, "vol_source": "unpriced",
+        "vol_detail": reason, "spot": None, "premium_paid": 0.0,
+        "pnl_since_trade": float("nan"), "ccy": spec.quote, "base_ccy": spec.base,
+        "report_ccy": report_ccy, "fx_to_report": float("nan"),
+        "fx_base_to_report": float("nan"), "expired": False,
+    }
+    row.update(kw)
+    row.update({c: float("nan") for c in GREEK_COLS})
+    row.update({f"{c}_rep": float("nan") for c in QUOTE_CCY_GREEKS + BASE_CCY_GREEKS})
+    return row
+
+
+_VOL_SOURCE = {"mark": "mark override", "surface": "surface", "expired": "expired",
+               "n/a": "n/a (spot)"}
+
+
+def _rows_from_frame(df: pd.DataFrame, mkt: MarketSnapshot) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in df.to_dict("records"):
+        expired = bool(r.get("expired"))
+        tag = str(r.get("tag") or "")
+        expiry = r.get("expiry")
+        row = dict(r)
+        row.update({
+            "instrument": "OPTION" if r.get("kind") == "option" else "SPOT",
+            "state": "EXPIRED" if expired else "LIVE",
+            "structure": tag.split(":")[0] if ":" in tag else "",
+            "cp": ("C" if int(r.get("cp") or 0) > 0 else "P") if r.get("kind") == "option" else "",
+            "dir": "B" if float(r.get("signed_notional") or 0.0) >= 0 else "S",
+            "days": (None if expiry in (None, "") else
+                     (expiry - mkt.asof.date()).days if hasattr(expiry, "year") else None),
+            "notional_base": float(r.get("signed_notional") or 0.0),
+            "vol_source": _VOL_SOURCE.get(str(r.get("vol_source")), str(r.get("vol_source"))),
+            "vol_detail": "",
+            "expiry": expiry.isoformat() if hasattr(expiry, "isoformat") else (expiry or ""),
+        })
+        if r.get("kind") != "option":
+            row["vol"] = None
         out.append(row)
     return out
 
 
-def fx_or_nan(ccy: str, report_ccy: str, mkt: MarketSnapshot) -> float:
-    try:
-        return fx_rate(ccy, report_ccy, mkt)
-    except KeyError:
-        return float("nan")
+def price_positions(book: Book, mkt: MarketSnapshot, *,
+                    marks: Mapping[str, Any] | None = None,
+                    report_ccy: str = "USD") -> list[dict[str, Any]]:
+    """One row per position, priced by ``risk.price_book``, in the app's row shape.
 
-
-def book_greeks(rows: Iterable[dict[str, Any]], *, pair: str | None = None,
-                include_expired: bool = False) -> Greeks:
-    """Aggregate **within one pair** (native quote ccy).
-
-    Cross-pair aggregation in native currency is forbidden by CG-1, so this refuses to
-    do it: call it per pair and convert, or use the ``*_rep`` columns.
+    Degrades pair by pair: a pair with no spot or no surface comes back ``UNPRICED``
+    with the library's own message in ``vol_detail`` while every other pair prices
+    normally.  Nothing is substituted for the missing input (architecture section 7).
     """
-    total = Greeks.zero()
-    n = 0
-    for r in rows:
-        if pair and r["pair"] != pair:
-            continue
-        if r["state"] == "UNPRICED":
-            continue
-        if r["state"] == "EXPIRED" and not include_expired:
-            continue
-        total = total + Greeks(**{k: float(r.get(k, 0.0) or 0.0)
-                                  for k in Greeks._FIELDS})
-        n += 1
-    return total if n else Greeks.zero()
-
-
-def pair_totals(rows: list[dict[str, Any]], report_ccy: str = "USD"
-                ) -> list[dict[str, Any]]:
-    """Per-pair totals in the pair's own quote ccy, plus the disclosed fx to report."""
-    out = []
-    for p in sorted({r["pair"] for r in rows}):
-        g = book_greeks(rows, pair=p)
-        fx = next((r["fx_to_report"] for r in rows if r["pair"] == p), float("nan"))
-        spec = pair_spec(p)
-        out.append({"pair": p, "ccy": spec.quote, "base_ccy": spec.base,
-                    "fx_to_report": fx, "report_ccy": report_ccy,
-                    **{k: getattr(g, k) for k in Greeks._FIELDS}})
+    if not book.options and not book.spots:
+        return []
+    try:
+        return _rows_from_frame(price_frame(book, mkt, marks=marks,
+                                            report_ccy=report_ccy), mkt)
+    except Exception as exc:                               # noqa: BLE001
+        log.warning("price_book on the whole book failed (%s); pricing pair by pair", exc)
+    out: list[dict[str, Any]] = []
+    for pair in book.pairs():
+        sub = book.filter(pair)
+        try:
+            out += _rows_from_frame(price_frame(sub, mkt, marks=marks,
+                                                report_ccy=report_ccy), mkt)
+        except Exception as exc:                           # noqa: BLE001
+            out += _unpriced_rows(sub, mkt, str(exc)[:300], report_ccy.upper())
     return out
+
+
+# ------------------------------------------------------------------ aggregation (CG-1)
+def aggregate(book: Book, mkt: MarketSnapshot, *, pair: str | None = None,
+              report_ccy: str = "USD", marks: Mapping[str, Any] | None = None,
+              base_as_value: bool = False, include_expired: bool = False,
+              df: pd.DataFrame | None = None) -> Greeks:
+    """The **only** aggregation entry point in ``app/``: ``risk.book_greeks``.
+
+    ``pair`` restricts to one pair; pass ``report_ccy=pair_spec(pair).quote`` to read
+    that pair's totals in its own quote ccy, which is the only currency in which a
+    per-pair card may be shown.  Cross-pair cards must pass the reporting ccy and
+    ``base_as_value=True`` so ``delta_base`` / ``gamma_1pct`` / ``vanna`` come back as
+    report-ccy *values* rather than ``nan`` (CR-2).
+    """
+    sub = book.filter(pair) if pair else book
+    return risk.book_greeks(sub, mkt, report_ccy, marks=mark_vols(marks),
+                            base_as_value=base_as_value,
+                            include_expired=include_expired, df=df)
+
+
+def pair_totals(book: Book, mkt: MarketSnapshot, report_ccy: str = "USD", *,
+                marks: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Per-pair totals in that pair's own quote ccy, plus the disclosed fx rate."""
+    out = []
+    for pair in book.pairs():
+        spec = pair_spec(pair)
+        try:
+            g = aggregate(book, mkt, pair=pair, report_ccy=spec.quote, marks=marks)
+            fx = fx_rate(spec.quote, report_ccy, mkt)
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("pair total for %s failed: %s", pair, exc)
+            continue
+        out.append({"pair": pair, "ccy": spec.quote, "base_ccy": spec.base,
+                    "fx_to_report": fx, "report_ccy": report_ccy.upper(),
+                    **g.as_dict()})
+    return out
+
+
+# ------------------------------------------------------------------ MISS-4 headline
+def headline(book: Book, mkt: MarketSnapshot, pair: str, *,
+             marks: Mapping[str, Any] | None = None,
+             days: float | None = None) -> dict[str, Any]:
+    """The one-line answer for one pair (MISS-4), computed, never constant.
+
+    **Amendment v1.4 ruling 2 is binding here:** theta comes from
+    ``risk.book_greeks`` on this pair's sub-book, in the pair's own quote ccy.  The
+    trader's table said USD 5,800/day for the reference straddle; pricing it gives
+    USD 2,868, and this is the most-read number in the app, so it is priced on every
+    render and never written down.
+
+    Returns a dict; the sentence is ``["text"]``.  ``be_pips`` uses the
+    ``ECONOMICS_BASIS`` (calendar days) because it is a theta question.
+    """
+    spec = pair_spec(pair)
+    S = (mkt.spot or {}).get(pair)
+    d = float(days if days is not None else days_to_next_mark(mkt.asof))
+    g = aggregate(book, mkt, pair=pair, report_ccy=spec.quote, marks=marks)
+    out: dict[str, Any] = {
+        "pair": pair, "ccy": spec.quote, "base_ccy": spec.base, "spot": S,
+        "gamma_1pct": g.gamma_1pct, "theta": g.theta, "pv": g.pv, "vega": g.vega,
+        "delta_base": g.delta_base, "days": d, "greeks": g,
+    }
+    side = ("LONG GAMMA" if g.gamma_1pct > 0 else
+            "SHORT GAMMA" if g.gamma_1pct < 0 else "FLAT GAMMA")
+    out["side"] = side
+    be = be_pips = None
+    try:
+        card = daily_breakeven(book.filter(pair), mkt, pair, days=d,
+                               report_ccy=spec.quote, marks=mark_vols(marks))
+        be = card.get("be_pct")
+        be_pips = card.get("be_pips")
+        out["theta_gamma"] = card.get("theta_gamma_per_day")
+        out["sigma_used"] = card.get("sigma_used")
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("daily_breakeven(%s) unavailable: %s", pair, exc)
+    be = None if (be is None or not math.isfinite(be)) else float(be)
+    be_pips = None if (be_pips is None or not math.isfinite(be_pips)) else float(be_pips)
+    out["be_pct"], out["be_pips"] = be, be_pips
+    pays = (f"pays above {be_pips:,.0f} pips today" if be_pips is not None else
+            "no breakeven (you are short gamma — the move costs you)"
+            if g.gamma_1pct < 0 else "breakeven unavailable")
+    verb = "costs" if g.theta < 0 else "earns"
+    day_word = "today" if d <= 1 else f"over {d:g} calendar days"
+    theta_txt = (f"{verb} {spec.quote} {abs(g.theta) * d:,.0f} {day_word}"
+                 if math.isfinite(g.theta) else "theta unavailable")
+    out["text"] = (f"{side} · {_mm(g.gamma_1pct, spec.base)} per 1% · {pays} · {theta_txt}")
+    return out
+
+
+def _mm(x: float, ccy: str) -> str:
+    if x is None or not math.isfinite(float(x)):
+        return f"{ccy} n/a"
+    v = float(x)
+    return f"{ccy} {v / 1e6:+,.2f}mm" if abs(v) >= 1e5 else f"{ccy} {v:+,.0f}"
+
+
+# ------------------------------------------------------------------ v1.7: delta bounds
+def attainable_delta(pair: str, mkt: MarketSnapshot, T: float | None,
+                     *, cp: int = 1, sigma: float | None = None) -> dict[str, Any]:
+    """AMENDMENT v1.7 — the largest ``|delta|`` any strike can reach here.
+
+    Premium-adjusted call delta is **bounded**: the PM verified 0.8745 at 3M/10% vol
+    but only 0.2764 at 5Y/40% vol, so on USDJPY / USDCHF / USDCAD / USDSEK / USDNOK a
+    "30-delta call" can simply not exist.  Every delta-based strike entry calls this
+    and renders "unattainable at this tenor/vol" -- never a blank, a zero or a ``nan``
+    strike.
+
+    Returns ``{"max": float|None, "convention": str, "sigma": float|None,
+    "bounded": bool, "note": str}``.  ``bounded`` is True only when the maximum can
+    actually bite (a premium-adjusted call); everywhere else it is 1.0-ish and the
+    caller says nothing.
+    """
+    spec = pair_spec(pair)
+    conv = spec.delta_convention
+    out: dict[str, Any] = {"max": None, "convention": conv, "sigma": None,
+                           "bounded": False, "note": ""}
+    if T is None or not math.isfinite(float(T)) or float(T) <= 0:
+        out["note"] = "no tenor: a delta strike needs an expiry"
+        return out
+    S = (mkt.spot or {}).get(pair)
+    if S is None or spec.quote not in mkt.rates or spec.base not in mkt.rates:
+        out["note"] = f"no spot/rates for {pair} in this snapshot"
+        return out
+    sig = sigma
+    if sig is None:
+        surf = (getattr(mkt, "surfaces", {}) or {}).get(pair)
+        if surf is None:
+            out["note"] = f"no surface for {pair}: the bound needs a vol"
+            return out
+        try:
+            sig = float(surf.atm(float(T)))
+        except Exception as exc:                           # noqa: BLE001
+            out["note"] = f"surface.atm failed: {exc}"
+            return out
+    rd, rf = mkt.rd_rf(pair, PAIRS)
+    try:
+        mx = float(gk.max_attainable_delta(float(S), float(T), rd, rf, float(sig),
+                                           int(cp), conv))
+    except Exception as exc:                               # noqa: BLE001
+        out["note"] = f"max_attainable_delta failed: {exc}"
+        return out
+    out["sigma"] = float(sig)
+    out["max"] = mx if math.isfinite(mx) else None
+    out["bounded"] = bool(conv.endswith("_pa") and int(cp) > 0 and math.isfinite(mx)
+                          and mx < 0.999)
+    if out["bounded"]:
+        out["note"] = (f"premium-adjusted call delta on {pair} is bounded at "
+                       f"{mx * 100:.2f}% at T={float(T):.4f}y, vol {sig * 100:.2f}% "
+                       f"({conv} convention). Deltas above that do not exist at this "
+                       "tenor/vol — no strike produces them.")
+    return out
+
+
+def unattainable_message(pair: str, delta: float, cp: int,
+                         info: Mapping[str, Any]) -> str:
+    """The exact words amendment v1.7 requires when a requested delta cannot exist."""
+    mx = info.get("max")
+    what = f"{abs(float(delta)) * 100:g}-delta {'call' if cp > 0 else 'put'} on {pair}"
+    if mx is None:
+        return f"{what}: strike unavailable — {info.get('note') or 'no bound computable'}"
+    return (f"{what}: UNATTAINABLE AT THIS TENOR/VOL. The premium-adjusted maximum is "
+            f"{float(mx) * 100:.2f}% delta ({info.get('convention')} convention, vol "
+            f"{float(info.get('sigma') or 0) * 100:.2f}%). No strike produces the delta "
+            "you asked for — enter a lower delta or an absolute strike.")
+
+
+# ------------------------------------------------------------------ removed API
+def book_greeks(*_a: Any, **_kw: Any) -> Greeks:                # pragma: no cover
+    """Removed.  ``app`` aggregates through :func:`aggregate` -> ``risk.book_greeks``."""
+    raise NotImplementedError(
+        "app.pricing.book_greeks was the interim aggregator and is gone. Call "
+        "app.pricing.aggregate(book, mkt, pair=..., report_ccy=...), which delegates "
+        "to fxgamma.portfolio.risk.book_greeks (amendment v1.1 CG-1).")

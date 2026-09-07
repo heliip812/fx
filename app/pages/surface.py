@@ -16,15 +16,16 @@ get" twenty times a day.
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 import dash
 import numpy as np
 from dash import Input, Output, callback, dcc, html
 
 from fxgamma.conventions import PAIRS, TENORS, pair_spec, tenor_years
-from fxgamma.models.gk import gk_greeks
 from fxgamma.models.surface import build_surface
 from fxgamma.store import parse_strike
+from fxgamma.types import Book, OptionPosition
 
 from .. import analytics as A
 from ..components.badges import (provenance_badge, surface_status, surface_status_badge,
@@ -34,7 +35,8 @@ from ..components.charts import figure, spot_line
 from ..components.fmt import (EM_DASH, fmt_mm, fmt_money, fmt_spot, fmt_vol,
                               fmt_vol_pts, greek_unit)
 from ..components.tables import col, data_table
-from ..pricing import breakeven_daily_pct, sigma_day_move
+from ..pricing import (DISTANCE_BASIS, aggregate, breakeven_daily_pct,
+                       price_positions, sigma_day_move)
 from ..state import ALL_PAIRS, get_session
 from ..theme import ACCENT, DIVERGING, NEG, SERIES, WARN, empty_figure
 
@@ -383,12 +385,28 @@ def _whatif(strike_text, tenor, cp, notional_text, pair, _token):
         surf = snap.surfaces.get(pair)
         if surf is None:
             return note(f"no surface for {pair}; a price cannot be quoted.", tone="warn")
-        sig = float(surf.vol(res.strike, T))
-        rd, rf = snap.rd_rf(pair, PAIRS)
-        g = gk_greeks(S, res.strike, T, rd, rf, sig, int(cp or 1), notional_base=N,
-                      direction=1, delta_convention=spec.delta_convention)
+        # ONE pricing route (see app/pricing): the what-if ticket prices a one-line
+        # throwaway Book through `portfolio.risk.price_book`, exactly as the blotter,
+        # the Risk page and the P&L page do.  A pre-trade number and a booked number
+        # can no longer be produced by two different code paths, and the vol, the day
+        # count and the delta convention are whatever the *book* would have used.
+        expiry = (snap.asof + timedelta(days=max(round(T * 365.0), 1))).date()
+        probe = Book([OptionPosition(id="whatif", pair=pair, cp=int(cp or 1),
+                                     strike=float(res.strike), expiry=expiry,
+                                     notional_base=N, direction=1,
+                                     cut=spec.cut)], [])
+        rows = price_positions(probe, snap, report_ccy=spec.quote)
+        if not rows or rows[0]["state"] == "UNPRICED":
+            return note(f"{pair} could not be priced: "
+                        f"{rows[0]['vol_detail'] if rows else 'no row'}", tone="warn")
+        r0 = rows[0]
+        g = aggregate(probe, snap, pair=pair, report_ccy=spec.quote)
+        sig, T = float(r0["vol"]), float(r0["T"])
         pips = g.pv / (N * spec.pip)
+        # premium as % of the BASE notional: an amount of base ccy, converted at spot
         pct_base = g.pv / (N * S) * 100
+        # premium as % of the QUOTE notional, which is N_base x K -> at the STRIKE
+        pct_quote = g.pv / (N * float(res.strike)) * 100
         be = breakeven_daily_pct(g.gamma_1pct, g.theta, S)
         status, _ = surface_status(snap.meta, pair)
         return html.Div([
@@ -397,16 +415,20 @@ def _whatif(strike_text, tenor, cp, notional_text, pair, _token):
                        unit=res.detail or "as typed",
                        sub=(f"delta {res.delta * 100:+.1f}% ({res.convention})"
                             if res.delta is not None else "delta unavailable")),
-                metric("vol used", fmt_vol(sig), unit=f"{status} surface at K, T={T:.4f}y"),
+                metric("vol used", fmt_vol(sig),
+                       unit=f"{status} surface at K, T={T:.4f}y (expiry {expiry} "
+                            f"{spec.cut}) — priced through portfolio.risk.price_book, "
+                            "the same route as the blotter"),
                 metric("premium", fmt_money(g.pv, spec.quote),
                        unit="all four units, always (W-12)",
-                       sub=f"{pips:,.1f} pips · {pct_base:.3f}% of base notional · "
-                           f"{g.pv / (N * S) * 100:.3f}% of quote notional"),
+                       sub=f"{pips:,.1f} pips · {pct_base:.3f}% of base notional "
+                           f"(at spot) · {pct_quote:.3f}% of quote notional (at the "
+                           f"strike — the two differ by S/K)"),
                 metric("daily breakeven", EM_DASH if be is None else f"{be:.3f}%",
                        unit="sqrt(|theta| / (0.005·G1·S)), calendar-day basis",
                        sub=(EM_DASH if be is None else
                             f"{be * S / spec.pip / 100:,.1f} pips · "
-                            f"{be / sigma_day_move(sig):.2f} sigma-days (sqrt 252)")),
+                            f"{be / sigma_day_move(sig):.2f} sigma-days — {DISTANCE_BASIS}")),
             ], cols="repeat(auto-fit, minmax(230px, 1fr))"),
             metric_row([
                 metric("delta", fmt_mm(g.delta_base, spec.base),

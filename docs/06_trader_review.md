@@ -473,3 +473,618 @@ Ranked by what I would notice absent on day one.
 | **MISS-13** | **Position-level P&L since *yesterday*, not only since trade.** | REQ-032 gives `PV − premium_paid` (P&L since inception). The daily question is "what did this line do today". | Acceptance criterion on REQ-032. |
 | **MISS-14** | **A stated policy for options on crosses.** NG-11 says v1 prices crosses off their own quoted surface "where available, else flags as unsupported". No free source quotes EURJPY/EURGBP/EURCHF vol, so in practice **every cross is unsupported** — yet `conventions.PAIRS` ships all three and the demo book concept implies they work. | Either drop crosses from v1, or build them from the vol triangle and badge them `DERIVED` with the correlation assumption printed. Silently shipping unpriceable pairs in `PAIRS` is worse than either. | PM decision. |
 
+
+---
+---
+
+# Part II — the sections lost to the interruption, plus the second pass on the built app
+
+**Written:** 2026-09-07, after the infrastructure failure that truncated Part I at §3c.
+**Reads against:** `01_architecture.md` AMENDMENTS v1.1–v1.7, `02_requirements.md` rev 3,
+`05_test_report.md`, and the running app (`run.py --port 8077`, synthetic provider, demo book).
+
+**Numbering note before anyone goes hunting.** The `§4.1`, `§4.6`, `§4.7`, `§5.2`, `§5.4` and
+`§6.3` references in Part I are cross-references to **`02_requirements.md`**, not to this
+document. The one exception is `§5.3` in §1.5, which is a typo: those two defects (the REQ-045
+pin formula and `year_fraction`) are **W-1 and W-2 in §3a** and always were. The sections Part I
+genuinely promised and never delivered are **§4** (the screens), **§7** (the Lab), **§8** (the
+contract change requests CR-1…CR-8) and **§9** (the questions for the real user). All four are
+below, followed by **§10**, the second pass on the app as built, and **§11**, the report to the PM.
+
+---
+
+## 3d. Amendment v1.4 checked — the PM is right and I was wrong
+
+I have re-derived it rather than taken it on trust, and the correction stands. For EUR 10mm per
+leg, S = 1.084, σ = 7.05%, T = 1/12:
+
+- Γ per unit = `n(d₁)/(S·σ√T)` = `0.3989/(1.084 × 0.02035)` = 18.08, so
+  Γ₁ per leg = `Γ·S/100 × N` = EUR 1.96mm, **both legs EUR 3.92mm**. The priced 3.914mm is right
+  and my 3.95mm was right.
+- Cash gamma `Γ·S²` = `Γ₁·S·100` = USD 4.243e8. Gamma-theta = `−0.5·Γ·S²·σ²/365`
+  = `−0.5 × 4.243e8 × 0.004970 / 365` = **USD −2,889/day**, which is the priced −2,868 once the
+  rate terms are added back. **USD 5,800 was roughly twice the truth.**
+- Friday→Monday is therefore ~USD 8,600, not 17,400. Withdraw 17,400 wherever it appears.
+
+The diagnosis is also right: I quoted Γ₁ for both legs and then, separately, doubled a
+single-leg theta. It is the same class of error as REQ-046's factor of 100 and my own W-7 —
+a quantity that is already aggregated, aggregated again. **I have no disagreement.** Ruling 2
+(the header card prices theta from `book_greeks`, never from a constant) is the right structural
+response, and ruling 3 (adopt the trade as a golden fixture that cross-checks Γ₁, θ and BE
+against each other) is the thing that would have caught me. It is now
+`tests/test_golden_reference_trade.py` and it is the most valuable test in the suite.
+
+One correction *to* the correction, which matters for §4.3. Ruling 3's fixture and my §2 table
+both compute the breakeven against **total** theta. On a straddle at rd 4% / rf 2% the call and
+put rate terms very nearly cancel, so the identity `BE = σ/√365` survives to 0.3% and the
+fixture passes. It does **not** cancel on a single option or on anything skewed: my W-15 stands
+and the breakeven must be struck against the **gamma-theta component only**. `signals.richness`
+has this right already (`theta_mode="gamma"`); §10 is where I found the app not printing it.
+
+---
+
+## 4. The two screens
+
+Most dashboards fail by showing everything, and the failure mode is specific: a screen that
+shows everything makes me *derive* the answer, and derivation at 07:05 with coffee in one hand
+is where errors come from. Below are the only two screens I would actually keep open. They have
+different jobs and therefore different designs, and neither of them is a superset of the other.
+
+### 4.1 What the morning screen exists to answer
+
+Three questions, in this order, in the first thirty seconds:
+
+1. **Am I long or short gamma, in what size, per pair?** — the sign of everything else I do today.
+2. **What does today cost me, and what move pays for it?** — the theta bill and the breakeven.
+3. **Did anything gap, expire or get added while I was asleep?** — the overnight diff.
+
+Everything else on the screen is evidence for one of those three. If a panel cannot be traced to
+one of them it belongs on another page. Note that "is gamma cheap or expensive" is **not** on
+that list: it is the 07:15 question, not the 07:00 one, and it belongs on the Market Monitor.
+
+### 4.2 The morning screen — exact layout
+
+One 1440-wide laptop screen, no scrolling for rows 0–2. Rows 3–5 may scroll.
+
+**Row 0 — the strip that is on every page, not just this one (height ~28px).**
+
+| Field | Format | Why |
+|---|---|---|
+| snapshot id + `asof` | `S-0912 · 07:03:41 BST` | REQ-001, one stamped snapshot |
+| spot age, per G3 | `EUR 12s · GBP 12s · JPY 12s` | with 15-min-delayed free data (R-2) this is the first thing I check |
+| spot source | `live` / `cached` / `synthetic` / `override`, as a **word**, coloured | never colour alone |
+| mark status, per pair | `EURUSD MARK 07:01 · GBPUSD MARK 07:01 · USDJPY INDICATIVE` | I must never wonder whether I am looking at my curve or an ETF's |
+| next cut | `NY10 in 2h 57m` and, if I hold JPY, `TKY15 in 6h 12m` | Q-9; suppressed for cuts where I hold nothing |
+| book | `6 opt / 1 spot` | catches a failed load silently returning an empty book |
+
+**Row 1 — the answer line. One row per pair with a live position. This is the screen.**
+
+Fixed-width, one line each, no wrapping, no cards, no icons:
+
+```
+EURUSD  LONG GAMMA   EUR +3.91mm /1%   BE 40p (0.369%)   1σ-day 48p   θ→Mon  USD  −8,604 (3d)   Δ  EUR +2.41mm
+GBPUSD  SHORT GAMMA  GBP −3.59mm /1%   BE 63p (0.467%)   1σ-day 53p   θ→Mon  USD +15,753 (3d)   Δ  GBP −0.01mm
+USDJPY  LONG GAMMA   USD +0.31mm /1%   BE 81p (0.550%)   1σ-day 93p   θ→Mon  JPY +620,382 (3d)  Δ  USD +10.99mm
+```
+
+Field by field, with the units that must be printed and the ones that must not be inferred:
+
+| Field | Unit, printed | Rule |
+|---|---|---|
+| side | the words `LONG GAMMA` / `SHORT GAMMA` / `FLAT` | never a `+`/`−` alone, never a colour alone |
+| Γ₁ | **base ccy mm per +1% spot**, signed, with the ccy code | `EUR +3.91mm /1%`. `/1%` is part of the number, not a header |
+| BE | **pips first, percent in brackets** | pips is what I trade in; the percent is what compares across pairs |
+| 1σ-day | **pips**, on **√252** | printed adjacent to BE precisely because the two bases differ (W-7). If BE > 1σ-day I am paying more than a normal day delivers |
+| θ→next mark | signed money in the **pair's quote ccy**, with the **day count in brackets** | Friday reads `(3d)`. Sign in the number, verb in the tooltip, never `\|θ\|` |
+| Δ | **base ccy mm**, on my **hedge convention**, with the convention named on hover and the pair-convention delta one keystroke away | Q-4 |
+
+Sign discipline, because this is where the app is currently wrong (§10.3, B-2). Four cases, four
+sentences, no shared template:
+
+- long gamma, pay theta → `BE 40p — above 40 pips today you make money`
+- short gamma, collect theta → `BE 63p — you keep the theta below 63 pips; above it you pay`
+- long gamma, collect theta → `BE 81p vs gamma-theta; you also collect JPY 206,794/day of carry — no net breakeven`
+- short gamma, pay theta → `CHECK THE MARK — short gamma and paying theta should not happen on a vanilla book`
+
+**Row 2 — where the gamma is (this is MISS-3 and it is not optional).**
+Per pair, two small horizontal bars, numbers on the bars, no legend:
+
+```
+EURUSD  gamma by expiry:  today —   tomorrow —   this week EUR 3.91mm   next week —   beyond —
+        vega by tenor:    ON —  1W —  2W —  1M USD 26.4k  2M —  3M —  6M —  1Y —
+```
+
+A gamma book's defining question is *how much of my gamma dies this week*. A single aggregate
+gamma number and a single aggregate vega number cannot answer it, and adding ON vega to 1Y vega
+is a parallel-shift assumption I did not make.
+
+**Row 3 — the overnight diff (MISS-8).** Since the last stamped EOD mark, per pair:
+spot then → now in **pips and percent**; ATM 1M then → now in **vol points**; positions that
+**expired overnight and the spot delta I inherited from them, as an action line**; positions
+added; and a first-cut P&L estimate split delta / gamma / theta / vega, marked `ESTIMATE` until
+the full attribution runs. The elapsed period is printed — `17:00 NY → 07:03 LON = 14h 03m` —
+and theta is charged over *that*, not over a day (W-14).
+
+**Row 4 — one small ladder per pair, ±2%, 30 rows.** Spot centred and highlighted. Columns:
+spot level, Δ at that level, cumulative gamma P&L from here, and a marker at the next hedge
+trigger above and below. This is a *preview* of the fast-market screen, not a replacement:
+it exists so I know where today's first hedge is before spot moves.
+
+**Row 5 — today.** Events in my clock with the currency and importance; cuts today with the
+notional expiring at each; and the residual-check line from Q-10:
+`yesterday published PV USD 1,284,551 · recomputed now 1,284,551 · diff 0.00`.
+
+### 4.3 The top-left number, and why it is that one
+
+**Top-left is the signed Γ₁ of the pair I trade most, in base-ccy millions per +1% spot, with
+the word LONG or SHORT next to it.**
+
+Not PV: PV is the score of decisions I already made and it changes nothing I do today. Not
+theta: theta is a *consequence* of gamma, and putting a consequence above its cause is how you
+end up managing the symptom. Not delta: delta is a task, not a state — it is what I do about
+gamma, and it is stale seconds after I read it. Not "gamma cheap or expensive": that is a
+*trade* question and it belongs on the Market Monitor at 07:15, after I know what I already own.
+
+Γ₁ is the only number on the screen whose **sign changes the meaning of every other number**.
+Read it first and the rest of the screen interprets itself: with long gamma the breakeven is a
+target and the theta is a cost; with short gamma the breakeven is a stop and the theta is
+income. Read anything else first and you have to come back.
+
+Two constraints on it. It is **per pair**, never a book total — I hedge per pair and a netted
+G3 gamma number is an artefact of the reporting currency, not a position. And it is **priced on
+every render from `book_greeks`**, never carried, never cached, never written down (amendment
+v1.4 ruling 2 — that ruling exists because of my own arithmetic).
+
+### 4.4 The fast-market screen
+
+Different job. When spot is doing 30 pips a minute I am not asking whether gamma is cheap; I am
+asking *what am I now, what do I do, at what level, in what size*. Nothing that takes a click,
+nothing that re-fits a surface, nothing that needs me to read a legend.
+
+**One pair. Full screen. No cross-pair anything.**
+
+| Region | Content | Rule |
+|---|---|---|
+| Top left, large | **Spot**, with **age in seconds** and source word beside it; below it the **manual spot box**, focused by one key | With delayed data the manual box is the *primary* input, not an override. If the feed is >60s old the whole spot block turns amber and states the age in words |
+| Under it | **Δ at the spot in the box**, in base mm, plus the same in quote-ccy equivalent and in P&L-per-pip | MISS-10. Three readings of one number, always together |
+| Centre, full height | **The ladder as a vertical price strip**, spot pinned to the vertical centre, ~40 rows at pip granularity that matches the pair | A ladder, not a heat map. In a fast market I read down a column; I do not read a 21×13 matrix |
+| Ladder columns | level · Δ at level · cumulative gamma P&L from here · **hedge trigger marker** · **my strikes** (size, expiry, cut) · **expiry chatter notionals** (MISS-6) | Everything I need to place an order sits on one row |
+| Right rail | **The instruction**: `SELL EUR 2.0mm at 1.1690` and `BUY EUR 2.0mm at 1.1610` — a side, a size and a level, never a percentage | A band expressed as "15% of gross notional" is not an order. Convert it for me |
+| Right rail, below | cost of hedging now vs waiting for the band, in **pips and money**, from the per-pair cost table | J4 |
+| Bottom strip | **Cut countdown**, seconds inside the last 10 minutes, and the two pin numbers per strike: **Δ if above / Δ if below**, plus the jump | W-1 as ruled in v1.6 |
+| Nowhere on this screen | theta, vega, vanna, volga, PV, richness, cones, the surface, the event calendar | They are all true and none of them changes what I do in the next 90 seconds |
+
+Three behavioural rules that matter more than the layout:
+
+1. **Every number recomputes from a typed spot in under 200ms.** If I type 1.1720 and wait, the
+   screen is useless. This is the one place the latency budget is a *feature*, not an NFR.
+2. **The sticky convention is chosen once and pinned**, with the difference between sticky-strike
+   and sticky-delta delta shown once, in base mm, at the top. The engine measures a 4.1% gap on
+   the reference book (v1.6); that is a real mis-size and I want to see it, but I do not want a
+   toggle I might knock in a fast market.
+3. **Nothing on this screen may be `INDICATIVE` without saying so on the instruction itself.**
+   If the pair is not marked, the right rail reads `NO MARK — instruction suppressed` and shows
+   the delta anyway. Delta off an ETF surface is still roughly right; a *hedge size* off one is
+   a decision I did not make.
+
+### 4.5 What is deliberately on neither screen
+
+The 3-D surface, the vol cone, the RV–IV heat strip, the scenario matrix, the HHI concentration
+table, the regime tag, implied correlation, listed open interest, five RV estimators, the equity
+curve. Every one of them is worth having. None of them belongs on a screen whose job is measured
+in seconds. They live on pages 1, 2, 3 and 7, and I open those deliberately.
+
+### 4.6 The two keys that are Musts
+
+Part I demoted REQ-005 (keyboard navigation) to a Could with one exception, and this is it:
+**`r` restamps the snapshot** and **`s` focuses the manual spot box**. Both are one keystroke
+because in a fast market a mouse trip to a text field is the difference between hedging at 1.1690
+and hedging at 1.1710. Everything else in REQ-005 can go.
+
+---
+
+## 7. The Lab: why an unconditional Sharpe is a number about the sample
+
+Part I promised this at §3b and never wrote it. Short, because the point is simple.
+
+A delta-hedged gamma strategy backtested over 2021–2026 spans one of the largest realised-vol
+regime shifts in G10 history. A single Sharpe over that window tells me about the window, not
+about the rule. Four demands, all cheap:
+
+1. **Bucket everything (REQ-065, which is why I promoted it to Must).** Report the equity curve
+   and the stats *conditional* on: implied-vol tercile at entry, realised/implied ratio at entry,
+   event days vs non-event days, and calendar year. A rule that makes all its money in the top
+   vol tercile is a rule I size differently, not a rule I reject.
+2. **The decomposition is the audit, not a nice-to-have (REQ-064).** `Σ (gamma P&L + theta +
+   hedge slippage + cost) = equity curve`, printed, with a residual. If that does not close, the
+   engine is wrong and the Sharpe is decoration. This is the same discipline as REQ-052 on the
+   P&L page and it should share the helper.
+3. **Costs per pair, or the net curve is fiction (REQ-063, W-13).** A single global `cost_bp`
+   makes USDNOK look like EURUSD. v1.6 moved this to `zones.COST_BP` — good; the Lab must
+   *display* the table it used, per pair, in pips, on the results page.
+4. **Say how much history is actually behind it (C-6).** ETF chains give today's smile and no
+   past. A hedge-frequency sweep run on 11 days of self-collected surface history is not a sweep;
+   it is a plot. Print the effective sample size next to every statistic, and grey anything
+   computed on fewer than 60 observations rather than printing a confident number.
+
+And one thing the sweep must output in the units I trade: the optimal band in **millions and
+pips per pair**, not as a percentage of notional. A band of "15%" is a research output; "hedge
+EURUSD in 2mm clips every 35 pips" is a rule I can follow.
+
+---
+
+## 8. Contract change requests CR-1 … CR-8 — register and current status
+
+Referenced throughout Part I, never tabulated. Status as of amendments v1.1–v1.7.
+
+| CR | Where | Ask | Status |
+|---|---|---|---|
+| **CR-1** | `types.HedgeRule` | `band_pct=0.25` documented as "% of notional" is ~60× too tight; `cost_bp` must be per pair | **RESOLVED (v1.6).** Ruled a *fraction*, not a percent — 25%, which is the intent and is inside the working range. `cost_bp` moved to `zones.COST_BP` per pair with a per-rule override. Correct on both counts. The actual band stays Q-2 for the real user (§9). |
+| **CR-2** | `conventions` / `gk` | derive the delta convention per position from `premium_ccy`; make it tenor-dependent (spot delta to 1Y, forward beyond); bracket `strike_from_delta` above the pa maximum rather than clamping | **PART DONE.** The pa non-monotonicity is fixed and hardened (v1.7: the `erf` underflow root cause, `max_attainable_delta`, the strict peak comparison). The **per-position derivation from `premium_ccy` is still open**, and the tenor-dependence is moot only if 2Y is dropped from `TENORS` — which has not happened. |
+| **CR-3** | data / UI | let the user enter **forward points** per pair per tenor in the same grid as the vol quotes; derive `rd − rf` from them, fall back to the flat rate, badged | **OPEN.** Referred by the BA, not ruled. REQ-068(f) reserves the cell; the built mark grid has ATM/RR/BF only (§10.5). Still the cheapest fix for R-9/NG-6 in the project. |
+| **CR-4** | `conventions.year_fraction` | must return `0.0` past the cut; expired legs leave every aggregate; the inherited spot delta becomes an action | **DONE (v1.2 T-3),** verified in `05_test_report.md` §3.1. The one-hour floor correctly survives only on the live side. |
+| **CR-5** | `types.Greeks.__add__` | stop summing `delta_pct` and `dual_delta` | **DONE (v1.2 T-2)** — they aggregate to `nan` and render "n/a". Drop dual delta from REQ-038's aggregate card as well; that half is a spec edit, not code. |
+| **CR-6** | `types.MarketSnapshot.rd_rf` | raise on a missing rate rather than defaulting to `0.0` | **DONE (v1.2 T-4),** and it now names the missing currency. |
+| **CR-7** | `conventions.TENORS` / new data file | real-date tenors (spot+lag, month roll, business-day roll, ACT/365 to the cut) and a per-currency **settlement/holiday calendar** | **OPEN.** `1M` is still a constant `1/12` (a 2% error in T on a 31-day month) and **`ON` is still `1/365` on a Friday**, when it is three calendar days — on the single most leveraged line on the book. QA confirms no calendar exists. This is the largest un-actioned correctness item left. |
+| **CR-8** | UI units | vanna in **base-ccy delta change per +1 vol point**; volga in quote ccy per vol point per vol point | **PART DONE.** `fmt.GREEK_UNITS` states the raw contract unit honestly, including "1 unit = a 100% spot move" — which is the right disclosure but is not the desk unit. Convert on the card; keep the raw unit on hover. |
+
+---
+
+## 9. Questions only the real user can answer
+
+Part I promised to push everything that is genuinely my taste rather than market convention to
+this section. Eight `[AWAITING USER]` items survive in `02_requirements.md` §10.1. They are not
+equal: four of them block trading and four of them are corrections that can ship as defaults and
+be fixed in a week. **Ask the first four before the user trades off this tool. The rest can wait
+for the first review.**
+
+**Must be answered before they trade off it:**
+
+1. **"Every morning, can you get ATM, 25-delta risk reversal and 25-delta butterfly for your
+   pairs from anywhere — a broker run, a chat, an email, a screenshot — yes or no?"**
+   *(Q-3, charter-level, `02_requirements.md:1401`.)* If yes, the whole product works and the
+   paste grid is the front door. If no, the charter must be rewritten today to promise "cheap
+   versus its own history" and never "cheap versus the market", and the PM must say so out loud.
+
+2. **"What time, in which timezone, is your official end-of-day mark — and do you also mark when
+   you get in in the morning?"** *(Q-1, `:1396`.)* This sets the P&L boundary, the elapsed window
+   theta is charged over, and whether the AM mark is persisted or scratch. Every number on the
+   P&L page depends on it and `Europe/London` is currently a guess.
+
+3. **"For each pair you trade, how far does delta have to drift before you hedge — in millions,
+   and in pips?"** *(Q-2, `:1399`.)* 25% of gross notional is the shipping default and it is a
+   plausible desk number, not their number. Also worth one line: do they tighten into events, and
+   do they ever hedge a pair in a proxy?
+
+4. **"Which expiry cuts do you actually trade — New York 10:00 only, or Tokyo 15:00 and London
+   16:00 as well?"** *(Q-9, `:1416`.)* Blocking on any book with JPY in it: a mis-set cut moves
+   `T`, theta and the pin clock by up to nine hours, and after the v1.2 T-3 fix it is the
+   difference between carrying an inherited delta and not. Ask which cuts to put a clock on, too;
+   a countdown for a cut where they hold nothing is noise.
+
+**Should be asked, but ship a default and correct it later:**
+
+5. **"Do you trade anything past three months, and do you run a separate vega book?"**
+   *(Q-7, `:1411`.)* If yes, the vega ladder (MISS-3) outranks most of page 2.
+
+6. **"Do you get the morning expiry chatter — '1.0850, EUR 1.2bn, NY cut' — and would you type it
+   in if it took thirty seconds?"** *(Q-8, `:1414`.)* If yes, MISS-6 replaces most of the value
+   the CME adapter was ever going to deliver. Add: do they trade listed FX options at all?
+
+7. **"When you buy a EURJPY, EURGBP or EURCHF option, which currency do you pay the premium in?"**
+   *(Q-4, `:1404`.)* It decides premium adjustment per position, and it is one line to answer and
+   a wrong delta on half the crosses to guess.
+
+8. **"How much of a normal day's theta do you think a weekend day is worth — and an FOMC or CPI
+   day?"** *(Q-6, `:1408`.)* Shipping 0.15 / 2.0; the observed G10 range is 0.10–0.25 and event
+   multipliers vary with how event-driven the book is. Display-only in v1, so a wrong guess is
+   cosmetic rather than dangerous — which is why it is last.
+
+**One question that is not on the list and should be:** *"When the tool and your broker disagree
+by half a vol point, which do you want it to do — show both, or take yours?"* The answer is
+almost certainly "show both", but MISS-5's reconcile box is now built (§10.2) and the follow-on
+behaviour is undefined.
+
+---
+
+## 10. Second pass — the app as built
+
+**Method.** Started it myself (`PYTHONPATH=/home/user/fx python3 run.py --port 8077`), fetched
+every route, drove the callbacks in-process against the synthetic provider and the seeded demo
+book, and read `app/pages/`, `app/components/fmt.py`, `app/components/badges.py`,
+`app/pricing.py`, `app/layout.py` and `fxgamma/signals/richness.py`.
+
+**Timestamp, and it matters.** The tree changed under me twice during this pass: `app/pricing.py`
+was rewritten mid-review to delegate to `fxgamma.portfolio.risk`, and `app/layout.py` was
+rewritten to a full eight-page nav. Everything below is against the tree as of **22:45 UTC**.
+Where a finding may already be in flight I say so. Pages **5 Risk, 6 P&L and 7 Lab did not exist
+at any point during this pass** — `app/pages/` holds `market.py`, `surface.py`, `gamma_map.py`,
+`book.py`, `data.py` and nothing else, though the nav now links all eight.
+
+### 10.1 Verdict
+
+**The parts that exist are better than the spec I reviewed, and the app is not yet a tool I would
+hedge off — mostly because the screen I would hedge off has not been written, and partly because
+the one path to a real mark silently corrupts it.**
+
+The build has taken the review seriously in a way I did not expect. MISS-1 (the manual vol grid)
+is the top panel of the Data page, not a buried dialog. MISS-5 (the reconcile box) exists and
+works. REQ-021 (the what-if pricer) has been promoted out of "Could" into a real panel with all
+four premium units. The Gamma Map has been rewritten unsigned with the disclaimer in the panel
+rather than in a caption. `fmt.py` is the best-executed file in the repo. And amendment v1.4's
+ruling has been honoured literally: the headline theta is priced from `book_greeks` on every
+render, never carried as a constant.
+
+Against that: the single most-read sentence in the app currently prints "breakeven unavailable"
+for the plainest position on the demo book, prints a breakeven struck against a theta of the
+opposite sign to the one it prints beside it, and refuses to print a breakeven at all for a short
+gamma book — which is the book where the breakeven is the whole decision. And the paste parser
+that feeds the primary mark path will silently mark EURUSD at the yen vol.
+
+### 10.2 What is right, and should be defended in review
+
+- **`app/components/fmt.py`.** The `×100` for vols happens in exactly one function; JPY pairs
+  price to 3dp with a 1e-2 pip and everything else to 5dp; `move_both` refuses to print a move in
+  pips *or* percent and always prints both; `dash_if_none` makes a missing value an em dash that
+  can never be read as a zero; `GREEK_UNITS` carries a unit sentence for every field of `Greeks`
+  so `gamma_1pct` cannot reach a screen without "delta change per +1% spot"; scientific notation
+  is never emitted. I tried to make it print a notional as a premium and could not: notionals
+  render as `EUR 10.00mm` and money as `USD 106,430` — different shapes on purpose.
+- **`app/components/badges.py` and the header.** Kind as a **word** as well as a colour, source,
+  age, a page-level banner on any page holding a synthetic field, and — the detail that matters —
+  a field with no provenance renders `UNKNOWN`, never `live`. The header carries snapshot id,
+  asof in my timezone, provider, the count of synthetic and override fields, and a
+  `NO MANUAL MARK` chip whose tooltip says "paste your grid before hedging off this screen". That
+  is the discipline I asked for in Q-10 and it is on screen, not on hover.
+- **The mark grid (MISS-1) works end to end.** I pasted a grid, saved it, and watched
+  `surface_status` flip `INDICATIVE → MARK`, the header chip change to `MARKED: EURUSD`, and the
+  book reprice off my curve. Two homes (SQLite versioned + the provider's marks file), badged
+  `user_override`, never overwritten by a live pull. This was my blocking objection in Part I and
+  it is delivered.
+- **The reconcile box (MISS-5).** Typed 106.4 pips against `opt-9001`: returned implied 7.32% vs
+  surface 7.96%, `−0.65 vol pts`, flagged `warn (>0.5 vol pts)`. Typed 130 pips: `+1.14 vol pts`,
+  warned. Bad id: "nope is not an option in this book". Two hours of work, exactly as I said, and
+  it is the check I would run first every morning.
+- **The what-if pricer.** Resolved strike with the **delta convention named** (`delta +25.0%
+  (spot_pa)`), the vol used and where it came from, premium in four units, breakeven in percent
+  **and** pips **and** sigma-days with the √252 basis printed on the panel. This is what a
+  pre-trade panel should look like.
+- **Calibration residuals (REQ-016)** with the money sentence attached: "on a EUR 100mm 1M
+  straddle one vol point is about USD 248,000 of PV — residuals are money, not housekeeping."
+  Whoever wrote that understood why the requirement exists.
+- **The Gamma Map** is unsigned, and the disclaimer — "OPEN INTEREST IS NOT DEALER POSITIONING…
+  the side each contract was opened on is not published" — is in the panel where it will be read.
+
+### 10.3 Wrong — these will print a plausible number that is not true
+
+Ordered by what the error costs. "Wrong" here means wrong, not "I'd prefer".
+
+**B-1 — The paste parser silently re-labels one pair's vols as another pair's. This is the
+primary mark path and it is a P0.**
+
+Paste the app's **own template** (`app/pages/data.py:40`, the same text used as the textarea
+placeholder and loaded by the "Load template" button):
+
+```
+EURUSD
+1W   7.35  -0.10  0.15
+1M   7.05  -0.15  0.20
+3M   7.30  -0.20  0.25
+USDJPY
+1M   9.25  -1.25  0.30
+3M   9.60  -1.55  0.35
+```
+
+`fxgamma.data.manual.parse_grid` returns **three** marks, all labelled EURUSD:
+
+```
+EURUSD 1W atm=7.35%      <- correct
+EURUSD 1M atm=9.25%      <- this is the USDJPY 1M row
+EURUSD 3M atm=9.60%      <- this is the USDJPY 3M row
+skipped: ["no tenor in row 'EURUSD'", "no tenor in row 'USDJPY'"]
+```
+
+Root cause, `manual.py` ~line 405: a bare pair token on its own line sets `row_pair` for **that
+row only**, the row then fails the tenor test and is discarded, and `row_pair` resets to
+`default_pair` on the next iteration. Subsequent rows are therefore stamped EURUSD, and because
+`_stash` writes into a `(pair, tenor)` dict, the USDJPY 1M row **overwrites** the real EURUSD 1M
+row in place. The true EURUSD 1M mark is not flagged, not warned, not skipped — it is gone.
+
+What the trader sees: "SAVED — EURUSD now price off YOUR curve", header chip `MARKED: EURUSD`,
+surface status `MARK`, badge `user_override` — the highest-trust state in the whole provenance
+system — on a EURUSD surface marked **2.20 vol points** too high, while **USDJPY is silently not
+marked at all** and stays `INDICATIVE`. I verified the mark reaches pricing: `surface.atm(1/12)`
+for EURUSD returns 9.25%.
+
+Cost: on a EUR 100mm 1M straddle, 2.2 vol points is ~USD 545,000 of PV, plus the wrong delta
+through the smile, plus the wrong hedge size, plus an attribution residual nobody can explain.
+And it happens on the *most careful* user — the one who marks his book before he trades.
+
+Three fixes, all required: (a) a bare pair token on its own line sets the **sticky** pair for the
+rows that follow; (b) `_stash` must never silently overwrite an existing `(pair, tenor)` — warn
+and keep both for the user to resolve; (c) **"Save pasted marks" must not be reachable without
+the parse preview**, or at minimum must refuse to save while `skipped` is non-empty. QA: this is
+the first test `manual.py` gets, and `05_test_report.md` already flags `manual.py` as the
+untested primary path.
+
+**B-2 — The one-line answer is wrong or absent in three of its four cases.**
+
+Driving `app.pricing.headline` against the demo book, at 22:45:
+
+```
+EURUSD | LONG GAMMA  · EUR +3.50mm per 1% · breakeven unavailable                          · costs USD 3,559 today
+GBPUSD | SHORT GAMMA · GBP -3.59mm per 1% · no breakeven (you are short gamma — the move costs you) · earns USD 5,251 today
+USDJPY | LONG GAMMA  · USD +0.31mm per 1% · pays above 81 pips today                        · earns JPY 206,794 today
+```
+
+Three separate defects:
+
+- **EURUSD — the textbook long-gamma position prints no breakeven at all.** Cause:
+  `signals.richness.daily_breakeven` takes a vega-weighted average vol across all live rows
+  (`richness.py:112-113`), and the demo book's **spot hedge line carries `vol = NaN`**.
+  `np.average` propagates the NaN regardless of the 1e-12 weight, so `sigma` is NaN,
+  `gamma_theta` is NaN, and the card dies. **Every real gamma book has a spot hedge line**, so
+  this is not a demo artefact — it is "the breakeven card is off whenever you are hedged". One
+  line: restrict the average to option rows, or drop NaN vols before averaging. With it fixed,
+  EURUSD reads BE 0.4166% / 48.5 pips, which is `σ/√365` to four figures.
+- **GBPUSD — a short-gamma book does have a breakeven, and it is the number that matters most.**
+  `breakeven_pct` returns `nan` for negative Γ₁ and the card says "no breakeven". Wrong: the
+  breakeven of a short book is the move above which the gamma loss exceeds the theta collected —
+  `sqrt(|θ_γ| / (0.005·|Γ₁|·S))` = **63 pips** on this book. That is precisely the number that
+  tells me whether to buy gamma back this morning. Suppressing it is a regression on the earlier
+  build, which at least printed the magnitude with the wrong verb. Take absolute values in the
+  **maths** and put the sign in the **words** (§4.2).
+- **USDJPY — the sentence contains two numbers of opposite sign and invites you to connect them.**
+  "pays above 81 pips today · earns JPY 206,794 today". The 81 pips is struck against
+  `theta_gamma = −69,074` (correct per W-15); the 206,794 is total theta including carry. Both
+  are right and printing them adjacent without saying which theta the breakeven used is a trap.
+  `daily_breakeven` already returns both fields — print them: *"BE 81p vs gamma-theta JPY
+  −69,074/day; total theta +206,794/day incl. carry."*
+
+**B-3 — The what-if pricer's breakeven still uses total theta, and is 8% too wide.**
+EURUSD 1M ATMF call, σ 7.95%, Γ₁ EUR 1.74mm, θ USD −2,059 → the panel prints **0.451% / 52.6
+pips**. The gamma-theta is −1,755, giving **0.4166% / 48.5 pips**, which is exactly `σ/√365`.
+Four pips out of 48 on a daily breakeven decision. The library got this right (`theta_mode
+="gamma"`); `app/pages/surface.py` (22:22) is still calling the older total-theta helper. W-15,
+verbatim, live on screen.
+
+**B-4 — Two of the four premium units are the same number computed twice.**
+Every premium echo prints `106.4 pips · 0.914% of base notional · 0.914% of quote notional`
+(EURUSD), `210.3 pips · 1.426% · 1.426%` (USDJPY 25dc). Both are `P/(N·S)`. The quote-ccy
+notional of an FX option is `N × K`, not `N × S` — it is the amount of quote currency actually
+exchanged — so `%quote` should be `P/(N·K)`. On the USDJPY 25-delta call (K 149.76 vs S 147.50)
+the two differ by 1.5%. As built, the fourth unit is a copy of the third, so it cannot catch the
+unit error W-12 added it to catch. *(Flagging with one caveat: if the desk's convention is
+spot-based, say so on the panel — but then do not call it a fourth unit.)*
+
+**B-5 — One identity, two homes.** `02_requirements.md` §0 is explicit: the identities live once,
+in `fxgamma/portfolio/risk.py`, and no screen re-derives them. `gamma_pnl_pct` now exists in both
+`risk.py` and `app/pricing.py`, and `breakeven_daily_pct` lives **only** in `app/pricing.py` —
+the identity most likely to be got wrong sits in the app layer, where the golden fixture does not
+reach it. That is exactly how REQ-046's factor of 100 and my own factor-of-two theta happened.
+One home, imported.
+
+**B-6 — No RR25 or BF25 z-scores anywhere.** REQ-010 requires them in the cross-pair table; the
+built table (`app/pages/market.py`) carries RV, ATM, spread and an **RV** z-score only. Skew
+richness is the signal on a risk-reversal book and there is no screen for it. The C-6
+history-disclosure requirement ("n days behind this z") attaches to these, not to RV — RV has two
+years of synthetic history and shows `n=252` honestly; the skew z-scores, which are the ones with
+no history, are simply absent.
+
+**B-7 — Delta is shown once, with no convention named.** Q-4 is SETTLED as "show both the
+pair-convention delta and the hedge delta side by side, difference in base mm, convention named
+in words on every delta cell". The what-if panel does name it; the **blotter and the headline do
+not**. On the demo USDJPY risk reversal that difference is ~1% of notional per leg — around
+USD 200k of delta on a USD 20mm leg — and it does not cancel on a skewed structure.
+
+**B-8 — The blotter prints money as bare floats.** `PV`, `vega`, `theta`, `vanna`, `volga`,
+`premium` and `P&L` are `round(x, 0)` with no currency on the cell and no thousands separator:
+`-29638667.0` (JPY) sits four columns from `-72525.0` (USD), with the `ccy` column eight columns
+to the right. This is the one table in the app where `fmt.py`'s own discipline is not applied,
+and it is the table I scan fastest. Use `fmt_money`.
+
+### 10.4 Would I put a hedge on off this screen?
+
+**No. Three things stop me, precisely:**
+
+1. **There is no hedge screen.** Pages 5 (Risk), 6 (P&L) and 7 (Lab) do not exist. There is no
+   spot ladder, no hedge band, no trigger level, no clip size, no pin panel, no cut clock, no
+   scenario, no decay path, no manual spot box on a risk page. The app tells me my delta and
+   nothing about what to do with it. J4, J6 and J8 in the requirements' own day-in-the-life table
+   are unanswered end to end.
+2. **The only route to a real mark silently corrupts it (B-1)** and then badges the corrupted
+   result with the system's highest-trust label. A tool that can be wrong is survivable; a tool
+   that is wrong *and* certain is not.
+3. **The sentence I would act on is broken in three of its four cases (B-2).** For my most common
+   position it prints nothing; for a short book it refuses the number I most need; for a skewed
+   book it prints two contradictory thetas in one line.
+
+**What would change the answer.** Fix B-1 and B-2, ship the Risk page with the §4.4 ladder and
+the manual spot box, and I would hedge off it **for a pair whose status reads `MARK`**, with the
+standing caveat that I would cross-check the first week's hedges against my own arithmetic. I
+would not hedge off an `INDICATIVE` pair at any point, and the app is already built to refuse
+that if the Risk page honours the two-tier rule.
+
+### 10.5 What is missing, ranked by what it costs me
+
+| # | Missing | What it costs |
+|---|---|---|
+| 1 | **The Risk page** — ladder, hedge bands and trigger levels, pin panel with `Δ_above`/`Δ_below`/jump, cut clock, decay path | The whole reason to open the app intraday. Everything else is analysis; this is the tool. |
+| 2 | **The P&L page** — attribution waterfall, the always-displayed residual ratio, and the "yesterday's published PV vs recomputed now" line | Q-10 checks 1 and 2. These are the two that decide whether I still have the app open in week three. |
+| 3 | **A manual spot box on a risk screen, one keystroke away** | With 15-minute-delayed free data the very first thing I do every morning is override spot. Today the only override path is the Data page, which is REQ-068 living in exactly the wrong place. |
+| 4 | **The overnight diff (MISS-8)** | The literal first question of the day, and the fastest way to catch a bad mark before it reaches a hedge. |
+| 5 | **Vega by tenor bucket and gamma by expiry bucket (MISS-3)** | "How much of my gamma dies this week" is unanswerable today. One aggregate vega hides the defining risk of a gamma book. |
+| 6 | **Forward points in the mark grid (CR-3 / MISS-2)** | The grid takes ATM/RR/BF only. Without forward points the flat-rate assumption puts the ATMF and the delta-neutral strike wrong at 1Y on USDJPY and the Scandies, and hedge carry (MISS-7) lands in `unexplained`. |
+| 7 | **RR25 / BF25 z-scores (B-6)** and the "n days of history" disclosure on them | The skew signal, absent. |
+| 8 | **The expiry-notional table (MISS-6)** | What actually pins spot. Cheap, and worth more than the entire CME adapter. |
+| 9 | **10-delta wings in the mark grid** | The grid is ATM/RR25/BF25. `SmileQuotes` carries `rr10`/`bf10` and `parse_grid` handles them; the UI does not offer the columns. On a book with wings that is a real gap, though a smaller one than the eight above. |
+| 10 | **Real-date tenors and a holiday calendar (CR-7)** | `ON` is still `1/365` on a Friday. Silent, systematic, and on the most leveraged line on the book. |
+
+### 10.6 Units audit — the specific questions
+
+- **Could I mistake a notional for a premium?** No. Notionals render `EUR 10.00mm`, money renders
+  `USD 106,430` — different shapes, deliberately, and `fmt.py` documents why.
+- **Pips for percent?** No. `move_both` refuses to print one without the other. Spot precision
+  follows the pip: JPY 3dp, everything else 5dp.
+- **Per-1-unit gamma for per-1%?** No, and this is well done: `gamma_1pct` is the only gamma on
+  any screen, it is always labelled `per +1%`, and the intensive fields (`delta_pct`,
+  `dual_delta`) render "n/a" at book level per v1.2 T-2 rather than printing a confident sum.
+- **Vol level for vol difference?** No. `fmt_vol_pts` always appends "vol pts" and always signs.
+- **The two genuine unit defects** are B-4 (two identical "different" premium units) and B-8
+  (money as bare floats in the blotter). Plus CR-8: vanna is labelled with the raw contract unit
+  and the honest gloss "1 unit = a 100% spot move", which is correct disclosure of a unit no
+  trader uses.
+
+### 10.7 Provenance audit
+
+Is it obvious when a number is synthetic, stale or my own override? **Yes — this is the strongest
+part of the build.** Kind as a word and a colour; source and age on every badge; a page-level
+banner naming the count of simulated fields ("119 field(s) on this page are SIMULATED, not market
+data. Nothing here is a mark and nothing here is tradable"); surface status `MARK` /
+`INDICATIVE` on the market table, the surface page and every headline card; `UNKNOWN` never
+rendering as `live`; and the `NO MANUAL MARK` header chip telling me in words not to hedge off
+the screen. The staleness ladder (live / delayed / stale / EOD) is implemented and outranked
+correctly by synthetic and override.
+
+**The one hole is B-1, and it is a hole in a different dimension.** The provenance system is
+completely honest about *where* a number came from and completely blind to *what* it is. A EURUSD
+surface marked at the yen vol is badged `user_override / MARK` — truthfully, since the user did
+type it — and there is nothing on the screen that would make me doubt it. Provenance is not a
+substitute for a plausibility check: the mark grid needs the same defence W-12 asked of the
+premium field, which is to compare each saved mark against the last surface for that pair and
+warn above, say, 1.5 vol points of change.
+
+---
+
+## 11. Report to the PM
+
+The full report is in the task response. The one-line version: **the parts that exist are better
+than the spec, the screen I would actually hedge off has not been written yet, and the paste
+parser will mark EURUSD at the yen vol today.** Fix B-1 before anything else; fix B-2 before the
+Risk page ships, because the Risk page will inherit the same sentence.
+
+---
+
+## 10.8 Addendum, 22:55 UTC — Risk and P&L landed while this was being written
+
+`app/pages/risk.py` (869 lines) and `app/pages/pnl.py` (462 lines) appeared on disk during the
+final hour of this pass. `app/main.py` still imports only the five original pages, so **neither
+is reachable in the running app yet** — the nav links to `/risk` and the router 404s. Judge them
+when they are wired; a first read of the Risk page layout says the shape is right:
+
+- headline, aggregate cards, skew panel, spot ladder with a **sticky-strike / sticky-delta**
+  selector, gamma zones, scenario grid, **hedge-rule panel** (band as % of gross option notional,
+  target delta, per-pair cost table with a manual override), **pin panel**, **expiry ladder with
+  the exact cut instant and a countdown**, and a decay path with the CG-4 calendar/business
+  toggle. That is J4, J6 and J8 addressed on one page.
+- **Two things to fix before it ships.** (1) There is **no manual spot box and no `s` key** on the
+  page — my Q-10 continuous demand and #3 in the §10.5 ranking. With delayed data the first thing
+  I do on a risk screen is override spot, and the only override today is on the Data page. (2)
+  The band input defaults to **15%**, which is my §2/Q-2 recommendation; amendment v1.6 ruled the
+  shipping default is **25%** of gross option notional floored at a 1mm clip. One of the two is
+  wrong and it should be the amendment that wins until the real user answers §9 question 3.
+- The headline defect **B-2 is inherited here** — `rk-headline` uses the same `headline()` helper.
+  Fixing it once fixes both pages, which is the argument for B-5.
+
+Everything else in §10 stands as written, including B-1, which I re-checked at 22:55 and which is
+unchanged.

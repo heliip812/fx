@@ -1,9 +1,9 @@
 """Dash application factory  (contract section 6).
 
-Five pages are wired here: Market Monitor, Vol Surface, Gamma Map, Position Book and
-Data & Settings.  Pages 6-8 (Risk, P&L, Lab) depend on ``fxgamma.portfolio``, which is
-being written against the frozen contract section 5; they are shown greyed in the nav and
-wired in a later task rather than stubbed with fake numbers.
+All **eight** contract section 6 pages are wired: Market Monitor, Vol Surface, Gamma Map,
+Position Book, Risk, P&L, Signals & Backtest and Data & Settings.  The last three came
+in on this pass, against the now-complete ``fxgamma.portfolio``, ``fxgamma.signals`` and
+``fxgamma.backtest``; nothing in ``app/`` computes a Greek, a band or a zone itself.
 
 Everything is defensive by policy (requirements section 5.7): no traceback ever reaches the
 browser, every callback catches and renders a panel-level message naming what failed, and
@@ -39,7 +39,8 @@ def create_app(provider: str = "synthetic", *, db: str | None = None,
     )
 
     # importing a page registers it (dash.register_page at module scope)
-    from .pages import book, data, gamma_map, market, surface     # noqa: F401
+    from .pages import (book, data, gamma_map, lab, market, pnl,      # noqa: F401
+                        risk, surface)
 
     app.layout = lambda: shell(get_session())
 

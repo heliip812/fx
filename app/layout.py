@@ -14,12 +14,15 @@ import dash
 from dash import dcc, html
 
 from .components.badges import chip, provenance_badge
-from .theme import ACCENT, KIND_COLORS, TEXT_DIM
+from .components.fmt import EM_DASH
+from .pricing import DISTANCE_BASIS, ECONOMICS_BASIS, headline
+from .theme import ACCENT, KIND_COLORS, NEG, POS, TEXT_DIM
 
 NAV = [("/", "1 Market"), ("/surface", "2 Surface"), ("/gamma-map", "3 Gamma Map"),
-       ("/book", "4 Book"), ("/data", "5 Data")]
-#: pages 5-7 are being built against the frozen contract section 5 by quant-risk
-PENDING = [("/risk", "6 Risk"), ("/pnl", "7 P&L"), ("/lab", "8 Lab")]
+       ("/book", "4 Book"), ("/risk", "5 Risk"), ("/pnl", "6 P&L"),
+       ("/lab", "7 Lab"), ("/data", "8 Data")]
+#: nothing is pending any more: all eight contract section 6 pages are wired.
+PENDING: list[tuple[str, str]] = []
 
 
 def local_time(dt: datetime, tz: str) -> str:
@@ -31,6 +34,60 @@ def local_time(dt: datetime, tz: str) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     loc = dt.astimezone(z)
     return f"{loc:%Y-%m-%d %H:%M:%S} {loc.tzname()}"
+
+
+def gamma_strip(session) -> html.Div:
+    """MISS-4 / AMENDMENT v1.4 — the always-visible one-line answer, per pair.
+
+    "LONG GAMMA · EUR 4.0mm per 1% · pays above 41 pips today · costs USD 2,870".
+
+    **Ruling 2 of amendment v1.4 is binding on this function: theta is computed from
+    ``book_greeks`` on every render, never from a constant.**  The trader's reference
+    table said USD 5,800/day for the EURUSD 1M ATM straddle; pricing that very trade
+    gives USD 2,868, and the 5,800 figure is withdrawn.  Shipping a constant here
+    would overstate the daily cost of carry by 2x in the single most-read number in
+    the app, so there is no constant to ship: every figure below comes from
+    ``app.pricing.headline`` -> ``fxgamma.portfolio.risk.book_greeks``.
+
+    The theta charged is to the **next mark**, not always one day: on a Friday the
+    strip says three calendar days and shows the three-day number (trader Q-6).
+    """
+    try:
+        snap = session.snapshot()
+        book = session.store.load_book()
+        marks = session.store.marks()
+    except Exception as exc:                               # noqa: BLE001
+        return html.Div(f"header risk unavailable: {exc}", className="tiny",
+                        style={"color": KIND_COLORS["unavailable"], "padding": "4px 0"})
+    if not book.options and not book.spots:
+        return html.Div(
+            ["EMPTY BOOK — no gamma, no theta. ",
+             dcc.Link("add a trade on the Book page", href="/book",
+                      style={"color": ACCENT})],
+            className="gamma-strip",
+            style={"color": TEXT_DIM, "fontSize": "12px", "padding": "5px 0"})
+    items = []
+    for pair in book.pairs():
+        try:
+            h = headline(book, snap, pair, marks=marks)
+        except Exception as exc:                           # noqa: BLE001
+            items.append(html.Span(f"{pair}: not priced ({str(exc)[:70]})",
+                                   style={"color": KIND_COLORS["unavailable"]}))
+            continue
+        colour = (POS if h["gamma_1pct"] > 0 else NEG if h["gamma_1pct"] < 0 else TEXT_DIM)
+        items.append(html.Span(
+            [html.Span(f"{pair} ", style={"color": TEXT_DIM}),
+             html.Span(h["text"] or EM_DASH, style={"color": colour, "fontWeight": 600})],
+            title=(f"theta from book_greeks on this render (amendment v1.4 ruling 2), "
+                   f"charged over {h['days']:g} calendar day(s) to the next mark. "
+                   f"Breakeven basis {ECONOMICS_BASIS}; any distance/sigma-day figure "
+                   f"on a page uses {DISTANCE_BASIS}."),
+            style={"marginRight": "16px", "whiteSpace": "nowrap"}))
+    return html.Div(items, className="gamma-strip",
+                    style={"display": "flex", "flexWrap": "wrap", "gap": "2px",
+                           "fontSize": "12px", "padding": "5px 0",
+                           "borderTop": "1px solid #222b36",
+                           "borderBottom": "1px solid #222b36", "marginTop": "6px"})
 
 
 def header(session) -> html.Div:
@@ -77,6 +134,7 @@ def header(session) -> html.Div:
                        "used is shown on the row")],
                  style={"marginTop": "6px", "display": "flex", "flexWrap": "wrap",
                         "gap": "4px", "alignItems": "center"}),
+        gamma_strip(session),
         html.Div(
             [dcc.Link(label, href=href, id={"type": "nav", "href": href},
                       className="nav-link") for href, label in NAV]

@@ -53,7 +53,10 @@ class Session:
 
     def __init__(self, provider: str = "synthetic", *, db: str | None = None,
                  seed_demo: bool = True, pairs: list[str] | None = None):
-        self.store: Store = get_store(db, fresh=db is not None)
+        # Q-4 is fixed in `store.get_store`: the cache is keyed on the resolved
+        # path, so a second book path is a second store rather than silently the
+        # first one.  No `fresh=` needed any more -- asking for a path *is* the key.
+        self.store: Store = get_store(db)
         self.provider_name = provider
         self.pairs = list(pairs or DEFAULT_PAIRS)
         self._snapshots: "OrderedDict[str, MarketSnapshot]" = OrderedDict()
@@ -244,6 +247,16 @@ class Session:
     @property
     def snapshot_id(self) -> str:
         return self._current or ""
+
+    def snapshot_ids(self) -> list[tuple[str, datetime]]:
+        """Every snapshot still held this session, oldest first: ``(id, asof)``.
+
+        The P&L page needs **two** stamped marks to explain a day; this is the list it
+        offers.  Snapshots are never recomputed against today's surface (REQ-054), so a
+        t0 chosen here is the market as it was stamped, not as it would be re-derived.
+        """
+        with self._lock:
+            return [(sid, snap.asof) for sid, snap in self._snapshots.items()]
 
     def token(self) -> dict[str, Any]:
         """The JSON-safe half that travels in ``dcc.Store``."""

@@ -22,15 +22,14 @@ import dash
 import pandas as pd
 from dash import Input, Output, callback, dcc, html
 
-from fxgamma.conventions import PAIRS, pair_spec, year_fraction
-from fxgamma.models.gk import gk_greeks
+from fxgamma.conventions import pair_spec
 
 from ..components.badges import provenance_badge, synthetic_banner
 from ..components.cards import empty_state, grid, note, panel
 from ..components.charts import figure, spot_line
 from ..components.fmt import EM_DASH, fmt_spot
 from ..components.tables import col, data_table
-from ..pricing import sigma_day_move
+from ..pricing import DISTANCE_BASIS, price_positions, sigma_day_move
 from ..state import ALL_PAIRS, get_session
 from ..theme import ACCENT, NEG, POS, empty_figure
 
@@ -84,34 +83,23 @@ def layout(**_kw):
 
 
 def _book_gamma_by_strike(s, pair, snap) -> pd.DataFrame:
-    """The user's own gamma_1pct bucketed by strike — exact, not inferred."""
-    book = s.store.load_book()
-    marks = s.store.marks()
-    rows = []
-    for o in book.options:
-        if o.pair != pair:
-            continue
-        S = snap.spot.get(pair)
-        spec = pair_spec(pair)
-        if S is None or spec.quote not in snap.rates or spec.base not in snap.rates:
-            continue
-        T = year_fraction(snap.asof, o.expiry, o.cut)
-        surf = snap.surfaces.get(pair)
-        mk = marks.get(o.id)
-        sig = (float(mk.mark_vol) if mk is not None else
-               (float(surf.vol(o.strike, T)) if (surf is not None and T > 0) else
-                (o.trade_vol or 0.0)))
-        if T <= 0 or not sig:
-            continue
-        rd, rf = snap.rd_rf(pair, PAIRS)
-        g = gk_greeks(float(S), float(o.strike), T, rd, rf, float(sig), int(o.cp),
-                      notional_base=abs(float(o.notional_base)), direction=int(o.direction),
-                      delta_convention=spec.delta_convention)
-        rows.append({"strike": float(o.strike), "gamma_1pct": g.gamma_1pct,
-                     "expiry": o.expiry})
+    """The user's own ``gamma_1pct`` bucketed by strike — exact, not inferred.
+
+    Priced through :func:`app.pricing.price_positions` -> ``portfolio.risk.price_book``
+    like everything else on this app; the interim direct-``gk_greeks`` loop that lived
+    here while the risk engine was being written is gone, so the diamonds on this
+    figure and the blotter rows behind them are guaranteed to be the same numbers.
+    """
+    book = s.store.load_book().filter(pair)
+    if not book.options:
+        return pd.DataFrame(columns=["strike", "gamma_1pct"])
+    rows = [r for r in price_positions(book, snap, marks=s.store.marks(),
+                                       report_ccy=s.report_ccy)
+            if r["instrument"] == "OPTION" and r["state"] == "LIVE"]
     if not rows:
         return pd.DataFrame(columns=["strike", "gamma_1pct"])
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame([{"strike": float(r["strike"]), "gamma_1pct": float(r["gamma_1pct"]),
+                        "expiry": r["expiry"]} for r in rows])
     return df.groupby("strike", as_index=False)["gamma_1pct"].sum()
 
 
@@ -237,7 +225,7 @@ def _magnets(front, S, snap, pair):
     body = data_table("gm-magnets-tbl",
                       [col("strike"), col("share", unit="% of front OI", numeric=True),
                        col("distance", "dist", unit="pips / %"),
-                       col("sigma-days", "sigma_days", unit="sqrt(252) basis")],
+                       col("sigma-days", "sigma_days", unit=DISTANCE_BASIS)],
                       data, page_size=8, sort=False) if data else \
         empty_state("no strike holds >5% of front open interest within ±2% of spot")
     return panel([body,

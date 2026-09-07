@@ -348,6 +348,7 @@ def parse_grid(text: str, pair: str | None = None, *, source: str = "paste",
 
     # ---- header / layout detection ---------------------------------------------------
     head_map: dict[int, str] = {}
+    head_tenor_idx: int | None = None
     body = rows
     layout = "rows"
     first = _merge_header_tokens(rows[0])         # "25d RR" -> "25rr" before anything else
@@ -371,6 +372,9 @@ def parse_grid(text: str, pair: str | None = None, *, source: str = "paste",
         body = rows[1:]
         inferred.append("header row: " + ", ".join(
             f"col{i}={v}" for i, v in sorted(head_map.items())))
+        head_tenor_idx = next(
+            (i for i, h in enumerate(first_norm) if h in {"tenor", "term", "expiry", "exp"}),
+            None)
 
     # ---- collect (pair, tenor) -> {metric: raw value} ---------------------------------
     raw: dict[tuple[str, str], dict[str, float]] = {}
@@ -381,6 +385,14 @@ def parse_grid(text: str, pair: str | None = None, *, source: str = "paste",
         if key not in raw:
             raw[key] = {}
             order.append(key)
+        prev = raw[key].get(metric)
+        if prev is not None and prev != val:
+            # Never silently replace a mark: two rows claiming the same pair+tenor
+            # means the paste was misread (or the broker run really is ambiguous).
+            warnings.append(
+                f"{p} {tenor} {metric}: {prev:g} overwritten by {val:g} - two rows claim "
+                "the same pair and tenor; check the paste"
+            )
         raw[key][metric] = val
 
     if layout == "columns":
@@ -408,12 +420,22 @@ def parse_grid(text: str, pair: str | None = None, *, source: str = "paste",
                 if j < len(vals):
                     _stash(p, t, label, vals[j])
     else:
+        active_pair = default_pair
         for r in body:
             if not r:
                 continue
-            row_pair = default_pair
             toks = list(r)
             p0 = _pair_token(toks[0])
+            if p0 and len(toks) == 1:
+                # A bare pair on its own line is a BLOCK HEADER: every row beneath it
+                # belongs to that pair until the next header. Without this a multi-pair
+                # broker run silently collapsed onto the first pair, and the second
+                # block's tenors then overwrote the first block's - so a EURUSD 1M mark
+                # would quietly become the USDJPY 1M vol.
+                active_pair = p0
+                inferred.append(f"block header {p0}: the rows below are marked as {p0}")
+                continue
+            row_pair = active_pair
             if p0:
                 row_pair = p0
                 toks = toks[1:]
@@ -435,6 +457,27 @@ def parse_grid(text: str, pair: str | None = None, *, source: str = "paste",
                 skipped.append(f"no numbers in row {' '.join(r)!r}")
                 continue
             if head_map:
+                # A declared header maps metrics by COLUMN POSITION, so any shift
+                # between the header and the row silently maps the wrong number onto
+                # the ATM. Refuse rather than guess: a mispositioned column once marked
+                # a 7.05 vol book at 25 vol with no warning. Realigning would be a
+                # guess about the number that prices the book, so we make the user fix
+                # the paste instead.
+                row_tenor_idx = next((i for i, t in enumerate(r) if _norm_tenor(t)), None)
+                misaligned = (
+                    (head_tenor_idx is not None and row_tenor_idx is not None
+                     and row_tenor_idx != head_tenor_idx)
+                    or len(r) < len(first)
+                )
+                if misaligned:
+                    warnings.append(
+                        f"row {' '.join(r)!r} does not line up with the header "
+                        f"({' '.join(first)!r}): the tenor is in column "
+                        f"{row_tenor_idx} but the header puts it in column "
+                        f"{head_tenor_idx}. Refusing to mark - re-paste with the "
+                        "columns the header declares."
+                    )
+                    continue
                 # map by header position, counting only the columns we kept
                 vals_by_col = {i: _as_float(t) for i, t in enumerate(r)}
                 got = False

@@ -36,8 +36,8 @@ from ..components.cards import empty_state, grid, kv, metric, metric_row, note, 
 from ..components.fmt import (EM_DASH, fmt_mm, fmt_money, fmt_spot, fmt_vol,
                               greek_unit, theta_sentence)
 from ..components.tables import col, data_table, empty_table_note, status_rules
-from ..pricing import (book_greeks, breakeven_daily_pct, pair_totals,
-                       price_positions)
+from ..pricing import (aggregate, attainable_delta, headline, pair_totals,
+                       price_positions, unattainable_message)
 from ..state import ALL_PAIRS, get_session
 from ..theme import KIND_COLORS, NEG, POS, TEXT_DIM, WARN
 
@@ -289,36 +289,38 @@ def _csv_panel():
 
 # ====================================================================== headline + blotter
 def _headline_children(s):
+    """MISS-4 on page 4.  Theta is priced here too (amendment v1.4 ruling 2)."""
     snap = s.snapshot()
-    rows = price_positions(s.store.load_book(), snap, marks=s.store.marks(),
-                           report_ccy=s.report_ccy)
-    if not rows:
+    book = s.store.load_book()
+    marks = s.store.marks()
+    if not book.options and not book.spots:
         return panel(empty_state("no positions — import a CSV or add a trade",
                                  "every screen renders with an empty book (REQ-003)"),
                      title="the one-line answer", sub="MISS-4")
     cards = []
-    for pair in sorted({r["pair"] for r in rows}):
-        g = book_greeks(rows, pair=pair)
+    for pair in book.pairs():
         spec = pair_spec(pair)
-        S = snap.spot.get(pair)
-        be = breakeven_daily_pct(g.gamma_1pct, g.theta, S) if S else None
-        long_short = ("LONG GAMMA" if g.gamma_1pct > 0 else
-                      "SHORT GAMMA" if g.gamma_1pct < 0 else "FLAT GAMMA")
-        be_pips = (be * S / spec.pip / 100) if (be and S) else None
-        sentence = (f"{long_short} · {fmt_mm(g.gamma_1pct, spec.base)} per +1% · "
-                    + (f"pays above {be_pips:,.0f} pips today" if be_pips else
-                       "breakeven unavailable")
-                    + f" · {theta_sentence(g.theta, spec.quote)}")
+        try:
+            h = headline(book, snap, pair, marks=marks)
+        except Exception as exc:                           # noqa: BLE001
+            cards.append(metric(pair, "not priced", unit=str(exc)[:120], tone="neg"))
+            continue
+        g = h["greeks"]
         status, _ = surface_status(snap.meta, pair)
         cards.append(metric(
-            pair, sentence,
+            pair, h["text"],
             tone="pos" if g.gamma_1pct > 0 else "neg" if g.gamma_1pct < 0 else "",
             unit=f"priced off the {status} surface · gamma_1pct = "
-                 + greek_unit("gamma_1pct"),
+                 + greek_unit("gamma_1pct")
+                 + f" · theta charged over {h['days']:g} calendar day(s) to the next mark",
             sub=(f"PV {fmt_money(g.pv, spec.quote)} · vega {fmt_money(g.vega, spec.quote)} "
                  f"per vol pt · delta {fmt_mm(g.delta_base, spec.base)}"),
             badge=provenance_badge(snap.meta, f"surface.{pair}", compact=True)))
-    return panel(metric_row(cards, cols="repeat(auto-fit, minmax(420px, 1fr))"),
+    return panel([metric_row(cards, cols="repeat(auto-fit, minmax(420px, 1fr))"),
+                  note("Every figure here is computed from "
+                       "portfolio.risk.book_greeks on this render — amendment v1.4 "
+                       "ruling 2 forbids a constant theta, and the trader's 5,800/day "
+                       "reference figure is withdrawn (the trade prices to 2,868).")],
                  title="the one-line answer",
                  sub="MISS-4 — long or short, by how much, what pays, what it costs")
 
@@ -380,7 +382,7 @@ def _blotter_children(s, filter_text: str = "", pair_filter=None, tag_filter=Non
         {"if": {"filter_query": '{state} = "UNPRICED"', "column_id": "state"},
          "color": WARN, "fontWeight": "700"},
     ]
-    totals = pair_totals(rows, s.report_ccy)
+    totals = pair_totals(book, snap, s.report_ccy, marks=marks)
     tot_rows = []
     for t in totals:
         tot_rows.append((f"{t['pair']} ({t['ccy']})",
@@ -646,6 +648,47 @@ def _echo(results, s) -> html.Div:
         kv(rows)])
 
 
+def _delta_bound_note(s, pair, expiry_iso, cut):
+    """AMENDMENT v1.7 — say the delta ceiling **before** the user types an impossible one.
+
+    ``parse_strike`` already refuses an unattainable delta in words (that is the
+    binding requirement, and it covers the CSV importer and the what-if pricer too);
+    this panel is the pre-emptive half, so a USDJPY ticket at a long tenor tells you
+    that "30dc" does not exist here rather than waiting for you to ask for it.
+    """
+    try:
+        pair = (pair or "EURUSD").upper()
+        spec = pair_spec(pair)
+        if not spec.delta_convention.endswith("_pa"):
+            return None
+        snap = s.snapshot()
+        exp = date.fromisoformat(str(expiry_iso)[:10]) if expiry_iso else None
+        from fxgamma.conventions import year_fraction
+        T = year_fraction(snap.asof, exp, cut or spec.cut) if exp else None
+        info = attainable_delta(pair, snap, T, cp=+1)
+    except Exception as exc:                               # noqa: BLE001
+        log.debug("delta bound unavailable: %s", exc)
+        return None
+    if not info.get("bounded"):
+        return None
+    mx = float(info["max"])
+    tone = "warn" if mx < 0.30 else "dim"
+    return html.Div(
+        [html.Span("PREMIUM-ADJUSTED DELTA IS BOUNDED HERE  ",
+                   style={"fontWeight": 700, "color": WARN}),
+         html.Span(f"max attainable call delta on {pair} at this expiry is "
+                   f"{mx * 100:.2f}% ({info['convention']}, vol "
+                   f"{float(info['sigma']) * 100:.2f}%). A call delta above that has "
+                   f"no strike — the ticket will say “unattainable at this tenor/vol” "
+                   f"rather than showing a blank, a zero or a nan strike "
+                   f"(amendment v1.7). Puts are unbounded.",
+                   style={"color": TEXT_DIM})],
+        className="tiny",
+        style={"padding": "5px 8px", "marginBottom": "6px", "lineHeight": "1.5",
+               "border": f"1px solid {WARN}55", "borderLeft": f"3px solid {WARN}",
+               "borderRadius": "4px"}) if tone else None
+
+
 @callback(Output("ot-echo", "children"), Output("book-version", "data"),
           Input("ot-preview", "n_clicks"), Input("ot-add", "n_clicks"),
           State("ot-pair", "value"), State("ot-structure", "value"),
@@ -665,7 +708,8 @@ def _ticket(_p, _a, *args):
     try:
         legs, notes = _legs_from_ticket(s, values)
         results = _validate_legs(s, legs)
-        body = _echo(results, s)
+        bound = _delta_bound_note(s, values[0], values[4], values[5])
+        body = html.Div([bound, _echo(results, s)]) if bound else _echo(results, s)
         blocked = any(r.status == "ERROR" for r in results)
         extra = [note(n) for n in notes]
         if add and not blocked:
@@ -829,8 +873,14 @@ def _reconcile(pid, prem, unit, _token):
             total = raw
         elif unit == "pips":
             total = raw * N * spec.pip
-        else:
+        elif unit == "pct_base":
+            # % of the BASE notional is an amount of base ccy -> convert at SPOT
             total = raw / 100.0 * N * s_trade
+        else:
+            # % of the QUOTE notional, and the quote notional is N_base x K by FX
+            # convention -> convert at the STRIKE.  The two units differ by S/K and
+            # coincide only for a spot-struck option (requirements 3.5, PM rev 3).
+            total = raw / 100.0 * N * float(pos.strike)
         per_unit = abs(total) / N
         if (pos.premium_ccy or spec.quote).upper() == spec.base:
             per_unit *= s_trade

@@ -51,7 +51,7 @@ from .types import Book, OptionPosition, Provenance, SpotPosition
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "Store", "get_store", "MarketContext", "StrikeResolution", "parse_strike",
+    "Store", "get_store", "close_stores", "resolve_db_path", "MarketContext", "StrikeResolution", "parse_strike",
     "parse_notional", "ImportReport", "RowResult", "CSV_COLUMNS", "SCHEMA_VERSION",
     "MarkVol", "ManualQuote", "HedgeLogEntry", "ValidationMessage",
 ]
@@ -154,6 +154,11 @@ class StrikeResolution:
     detail: str = ""
 
 
+class _UnattainableDelta(Exception):
+    """Internal: the requested delta has no strike (AMENDMENT v1.7). Re-raised as
+    ``ValueError`` with a message written to be shown to the user verbatim."""
+
+
 _RE_DELTA = re.compile(r"^([0-9]{1,2}(?:\.[0-9]+)?)\s*d\s*([cp])$", re.I)
 _RE_PIPS = re.compile(r"^(f)?\s*([+-])\s*([0-9]+(?:\.[0-9]+)?)\s*p$", re.I)
 _RE_PCT = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*%$")
@@ -231,14 +236,50 @@ def parse_strike(text: Any, pair: str, ctx: MarketContext | None = None, *,
         conv = _conv(pair)
         try:
             sig = float(surf.vol_by_delta(d, T, cp))
+            if not math.isfinite(sig) or sig <= 0.0:
+                # A surface that inverts delta -> vol can itself fail on an
+                # unattainable delta and hand back nan.  The bound below still has to
+                # be computed and reported, so anchor it on the ATM vol for this tenor
+                # rather than letting a nan quietly disable the check (which is how the
+                # user ends up with "did not converge" instead of a straight answer).
+                sig = float(surf.atm(T))
+            # AMENDMENT v1.7 (binding): premium-adjusted CALL delta is bounded, and the
+            # bound sits below common quoting deltas at long tenors / high vols (the PM
+            # verified 0.8745 at 3M/10% but only 0.2764 at 5Y/40%).  On USDJPY, USDCHF,
+            # USDCAD, USDSEK and USDNOK a "30-delta call" can simply not exist, and
+            # `strike_from_delta` correctly returns nan there.  Ask for the maximum
+            # BEFORE solving and refuse in words, so the ticket can never show a blank,
+            # a zero or a nan strike for a delta that has no strike.
+            mx = float(gk.max_attainable_delta(float(S), T, rr[0], rr[1], sig, cp, conv))
+            if math.isfinite(mx) and d > mx:
+                raise _UnattainableDelta(
+                    f"{raw}: unattainable at this tenor/vol. The largest {conv} "
+                    f"{'call' if cp > 0 else 'put'} delta any {pair} strike reaches at "
+                    f"T={T:.4f}y and {sig * 100:.2f}% vol is {mx * 100:.2f}% "
+                    f"(premium-adjusted delta is bounded). Enter a delta below "
+                    f"{mx * 100:.1f} or an absolute strike.")
             K = float(gk.strike_from_delta(d, float(S), T, rr[0], rr[1], sig, cp, conv))
             for _ in range(3):                       # tighten: vol depends on K
                 sig = float(surf.vol(K, T))
+                mx = float(gk.max_attainable_delta(float(S), T, rr[0], rr[1], sig, cp, conv))
+                if math.isfinite(mx) and d > mx:
+                    raise _UnattainableDelta(
+                        f"{raw}: unattainable at this tenor/vol. At the solved strike's "
+                        f"own vol ({sig * 100:.2f}%) the largest attainable {conv} delta "
+                        f"is {mx * 100:.2f}%. Enter a lower delta or an absolute strike.")
                 K = float(gk.strike_from_delta(d, float(S), T, rr[0], rr[1], sig, cp, conv))
+        except _UnattainableDelta as exc:
+            raise ValueError(str(exc)) from None
         except Exception as exc:                     # noqa: BLE001
             raise ValueError(f"{raw}: delta solve failed ({exc})") from exc
         if not math.isfinite(K):
-            raise ValueError(f"{raw}: delta solve did not converge")
+            # belt and braces: the bound above should have caught this, but a nan
+            # strike must never reach the ticket unexplained.
+            vtxt = f"{sig * 100:.2f}%" if math.isfinite(sig) else "unavailable"
+            raise ValueError(
+                f"{raw}: unattainable at this tenor/vol — the delta solve returned no "
+                f"strike ({conv} convention, vol {vtxt}). Premium-adjusted call delta "
+                f"is bounded; enter a lower delta or an absolute strike.")
         return StrikeResolution(K, "delta", raw, delta=d * cp, convention=conv,
                                 detail=f"{m.group(1)}d {'call' if cp > 0 else 'put'} "
                                        f"@ {sig * 100:.2f}% vol, {conv} convention")
@@ -703,12 +744,25 @@ def validate_row(raw: dict[str, Any], ctx: MarketContext | None = None, *,
             premium_paid = premium_raw
         elif unit == "pips":
             premium_paid = premium_raw * abs(notional) * spec.pip
-        else:                                    # pct_base / pct_quote (section 3.5)
+        elif unit == "pct_base":
+            # % of the BASE notional -> an amount of base ccy -> convert at SPOT.
             if not s_trade:
                 E("V-0", f"premium_unit={unit} needs trade_spot or a snapshot spot for {pair}",
                   "premium_unit")
             else:
                 premium_paid = premium_raw / 100.0 * abs(notional) * s_trade
+        else:                                    # pct_quote (section 3.5, PM rev-3 fix)
+            # % of the QUOTE notional, which by FX convention is N_base x K, so this
+            # one converts at the STRIKE, not at spot.  Rev 2 of the requirements gave
+            # both units the same formula, which made them indistinguishable; the two
+            # differ by S/K and agree only for a spot-struck option, which is exactly
+            # why an ATM worked example never caught it.  Raised by dev, ruled by the
+            # PM (docs/02_requirements.md section 3.5, "Correction (PM, rev 3)").
+            if strike is None:
+                E("V-0", "premium_unit=pct_quote needs a resolvable strike (the quote "
+                         "notional is notional_base x strike)", "premium_unit")
+            else:
+                premium_paid = premium_raw / 100.0 * abs(notional) * float(strike)
         if direction and premium_paid and (premium_paid > 0) != (direction > 0):   # V-15
             W("V-15", "sign check: you "
                       f"{'sold' if direction < 0 else 'bought'} this option but recorded a "
@@ -1615,14 +1669,67 @@ def _check_structures(rep: ImportReport) -> None:
 
 
 # ------------------------------------------------------------------ default store
-_default: Store | None = None
+#: one Store per **resolved** path, not one Store per process (QA finding Q-4).
+_stores: "dict[str, Store]" = {}
 _default_lock = threading.Lock()
 
 
+def resolve_db_path(path: str | os.PathLike | None = None) -> str:
+    """The canonical cache key for a book path: one book, one string.
+
+    ``None`` -> ``$FXGAMMA_DB`` -> :attr:`Store.DEFAULT_PATH`, then made absolute and
+    symlink-free so ``data/fxgamma.db``, ``./data/fxgamma.db`` and the absolute path
+    are one store rather than three.  ``:memory:`` is passed through untouched: each
+    in-memory database is genuinely private and is never cached.
+    """
+    raw = str(path if path is not None
+              else (os.environ.get("FXGAMMA_DB") or Store.DEFAULT_PATH))
+    if raw == ":memory:":
+        return raw
+    try:
+        return str(Path(raw).expanduser().resolve())
+    except OSError:                                        # pragma: no cover
+        return str(Path(raw).expanduser().absolute())
+
+
 def get_store(path: str | os.PathLike | None = None, *, fresh: bool = False) -> Store:
-    """Process-wide store (created on first use). ``fresh=True`` rebinds the path."""
-    global _default
+    """The store for ``path``, cached **per resolved path** (QA finding Q-4).
+
+    The previous implementation cached one store per process and ignored ``path``
+    after the first call, so a user opening a second book silently read and wrote the
+    first one -- data loss, not cosmetics.  The cache is now keyed on
+    :func:`resolve_db_path`: a second path gets a second store, and the same path
+    always gets the same connection (WAL wants one writer per process, and two
+    handles on one file is how you get a stale read).
+
+    ``path=None`` always means the default book (``$FXGAMMA_DB`` or
+    ``data/fxgamma.db``) -- it never means "whichever book was opened last", because
+    that is the ambiguity the bug was made of.  ``fresh=True`` closes and rebuilds
+    the store for *that path only* and leaves every other open book alone.
+    """
+    key = resolve_db_path(path)
+    if key == ":memory:":
+        return Store(":memory:")                 # private by definition; never cached
     with _default_lock:
-        if _default is None or fresh:
-            _default = Store(path)
-        return _default
+        if fresh and key in _stores:
+            try:
+                _stores.pop(key).close()
+            except Exception:                              # noqa: BLE001  pragma: no cover
+                pass
+        st = _stores.get(key)
+        if st is None:
+            st = _stores[key] = Store(key)
+        return st
+
+
+def close_stores() -> int:
+    """Close every cached store (tests and ``--db`` switches). Returns the count."""
+    with _default_lock:
+        n = len(_stores)
+        for st in list(_stores.values()):
+            try:
+                st.close()
+            except Exception:                              # noqa: BLE001  pragma: no cover
+                pass
+        _stores.clear()
+    return n

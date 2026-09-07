@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("%d field(s) are SYNTHETIC and badged purple in the UI - "
                     "not market data, not tradable", n_syn)
     print(f"\n  FX Gamma Desk  ->  http://{args.host}:{args.port}/\n"
-          f"  pages: /  /surface  /gamma-map  /book  /data\n"
+          f"  pages: /  /surface  /gamma-map  /book  /risk  /pnl  /lab  /data\n"
           f"  provider: {args.provider}   book: {stats['options']} options, "
           f"{stats['spots']} spot\n", flush=True)
     app.run(host=args.host, port=args.port, debug=args.debug)

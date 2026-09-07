@@ -194,3 +194,53 @@ def quotes_3pt():
 def np_seed():
     """A fixed numpy Generator for any test that needs randomness."""
     return np.random.default_rng(20260907)
+
+
+# --------------------------------------------------------------------------- #
+# book fixtures -- shared by the portfolio / signals / backtest suites
+# --------------------------------------------------------------------------- #
+#: expiries are stated relative to ``ASOF`` so the fixtures never rot
+from datetime import date, timedelta  # noqa: E402
+
+ASOF_DATE = ASOF.date()
+
+
+def in_days(n: int) -> date:
+    """An expiry ``n`` calendar days after the session ``asof``."""
+    return ASOF_DATE + timedelta(days=int(n))
+
+
+@pytest.fixture()
+def eur_book():
+    """A single-pair, single-base book: every aggregate is well defined."""
+    from fxgamma.types import Book, OptionPosition
+    return Book(
+        options=[
+            OptionPosition(id="e1", pair="EURUSD", cp=+1, strike=1.1800,
+                           expiry=in_days(32), notional_base=10e6, direction=+1),
+            OptionPosition(id="e2", pair="EURUSD", cp=-1, strike=1.1400,
+                           expiry=in_days(32), notional_base=10e6, direction=+1),
+        ], spots=[], name="qa-eur")
+
+
+@pytest.fixture()
+def mixed_book():
+    """EURUSD + USDJPY: two quote ccys and two base ccys.
+
+    The book amendment v1.6 was ruled on -- its naive theta sum adds USD to JPY and
+    is wrong by two orders of magnitude, and its base-ccy aggregates are meaningless
+    without conversion.
+    """
+    from fxgamma.types import Book, OptionPosition, SpotPosition
+    return Book(
+        options=[
+            OptionPosition(id="m1", pair="EURUSD", cp=+1, strike=1.1800,
+                           expiry=in_days(32), notional_base=10e6, direction=+1,
+                           premium_paid=95_000.0),
+            OptionPosition(id="m2", pair="USDJPY", cp=-1, strike=145.00,
+                           expiry=in_days(32), notional_base=10e6, direction=+1,
+                           premium_paid=180e6, premium_ccy="JPY"),
+        ],
+        spots=[SpotPosition(id="h1", pair="EURUSD", notional_base=-3.0e6,
+                            entry_rate=1.1600, tag="hedge")],
+        name="qa-mixed")
