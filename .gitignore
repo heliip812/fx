@@ -13,3 +13,8 @@ data/cache/*
 
 # runtime artefacts: the user's persisted manual vol marks and book
 data/manual/
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+data/*.db*
