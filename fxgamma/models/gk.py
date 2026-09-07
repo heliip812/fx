@@ -374,12 +374,21 @@ def implied_vol(price: float, S: float, K: float, T: float, rd: float, rf: float
     Parameters
     ----------
     price : quote ccy **per 1 unit of base notional** (i.e. undo notional/direction first).
-    tol : absolute tolerance on |model price - target| in quote ccy.
+    tol : absolute tolerance on |model price - target| in quote ccy.  It is used as
+        an **upper bound** on the working tolerance, which is additionally tightened
+        to ``1e-12 * price`` so that a deep-wing option worth 1e-12 is not declared
+        converged at the seed (see the comment on ``tol_eff``).
 
     Notes
     -----
     Deep-wing prices carry very little vega, so the *vol* returned there is only as
-    accurate as ``tol / vega``; the price round-trip is still exact to ``tol``.
+    accurate as the price resolution divided by vega -- roughly
+    ``1e-16 max(S e^{-rf T}, K e^{-rd T}) / vega``.  That is a real and unavoidable
+    limit, not a bug: at 20 standard deviations out there is simply no information
+    about vol left in a double-precision price.  What the function does guarantee is
+    that it never *invents* a vol: outside the no-arbitrage band it returns ``nan``,
+    and it returns ``0.0`` only when the time value is below the price's own
+    numerical noise floor.
     Reference: Jaeckel (2015), "Let's Be Rational", for the seeding idea; Clark (2011) s2.7.
     """
     if not np.isfinite([price, S, K, T, rd, rf]).all() or S <= 0 or K <= 0:
@@ -389,27 +398,58 @@ def implied_vol(price: float, S: float, K: float, T: float, rd: float, rf: float
         return float("nan")
 
     lb, ub = no_arb_bounds(S, K, T, rd, rf, cp)
+    dfd0, dff0 = math.exp(-rd * T), math.exp(-rf * T)
+    # `eps` is the *arbitrage* tolerance: how far outside the no-arb band we still
+    # accept a quote as a rounding artefact.  `noise` is something else entirely --
+    # the resolution of the price itself, since gk_price is a difference of two
+    # terms of size ~S e^{-rf T} and ~K e^{-rd T} and so carries ~1e-16 of that
+    # magnitude in absolute error.  Using one number for both is a scale-blind tie:
+    # `eps = 1e-12 * max(1, |ub|)` is 1.5e-10 for a USDJPY strike and 1.2e-12 for a
+    # EURUSD one, so the "zero time value -> return 0.0" shortcut used to fire on
+    # perfectly solvable deep-wing JPY options (a 1W 15-delta-equivalent option can
+    # be worth well under 1.5e-10 JPY per USD of notional) and hand back a
+    # confident **0.0 vol**.  Below `noise` the time value genuinely is not
+    # representable and 0.0 is the honest answer; between `noise` and `eps` we
+    # solve.
     eps = 1e-12 * max(1.0, abs(ub))
+    noise = 1e-15 * max(S * dff0, K * dfd0, 1.0)
     if price < lb - eps or price > ub + eps:
         return float("nan")
     price = min(max(price, lb), ub)
-    if price <= lb + eps:            # zero time value -> zero vol
+    if price <= lb + noise:          # time value below its own numerical resolution
         return 0.0
-    if price >= ub - eps:            # maximum time value -> unbounded vol
+    if price >= ub - noise:          # maximum time value -> unbounded vol
         return float("nan")
+
 
     dfd = math.exp(-rd * T)
     F = S * math.exp((rd - rf) * T)
     c = price / dfd                                    # undiscounted Black price
     sqrtT = math.sqrt(T)
 
+    # ---- always invert on the OUT-of-the-money leg ---------------------- #
+    # An in-the-money price is (forward intrinsic) + (time value), and for a deep
+    # ITM option the intrinsic is O(1) while the time value can be O(1e-13).
+    # Subtracting inside the objective destroys every significant digit of the only
+    # part that depends on sigma: a 1D EURUSD 0.92-moneyness call worth 0.0933 with
+    # 2e-13 of time value inverted to 3.6e-3 *relative* vol error, while its own
+    # put -- same vol, same strike, price 2e-13 -- inverted to machine precision.
+    # Put-call parity is exact and free, so switch legs and the deep-ITM case simply
+    # becomes the deep-OTM one.  (Jaeckel 2015 makes the same move.)
+    cpw, cw = cp, c
+    if cp * (F - K) > 0.0:
+        cpw = -cp
+        cw = c - cp * (F - K)                          # undiscounted parity
+        cw = max(cw, 0.0)
+    target = cw * dfd                                  # what the solver matches
+
     def _black(sig: float) -> float:
         if sig <= 0.0:
-            return max(cp * (F - K), 0.0)
+            return max(cpw * (F - K), 0.0)
         v = sig * sqrtT
         d1 = math.log(F / K) / v + 0.5 * v
         d2 = d1 - v
-        return cp * (F * float(_norm_cdf(cp * d1)) - K * float(_norm_cdf(cp * d2)))
+        return cpw * (F * float(_norm_cdf(cpw * d1)) - K * float(_norm_cdf(cpw * d2)))
 
     def _black_vega(sig: float) -> float:
         v = max(sig, VOL_MIN) * sqrtT
@@ -418,11 +458,10 @@ def implied_vol(price: float, S: float, K: float, T: float, rd: float, rf: float
 
     # ---- seed --------------------------------------------------------- #
     x = math.log(F / K)
-    atm_c = c - max(cp * (F - K), 0.0) * 0.0
-    sig = SQRT_2PI / sqrtT * (atm_c / F)               # Brenner-Subrahmanyam (ATM)
+    sig = SQRT_2PI / sqrtT * (cw / F)                  # Brenner-Subrahmanyam (ATM)
     if not (1e-4 < sig < 5.0) or abs(x) > 0.05:
         # Corrado-Miller style widening for away-from-the-money
-        cc = c - 0.5 * cp * (F - K)
+        cc = cw - 0.5 * cpw * (F - K)
         rad = max(cc * cc - (F - K) ** 2 / math.pi, 0.0)
         sig = SQRT_2PI / (sqrtT * (F + K)) * (cc + math.sqrt(rad)) * 2.0
     if not np.isfinite(sig) or sig <= 0.0:
@@ -430,10 +469,18 @@ def implied_vol(price: float, S: float, K: float, T: float, rd: float, rf: float
     sig = min(max(sig, 1e-3), 3.0)
 
     # ---- safeguarded Newton ------------------------------------------- #
+    # The stopping tolerance has to be relative as well as absolute.  A flat
+    # `abs(diff) < tol` with tol = 1e-10 quote ccy is satisfied *immediately*, at
+    # any starting vol, for an option worth 1e-12 -- so the deep wings used to
+    # return the seed.  Tightening to the price's own scale sends those cases to
+    # the Brent fallback, which brackets in sigma (xtol 1e-14) and is insensitive
+    # to the price magnitude.  `noise` floors it at what double precision can
+    # actually resolve, so this never becomes an infinite loop.
+    tol_eff = min(float(tol), max(1e-12 * target, noise))
     a, b = lo, hi
     for _ in range(max_iter):
-        diff = _black(sig) * dfd - price
-        if abs(diff) < tol:
+        diff = _black(sig) * dfd - target
+        if abs(diff) < tol_eff:
             return float(sig)
         if diff > 0.0:
             b = min(b, sig)
@@ -454,7 +501,7 @@ def implied_vol(price: float, S: float, K: float, T: float, rd: float, rf: float
     from scipy.optimize import brentq   # deferred: only the fallback path needs it
 
     def _obj(s: float) -> float:
-        return _black(s) * dfd - price
+        return _black(s) * dfd - target
 
     a, b = lo, hi
     fa, fb = _obj(a), _obj(b)

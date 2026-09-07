@@ -296,6 +296,26 @@ class Session:
         self._events = df
         return df
 
+    def smile_quotes(self, pair: str) -> list[Any]:
+        """The input quotes behind the surface - manual marks first (T-1), else the provider.
+
+        The Surface page needs these to show calibration residuals: a model is never
+        shown as valid without the reproduction error on its own inputs (REQ-016).
+        """
+        pair = pair.upper()
+        if self.manual is not None:
+            try:
+                marks = self.manual.store.get(pair)
+                if marks:
+                    return [m.to_smile_quotes() for m in marks]
+            except Exception:                              # noqa: BLE001
+                pass
+        try:
+            return list(self.make_provider().smile_quotes(pair, self.snapshot().asof))
+        except Exception as exc:                           # noqa: BLE001
+            log.warning("smile_quotes(%s) failed: %s", pair, exc)
+            return []
+
     def source_status(self) -> list[Any]:
         rows = []
         try:

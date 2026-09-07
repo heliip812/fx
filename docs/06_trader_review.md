@@ -112,7 +112,7 @@ S = 1.0850, σ = 7.05%:**
 |---|---|
 | Γ₁ (both legs) | **EUR 3.95mm per 1%** (EUR 0.395mm per 10 pips) |
 | Straddle premium | ~175 pips = **1.75% of EUR notional** ≈ USD 190k |
-| θ (calendar) | ≈ **USD 5,800/day**, ≈ USD 17,400 Fri→Mon |
+| θ (calendar) | ~~USD 5,800/day, USD 17,400 Fri→Mon~~ **CORRECTED (PM, amendment v1.4): USD ~2,870/day, ~USD 8,600 Fri→Mon.** Pricing this very trade gives θ = -2,868 and Γ₁ = 3.914mm; the table's own Γ₁ and 40-pip breakeven imply 2,915, not 5,800. Likely a double-count of the two legs. |
 | Daily breakeven | **σ/√365 = 0.369% = 40 pips** |
 | Typical trading-day move at that vol | σ/√252 = 0.444% = **48 pips** |
 
@@ -245,7 +245,7 @@ weighted opt-in and badged — is the right ruling.
 
 **But the headline card as specified is still wrong on Fridays**, and Fridays are 20% of mornings.
 REQ-038/REQ-039 show θ "per calendar day". On a Friday morning that number is a lie by a factor of
-three: you are about to pay three days. On the reference EUR 10mm straddle that is USD 5,800 shown
+three: you are about to pay three days. On the reference EUR 10mm straddle that is USD 8,600 (3 x 2,870) shown
 against USD 17,400 actually owed.
 
 **Ship this default:**
@@ -461,7 +461,7 @@ Ranked by what I would notice absent on day one.
 | **MISS-1** | **Manual OTC quote grid as a first-class morning input.** A per-pair, per-tenor grid of ATM / RR25 / BF25 (+ 10d optional) that the trader pastes or types in under 30 seconds, timestamped, versioned, feeding `build_surface` directly, and flipping the surface status from `INDICATIVE` to `MARK`. | Without it the app has no mark and cannot be used to hedge (§1.4, Q-3). With it, every other analytic in the document becomes trustworthy. | New Must on page 2, mirrored on page 8. This is the top build priority in the whole project. |
 | **MISS-2** | **Manual forward-points entry per pair/tenor** (Q-7). | Removes the flat-rate problem (R-9, NG-6) for a fraction of the cost of a curve build, and fixes ATMF / delta-neutral strikes. | Same grid as MISS-1. **CR-3.** |
 | **MISS-3** | **Vega ladder by tenor bucket**, and gamma bucketed by **expiry date** (today / tomorrow / this week / next week / beyond). | A gamma book's defining question is "how much of my gamma expires this week". One aggregate vega and one aggregate gamma number cannot answer it. REQ-048 does concentration but as an HHI heat table, which is a risk-management artefact, not a trading one. | Promote into REQ-038's card set; REQ-048 stays as the Should it is. |
-| **MISS-4** | **The one-line answer.** A single, always-visible sentence per pair: "**LONG GAMMA · EUR 4.0mm per 1% · pays above 41 pips today · costs USD 5,800 (USD 17,400 to Monday)**". | The persona explicitly abandons a screen that takes >2s to answer "am I long or short gamma". No REQ produces that answer; REQ-038 produces a grid of cards from which the user must derive it. | New Must, top of page 5 and repeated in the app header. See §4. |
+| **MISS-4** | **The one-line answer.** A single, always-visible sentence per pair: "**LONG GAMMA · EUR 4.0mm per 1% · pays above 41 pips today · costs USD 2,870 (USD 8,600 to Monday)**". | The persona explicitly abandons a screen that takes >2s to answer "am I long or short gamma". No REQ produces that answer; REQ-038 produces a grid of cards from which the user must derive it. | New Must, top of page 5 and repeated in the app header. See §4. |
 | **MISS-5** | **Reconcile box** — enter a broker premium (any of the four units) for one position, get the implied vol and the difference vs the surface, in vol points. | The single check that validates pricer, day count, premium convention, delta convention and surface at once. Answers Q-10. Two hours of work. | New Must on page 4. |
 | **MISS-6** | **Manual OTC expiry-notional table** (pair, strike, cut, notional, note), drawn on the Risk ladder and the Gamma Map. | This is what actually pins spot, and it is what a desk actually watches. It replaces most of the value the CME adapter was supposed to provide (Q-8). | New Should on page 3, drawn on page 5. |
 | **MISS-7** | **Hedge carry / roll cost.** A spot delta hedge is a T+2 position that must be rolled (tom-next). On USDJPY at a ~3.5% differential, carrying a USD 100mm hedge is ~USD 10k a day, and it is not gamma, theta or vega — today it lands in `unexplained`. | REQ-051's `carry` bar exists but nothing in the spec computes the *hedge's* carry, and §3.2's spot ticket has a `value_date` that nothing consumes. | Acceptance criterion on REQ-051 and REQ-055; forward points from MISS-2 make it a one-liner. |

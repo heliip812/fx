@@ -302,6 +302,26 @@ def _c_parsers(ctx: Ctx) -> str:
     return f"{len(ok)} parsers ok against recorded fixtures"
 
 
+def _short(exc: BaseException) -> str:
+    """One-token summary of a failure, for the "which ids did we try" lists."""
+    from fxgamma.data import _http
+
+    if isinstance(exc, _http.OfflineError):
+        return "unreachable"
+    m = re.search(r"HTTP (\d{3})", str(exc))
+    if m:
+        return "HTTP" + m.group(1)
+    return type(exc).__name__
+
+
+def _reraise_transport(errs: Sequence[BaseException]) -> None:
+    """If every attempt died in transport, re-raise that -- a blocked host is not a bad id."""
+    from fxgamma.data import _http
+
+    if errs and all(isinstance(e, _http.OfflineError) for e in errs):
+        raise errs[-1]
+
+
 def _expect_raises(fn: Callable[[], Any]) -> bool:
     try:
         fn()
@@ -369,20 +389,23 @@ def _c_fred_ccy(ccy: str) -> Callable[[Ctx], str]:
         from fxgamma.data import rates_fred as m
 
         tried: list[str] = []
+        errs: list[BaseException] = []
         for spec in m.SERIES.get(ccy, []):
             try:
                 df = m.parse_fred_csv(m.fetch_series_csv(
                     [spec.series_id], date.today() - timedelta(days=400), date.today()))
                 v = m.latest_value(df.iloc[:, 0], max_stale_days=400 if spec.freq == "M" else 45)
                 if v is None:
-                    tried.append(f"{spec.series_id}(stale/empty)")
+                    tried.append(f"{spec.series_id}=stale/empty")
                     continue
                 cc = m.to_continuous(v, spec.basis)
                 return (f"{spec.series_id} = {v:.4f}% -> cc {cc*100:.4f}% "
                         f"[{spec.confidence} confidence, {spec.basis}]"
                         + (f"; earlier ids failed: {', '.join(tried)}" if tried else ""))
             except Exception as exc:                                # noqa: BLE001
-                tried.append(f"{spec.series_id}({type(exc).__name__})")
+                tried.append(f"{spec.series_id}={_short(exc)}")
+                errs.append(exc)
+        _reraise_transport(errs)          # a proxy/DNS block is not a missing series id
         from fxgamma.data import _http
 
         raise _http.HttpError(
@@ -392,11 +415,15 @@ def _c_fred_ccy(ccy: str) -> Callable[[Ctx], str]:
 
 # ---- vol -------------------------------------------------------------------------
 def _c_yahoo_crumb(ctx: Ctx) -> str:
+    from fxgamma.data import _http
     from fxgamma.data import vol_etf_options as m
 
+    # fetch_crumb() deliberately swallows failures (the chain works without a crumb), so hit
+    # the cookie host directly first -- otherwise a blocked network would read as "PASS".
+    _http.get(m.COOKIE_URL)
     crumb = m.fetch_crumb()
     ctx.scratch["crumb"] = crumb
-    return f"crumb {'obtained' if crumb else 'not required/not issued'}"
+    return f"cookie host reachable; crumb {'obtained' if crumb else 'not issued (may be optional)'}"
 
 
 def _c_etf_chain(symbol: str, required: bool = False) -> Callable[[Ctx], str]:
@@ -426,13 +453,33 @@ def _c_etf_smile(ctx: Ctx) -> str:
 
 # ---- vol indices -----------------------------------------------------------------
 def _c_vol_index(key: str) -> Callable[[Ctx], str]:
+    """Probe EVERY candidate id for `key` and say which ones actually resolve."""
     def run(ctx: Ctx) -> str:
+        from fxgamma.data import _http
         from fxgamma.data import vol_indices as m
 
-        s, spec = m.index_history(key, date.today() - timedelta(days=365), date.today())
-        return (f"{spec.fred_id} ({s.attrs.get('series_id')}): {len(s)} obs, "
-                f"last {s.iloc[-1]*100:.2f}% on {s.index[-1]:%Y-%m-%d} "
-                f"[declared confidence: {spec.confidence}]")
+        start, end = date.today() - timedelta(days=365), date.today()
+        tried: list[str] = []
+        errs: list[BaseException] = []
+        for spec in m.CANDIDATES.get(key.upper(), []):
+            for label, fn in ((f"FRED:{spec.fred_id}",
+                               lambda sp=spec: m.parse_fred_index(m.fetch_index(sp, start, end))),
+                              (f"CBOE:{spec.cboe_ticker}",
+                               lambda sp=spec: m.parse_cboe_csv(
+                                   m.fetch_cboe_history(sp.cboe_ticker)))):
+                try:
+                    ser = fn()
+                    if ser.empty:
+                        tried.append(f"{label}=empty")
+                        continue
+                    return (f"{label} RESOLVES: {len(ser)} obs, last {ser.iloc[-1]*100:.2f}% "
+                            f"on {ser.index[-1]:%Y-%m-%d} [declared {spec.confidence}]"
+                            + (f"; failed: {', '.join(tried)}" if tried else ""))
+                except Exception as exc:                            # noqa: BLE001
+                    tried.append(f"{label}={_short(exc)}")
+                    errs.append(exc)
+        _reraise_transport(errs)
+        raise _http.HttpError(f"no vol index resolved for {key}: {', '.join(tried) or 'no candidates'}")
     return run
 
 
@@ -560,22 +607,36 @@ def verdicts(results: Sequence[Result]) -> dict[str, tuple[bool, str]]:
 
 # ===================================================================== output
 def render(results: list[Result], ctx: Ctx, color: bool) -> str:
+    import textwrap
+
     cols = ["", "source", "group", "ms", "rows / value fetched"]
     rows = [[r.status, r.name, r.group,
              "-" if r.latency_ms is None else f"{r.latency_ms:.0f}",
-             (r.detail or r.reason)] for r in results]
+             (r.detail if r.status == PASS else (r.reason.split(" - ")[0] or r.status))]
+            for r in results]
     w = [max(len(str(x[i])) for x in [cols] + rows) for i in range(len(cols))]
-    w[4] = min(w[4], 84)
+    w[4] = min(w[4], 76)
+    pad = " " * (w[0] + w[1] + w[2] + w[3] + 8)
     line = "  ".join("-" * n for n in w)
     out = ["  ".join(str(c).ljust(n) for c, n in zip(cols, w)), line]
+    seen_reasons: set[str] = set()
     for r, row in zip(results, rows):
         cell = str(row[4])
-        cell = cell if len(cell) <= w[4] else cell[: w[4] - 1] + "…"
+        cell = cell if len(cell) <= w[4] else cell[: w[4] - 1] + "\u2026"
         txt = "  ".join([str(row[0]).ljust(w[0]), str(row[1]).ljust(w[1]),
                          str(row[2]).ljust(w[2]), str(row[3]).rjust(w[3]), cell])
         out.append((_COLOR[r.status] + txt + _RESET) if color else txt)
-        if r.status in _BAD and r.reason and r.detail:
-            out.append(" " * (w[0] + 2) + "  -> " + r.reason)
+        if r.status in _BAD:
+            body = r.reason if r.reason else r.exc
+            if body in seen_reasons:                 # identical diagnosis: say it once
+                out.append(pad + "-> (same diagnosis as above)")
+            else:
+                seen_reasons.add(body)
+                for i, seg in enumerate(textwrap.wrap(body, 96) or [""]):
+                    out.append(pad + ("-> " if i == 0 else "   ") + seg)
+            if ctx.verbose and r.exc and r.exc not in body:
+                for seg in textwrap.wrap("raised: " + r.exc, 96):
+                    out.append(pad + "   " + seg)
     return "\n".join(out)
 
 

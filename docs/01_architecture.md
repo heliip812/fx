@@ -314,3 +314,42 @@ Required: a daily chain **snapshotter** that appends each day's pulled chain to 
 shipped in v1 so history starts accumulating from the user's first run, plus honest UI copy stating
 how many days of history exist before a z-score is meaningful. A z-score computed on 11 days of
 self-collected history must say so.
+
+---
+
+# AMENDMENT v1.4 — PM arbitration: BA vs trader on the reference trade (binding)
+
+The BA challenged the trader's reference table (`docs/06_trader_review.md` §2, lines 108-116) as
+internally inconsistent. **The BA is right.** The PM settled it by pricing the trader's own
+reference trade rather than taking either side's word.
+
+Reference trade: EURUSD 1M ATM straddle, EUR 10mm per leg, spot 1.084, sigma 7.05% (all the
+trader's own figures). Priced through `gk_greeks` on the DNS strike:
+
+| Quantity | Trader's table | Priced | Verdict |
+|---|---|---|---|
+| Gamma_1pct, both legs | EUR 3.95mm per 1% | EUR **3.914mm** | ✅ agrees |
+| Theta, calendar | USD **5,800**/day | USD **2,868**/day | ❌ trader ~2x too high |
+| Daily breakeven | 0.369% = 40 pips | 0.3677% = **39.9 pips** | ✅ agrees |
+| Cross-check sigma/sqrt(365) | — | 0.3690% = **40.0 pips** | ✅ identity holds to 0.3% |
+
+The three numbers are not independent: given Gamma_1pct and the breakeven, theta is determined.
+The trader's own Gamma_1pct of 3.95mm and breakeven of 0.369% imply **USD 2,915/day**, which
+matches the priced 2,868 and not 5,800. The likely slip is double-counting the two straddle legs in
+theta while the quoted gamma was already both-legs.
+
+**Rulings:**
+1. The correct reference theta is **~USD 2,870/day**, ~USD 8,600 Friday to Monday (3 calendar days).
+   The 5,800 / 17,400 figures are withdrawn wherever they appear.
+2. This matters beyond a table: MISS-4 asks for an always-visible header card reading
+   "costs USD 5,800". Shipped as-is it would overstate the daily cost of carry by 2x in the single
+   most-read number in the app. **Binding on `dev`: the header card computes theta from
+   `book_greeks`, never from a constant.**
+3. QA: adopt this trade as a **golden fixture** — Gamma_1pct 3.914mm, theta -2,868, breakeven
+   39.9 pips, and assert the `BE = sigma/sqrt(365)` identity to <1%. It cross-checks gamma, theta
+   and the breakeven helper in one test.
+4. The BA's REQ-046 correction is **confirmed independently**: the delta-hedged carry is
+   `50·Γ₁·S·(σ_r² − σ_i²)·Δt_years`, and its worked example (one day of 9% realised against 7.05%
+   implied = +USD 1,836) reproduces to USD 1,834 on the PM's own derivation.
+5. The trader's **W-7** stands and is accepted: `√365` for economics (breakeven, theta), `√252` for
+   distance and touch probability. Never conflate them; print the basis on the panel.

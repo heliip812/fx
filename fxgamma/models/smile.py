@@ -247,6 +247,15 @@ def risk_neutral_density(vol_fn: Callable[[np.ndarray], np.ndarray],
       delta-function artefacts in ``q`` at the knots.
     * The integral is always slightly < 1: the tails outside the grid carry the
       rest.  At ``n_std = 6`` the deficit is ~1e-6 for typical G10 vols.
+    * **``n`` has an optimum and more is not better.**  The second difference
+      amplifies the price's own round-off by ``4 eps |C| / h^2``, so the noise
+      floor of ``q`` grows like ``n^2`` while the truncation error falls like
+      ``n^-2``.  Past roughly ``n = 800`` on a G10 smile you are measuring double
+      precision, not the surface: an EURUSD overnight slice that reports
+      ``min q = +1.2e-9`` at ``n = 401`` reports ``-9.3e-6`` at ``n = 8001``,
+      with the negativity scaling exactly as ``n^2``.  Do not read that as
+      arbitrage.  ``n = 401..801`` is the sweet spot and is what the surface
+      ``diagnostics()`` methods use.
     * Negative density is the *definition* of butterfly (call-spread convexity)
       arbitrage; it is the single most useful smile sanity check on a desk.
     """

@@ -141,6 +141,24 @@ def rel_err(a: float, b: float, floor: float = 1e-14) -> float:
     return abs(a - b) / max(abs(b), abs(a), floor)
 
 
+def greek_mismatch(analytic: dict[str, float], fd: dict[str, float],
+                   names: tuple[str, ...], *, rtol: float, atol: float
+                   ) -> dict[str, tuple[float, float, float]]:
+    """Greeks where ``|analytic - fd| > rtol |fd| + atol``.
+
+    ``atol`` exists only to stop a Greek that is *numerically zero* (a 5-day 4-vol
+    2.5-sigma-OTM theta of 1.7e-9 quote ccy per unit notional -- 0.0017 on a 1mm
+    ticket) from failing on finite-difference noise.  It is set several orders of
+    magnitude below anything that could move a hedge.
+    """
+    out = {}
+    for g in names:
+        a, f = analytic[g], fd[g]
+        if abs(a - f) > rtol * max(abs(a), abs(f)) + atol:
+            out[g] = (a, f, rel_err(a, f))
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # data-layer fixtures -- one synthetic provider for the whole session
 # --------------------------------------------------------------------------- #

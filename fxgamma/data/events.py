@@ -6,9 +6,20 @@ The calendar is a **versioned, user-editable CSV shipped in the repo** at
 
     date, time_utc, ccy, event, importance, source        importance in {1, 2, 3}
 
-3 = top tier (FOMC/ECB/BoJ/BoE decisions, US CPI, US NFP), 2 = second tier (PMIs, GDP,
-minutes), 1 = background.  ``events()`` returns those six columns plus a derived tz-aware
-``datetime``.
+3 = top tier, 2 = second tier, 1 = background.  ``events()`` returns those six columns plus
+a derived tz-aware ``datetime``.
+
+**Importance policy** (CG-6 names the tier-3 examples; this is how we apply it consistently):
+
+  * **3** -- every G10 central-bank *rate decision* (FOMC, ECB GC, BoJ, BoE, SNB, BoC, RBA,
+    RBNZ, Riksbank, Norges Bank) plus the headline inflation print of each G3 economy
+    (US CPI, US NFP, EZ flash HICP, UK CPI, Japan national CPI).
+  * **2** -- everything else that moves a G10 spot on the day: FOMC minutes, ISM, retail
+    sales, PCE, flash PMIs, UK labour market, Tankan, listed option expiry, the month-end fix.
+  * **1** -- background; nothing in the shipped file uses it yet.
+
+Note ``date`` is the **UTC** date, not the local one: Japan's 08:30 JST CPI is stored as
+23:30 on the previous UTC day (see :func:`_utc_stamp`).
 
 Why a curated CSV and not a feed
 --------------------------------
@@ -38,8 +49,13 @@ Rule-derived rows are exact:
   * **Listed option expiry** -- third Friday, 16:00 America/New_York (the CME/ETF cut).
   * **NY option cut** -- 10:00 America/New_York daily is *not* an event and is not emitted.
 
-Everything else (FOMC, ECB GC, BoJ MPM, BoE MPC, US CPI) is hand-entered and flagged
-``approx:`` -- **verify against the central bank's own calendar before trading around it.**
+Everything else -- every central-bank decision, US CPI/PCE/ISM/retail sales, EZ HICP and
+PMIs, UK CPI and labour market, Japan CPI and Tankan -- is hand-entered or derived from a
+"usual day of the month" rule and is flagged ``approx:<host>``.  **These dates are curated,
+not fetched: verify them against the official calendars in** :data:`LIVE_SOURCES` **before
+trading around them.**  A wrong event date does not corrupt a price; it corrupts the
+event-weighted business time in :func:`~fxgamma.portfolio.risk.time_decay`, which is opt-in
+and badged for exactly this reason.
 """
 from __future__ import annotations
 
@@ -84,6 +100,13 @@ LIVE_SOURCES = {
     "BoE": "https://www.bankofengland.co.uk/monetary-policy/upcoming-mpc-dates",
     "RBA": "https://www.rba.gov.au/schedules-events/",
     "SNB": "https://www.snb.ch/en/the-snb/mandates-goals/monetary-policy-assessments",
+    "BoC": "https://www.bankofcanada.ca/press/upcoming-events/",
+    "RBNZ": "https://www.rbnz.govt.nz/news-and-events",
+    "Riksbank": "https://www.riksbank.se/en-gb/press-and-published/meeting-calendar/",
+    "Norges Bank": "https://www.norges-bank.no/en/news-events/calendar/",
+    "Eurostat (HICP)": "https://ec.europa.eu/eurostat/news/release-calendar",
+    "ONS (UK CPI)": "https://www.ons.gov.uk/releasecalendar",
+    "Japan (CPI/Tankan)": "https://www.stat.go.jp/english/data/cpi/  |  https://www.boj.or.jp/en/statistics/tk/",
 }
 
 
@@ -108,6 +131,32 @@ def _local_to_utc(d: date, hhmm: str, tzname: str) -> str:
 
 def _ny_to_utc(d: date, hh: int, mm: int) -> str:
     return _local_to_utc(d, f"{hh:02d}:{mm:02d}", "America/New_York")
+
+
+def _utc_stamp(d: date, hhmm: str, tzname: str) -> tuple[str, str]:
+    """Local wall clock -> ``(UTC date, UTC HH:MM)``.
+
+    Unlike :func:`_local_to_utc` this also returns the **UTC calendar date**, which differs
+    from the local date for Asian morning releases (Japan CPI at 08:30 JST is 23:30 UTC on
+    the *previous* day).  Every row emitted by :func:`regenerate` goes through here so the
+    stored ``date + time_utc`` pair is a correct UTC instant.
+    """
+    hh, mm = (int(x) for x in hhmm.split(":"))
+    stamp = datetime.combine(d, time(hh, mm), tzinfo=ZoneInfo(tzname)).astimezone(UTC)
+    return stamp.date().isoformat(), stamp.strftime("%H:%M")
+
+
+def _row(d: date, hhmm: str, tzname: str, ccy: str, event: str, importance: int,
+         source: str) -> dict[str, object]:
+    iso, utc_hhmm = _utc_stamp(d, hhmm, tzname)
+    return {"date": iso, "time_utc": utc_hhmm, "ccy": ccy, "event": event,
+            "importance": int(importance), "source": source}
+
+
+def _nearest_weekday(d: date, forward: bool = True) -> date:
+    while d.weekday() >= 5:
+        d += timedelta(days=1 if forward else -1)
+    return d
 
 
 # ------------------------------------------------------------------------------ load
@@ -191,6 +240,14 @@ CB_MEETINGS: dict[str, list[tuple[str, str, str, str]]] = {
     "NZD": [(d, "RBNZ OCR decision", "14:00", "Pacific/Auckland") for d in
             ["2026-10-07", "2026-11-25", "2027-02-17", "2027-04-14",
              "2027-05-26", "2027-07-07", "2027-08-18", "2027-10-06", "2027-11-24"]],
+    "SEK": [(d, "Riksbank policy decision", "09:30", "Europe/Stockholm") for d in
+            ["2026-09-22", "2026-11-05", "2026-12-16",
+             "2027-02-04", "2027-03-25", "2027-05-05", "2027-06-17",
+             "2027-08-25", "2027-09-22", "2027-11-04", "2027-12-15"]],
+    "NOK": [(d, "Norges Bank policy decision", "10:00", "Europe/Oslo") for d in
+            ["2026-09-24", "2026-11-05", "2026-12-17",
+             "2027-01-28", "2027-03-25", "2027-05-06", "2027-06-17",
+             "2027-08-19", "2027-09-23", "2027-11-04", "2027-12-16"]],
 }
 
 #: US CPI is nominally "around the 10th-15th, 08:30 ET"; the exact day moves. APPROXIMATE.
@@ -204,41 +261,70 @@ def regenerate(start_year: int, end_year: int) -> pd.DataFrame:
     for y in range(start_year, end_year + 1):
         for m in range(1, 13):
             nfp = nth_weekday(y, m, 4, 1)                       # first Friday
-            rows.append({"date": nfp.isoformat(), "time_utc": _ny_to_utc(nfp, 8, 30),
-                         "ccy": "USD", "event": "US Non-Farm Payrolls",
-                         "importance": 3, "source": "rule:first-friday-0830ET"})
+            rows.append(_row(nfp, "08:30", "America/New_York", "USD",
+                             "US Non-Farm Payrolls", 3, "rule:first-friday-0830ET"))
 
             exp = nth_weekday(y, m, 4, 3)                       # third Friday
-            rows.append({"date": exp.isoformat(), "time_utc": _ny_to_utc(exp, 16, 0),
-                         "ccy": "USD", "event": "Listed option expiry (CME/ETF)",
-                         "importance": 2, "source": "rule:third-friday-1600ET"})
+            rows.append(_row(exp, "16:00", "America/New_York", "USD",
+                             "Listed option expiry (CME/ETF)", 2,
+                             "rule:third-friday-1600ET"))
 
             # CPI: nearest weekday to the 12th, 08:30 ET. APPROXIMATE by construction.
-            d = date(y, m, min(_CPI_TARGET_DAY, _cal.monthrange(y, m)[1]))
-            while d.weekday() >= 5:
-                d += timedelta(days=1)
-            rows.append({"date": d.isoformat(), "time_utc": _ny_to_utc(d, 8, 30),
-                         "ccy": "USD", "event": "US CPI",
-                         "importance": 3, "source": "approx:bls.gov"})
+            d = _nearest_weekday(date(y, m, min(_CPI_TARGET_DAY, _cal.monthrange(y, m)[1])))
+            rows.append(_row(d, "08:30", "America/New_York", "USD", "US CPI", 3,
+                             "approx:bls.gov"))
 
-            eom = date(y, m, _cal.monthrange(y, m)[1])
-            while eom.weekday() >= 5:
-                eom -= timedelta(days=1)
-            rows.append({"date": eom.isoformat(), "time_utc": _ny_to_utc(eom, 16, 0),
-                         "ccy": "USD", "event": "Month-end fix (WMR 16:00 LDN / NY close)",
-                         "importance": 2, "source": "rule:last-business-day"})
+            eom = _nearest_weekday(date(y, m, _cal.monthrange(y, m)[1]), forward=False)
+            rows.append(_row(eom, "16:00", "America/New_York", "USD",
+                             "Month-end fix (WMR 16:00 LDN / NY close)", 2,
+                             "rule:last-business-day"))
+
+            # ---- other top-tier G3 data.  All APPROXIMATE: the exact day moves month to
+            # ---- month and only the statistical office's own calendar is authoritative.
+            rows.append(_row(_nearest_weekday(date(y, m, 1)), "10:00", "America/New_York",
+                             "USD", "US ISM Manufacturing PMI", 2,
+                             "approx:ismworld.org (1st business day)"))
+            rows.append(_row(_nearest_weekday(date(y, m, 15)), "08:30", "America/New_York",
+                             "USD", "US Retail Sales", 2, "approx:census.gov (~15th)"))
+            rows.append(_row(eom, "08:30", "America/New_York", "USD",
+                             "US PCE price index", 2, "approx:bea.gov (~last business day)"))
+
+            # Euro area flash HICP -- last working day of the month, 11:00 CET (Eurostat)
+            rows.append(_row(eom, "11:00", "Europe/Berlin", "EUR",
+                             "EZ flash HICP", 3, "approx:ec.europa.eu/eurostat"))
+            rows.append(_row(_nearest_weekday(date(y, m, 23)), "10:00", "Europe/Berlin",
+                             "EUR", "EZ flash PMIs (HCOB)", 2, "approx:pmi.spglobal.com"))
+
+            # UK CPI -- ONS, ~3rd Wednesday, 07:00 London
+            rows.append(_row(nth_weekday(y, m, 2, 3), "07:00", "Europe/London", "GBP",
+                             "UK CPI", 3, "approx:ons.gov.uk (~3rd Wednesday)"))
+            rows.append(_row(nth_weekday(y, m, 1, 2), "07:00", "Europe/London", "GBP",
+                             "UK labour market report", 2, "approx:ons.gov.uk"))
+
+            # Japan national CPI -- ~3rd Friday, 08:30 JST == 23:30 UTC the PREVIOUS day
+            rows.append(_row(nth_weekday(y, m, 4, 3), "08:30", "Asia/Tokyo", "JPY",
+                             "Japan national CPI", 3, "approx:stat.go.jp (~3rd Friday)"))
+            if m in (1, 4, 7, 10):                              # Tankan, quarterly
+                rows.append(_row(_nearest_weekday(date(y, m, 1)), "08:50", "Asia/Tokyo",
+                                 "JPY", "BoJ Tankan survey", 2, "approx:boj.or.jp"))
 
     host = {"USD": "federalreserve.gov", "EUR": "ecb.europa.eu", "JPY": "boj.or.jp",
             "GBP": "bankofengland.co.uk", "CHF": "snb.ch", "CAD": "bankofcanada.ca",
-            "AUD": "rba.gov.au", "NZD": "rbnz.govt.nz"}
+            "AUD": "rba.gov.au", "NZD": "rbnz.govt.nz", "SEK": "riksbank.se",
+            "NOK": "norges-bank.no"}
     for ccy, meetings in CB_MEETINGS.items():
         for iso, label, hhmm, tzname in meetings:
             d = date.fromisoformat(iso)
             if not (start_year <= d.year <= end_year):
                 continue
-            rows.append({"date": iso, "time_utc": _local_to_utc(d, hhmm, tzname), "ccy": ccy,
-                         "event": label, "importance": 3,
-                         "source": f"approx:{host.get(ccy, 'central bank')}"})
+            rows.append(_row(d, hhmm, tzname, ccy, label, 3,
+                             f"approx:{host.get(ccy, 'central bank')}"))
+            if ccy == "USD":                                   # minutes, 3 weeks later
+                mins = d + timedelta(days=21)
+                if start_year <= mins.year <= end_year:
+                    rows.append(_row(mins, "14:00", "America/New_York", "USD",
+                                     "FOMC minutes", 2,
+                                     "rule:fomc+3w (approx, verify federalreserve.gov)"))
 
     df = pd.DataFrame(rows)[CSV_COLUMNS]
     return df.sort_values(["date", "time_utc", "ccy"], ignore_index=True)

@@ -1,0 +1,94 @@
+/* FX Gamma Desk - dark theme. Self-contained: no CDN, so the app is legible offline. */
+:root{
+  --bg:#0e1116; --panel:#161b22; --panel2:#1c232c; --border:#2b3440; --grid:#222b36;
+  --text:#e6edf3; --dim:#9aa7b4; --faint:#6e7d8d; --accent:#4da3ff;
+  --pos:#3fb950; --neg:#f85149; --warn:#d29922;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+html,body{background:var(--bg); color:var(--text); margin:0; padding:0;
+  font-family:var(--mono); font-size:13px; -webkit-font-smoothing:antialiased;}
+#react-entry-point{min-height:100vh; background:var(--bg);}
+a{color:var(--accent); text-decoration:none;}
+h1,h2,h3,h4{margin:0; font-weight:650;}
+
+/* ---------- shell ---------- */
+.app-header{position:sticky; top:0; z-index:50; background:#11161d;
+  border-bottom:1px solid var(--border); padding:8px 14px 0 14px;}
+.app-title{font-size:14px; font-weight:800; letter-spacing:.06em; color:var(--text);}
+.app-title span{color:var(--accent);}
+.header-row{display:flex; align-items:center; gap:14px; flex-wrap:wrap;}
+.header-meta{color:var(--dim); font-size:11px; display:flex; gap:14px; flex-wrap:wrap;
+  align-items:center;}
+.nav{display:flex; gap:2px; margin-top:8px; flex-wrap:wrap;}
+.nav a{padding:6px 12px; color:var(--dim); font-size:12px; border:1px solid transparent;
+  border-bottom:none; border-radius:4px 4px 0 0;}
+.nav a:hover{color:var(--text); background:#1a212a;}
+.nav a.active{color:var(--text); background:var(--panel); border-color:var(--border);
+  font-weight:700;}
+.page{padding:14px; max-width:1900px;}
+
+/* ---------- panels ---------- */
+.panel{background:var(--panel); border:1px solid var(--border); border-radius:6px;
+  padding:12px; margin-bottom:10px;}
+.sec-title{font-size:12px; font-weight:800; letter-spacing:.07em; text-transform:uppercase;
+  color:var(--text);}
+.sec-sub{font-size:11px; color:var(--faint); margin-left:10px; font-weight:400;
+  text-transform:none; letter-spacing:0;}
+
+/* ---------- metrics ---------- */
+.metric{background:var(--panel2); border:1px solid var(--border); border-radius:5px;
+  padding:8px 10px;}
+.metric-label{font-size:10px; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--dim); font-weight:700;}
+.metric-value{font-size:19px; font-weight:700; margin-top:3px; line-height:1.2;
+  word-break:break-word;}
+.metric-sub{font-size:11px; color:var(--dim); margin-top:2px;}
+.metric-unit{font-size:10px; color:var(--faint); margin-top:3px; line-height:1.35;}
+
+/* ---------- forms ---------- */
+label, .lbl{display:block; font-size:10px; letter-spacing:.06em; text-transform:uppercase;
+  color:var(--dim); font-weight:700; margin-bottom:3px;}
+input[type=text], input[type=number], input[type=date], select, textarea{
+  background:#0d1117; color:var(--text); border:1px solid var(--border);
+  border-radius:4px; padding:5px 7px; font-family:var(--mono); font-size:12px; width:100%;
+  box-sizing:border-box;}
+input:focus, select:focus, textarea:focus{outline:none; border-color:var(--accent);}
+textarea{min-height:90px; line-height:1.45;}
+button, .btn{background:var(--panel2); color:var(--text); border:1px solid var(--border);
+  border-radius:4px; padding:6px 12px; font-family:var(--mono); font-size:12px;
+  cursor:pointer; font-weight:600;}
+button:hover{border-color:var(--accent); color:#fff;}
+button:disabled{opacity:.45; cursor:not-allowed;}
+button.primary{background:#17324f; border-color:#2f6fb0; color:#dbeeff;}
+button.danger{background:#3a1a1a; border-color:#803333; color:#ffd7d5;}
+.field{margin-bottom:8px;}
+.row{display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end;}
+.dash-dropdown, .Select-control{font-size:12px;}
+
+/* dropdowns (react-select) in dark */
+.Select-control, .Select-menu-outer, .Select--single>.Select-control .Select-value{
+  background:#0d1117 !important; color:var(--text) !important; border-color:var(--border) !important;}
+.Select-value-label, .Select-placeholder, .Select input{color:var(--text) !important;}
+.Select-option{background:#0d1117 !important; color:var(--text) !important;}
+.Select-option.is-focused{background:#1c232c !important;}
+.VirtualizedSelectOption{background:#0d1117; color:var(--text);}
+.VirtualizedSelectFocusedOption{background:#1c232c;}
+
+/* ---------- tables ---------- */
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner td,
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner th{
+  border-color:var(--border) !important;}
+.dash-table-container .previous-next-container{color:var(--dim); font-size:11px;}
+.dash-table-container input.dash-cell-value{color:var(--text) !important;
+  background:#0d1117 !important;}
+
+/* ---------- misc ---------- */
+.prov-badge{font-family:var(--mono);}
+.mono{font-family:var(--mono);}
+.dim{color:var(--dim);} .faint{color:var(--faint);}
+.pos{color:var(--pos);} .neg{color:var(--neg);} .warn{color:var(--warn);}
+.tiny{font-size:11px;}
+.scroll{overflow:auto;}
+::-webkit-scrollbar{width:10px; height:10px;}
+::-webkit-scrollbar-track{background:var(--bg);}
+::-webkit-scrollbar-thumb{background:#2b3440; border-radius:5px;}

@@ -21,7 +21,8 @@ import pytest
 
 from fxgamma.models import gk
 
-from conftest import CPS, MARKETS, TENORS, VOLS, ZS, fd_greeks, rel_err, strike_at
+from conftest import (CPS, MARKETS, TENORS, VOLS, ZS, fd_greeks, greek_mismatch,
+                      rel_err, strike_at)
 
 GREEKS = ("delta_base", "gamma", "vega", "theta", "rho_d", "rho_f",
           "vanna", "volga", "dual_delta")
@@ -29,6 +30,9 @@ GREEKS = ("delta_base", "gamma", "vega", "theta", "rho_d", "rho_f",
 #: the charter's target.  The finite-difference steps in ``conftest`` are scaled to
 #: the option's own volatility scale, which holds the worst case near 5e-5.
 FD_RTOL = 1e-4
+#: per 1 unit of base notional, so 1e-8 quote ccy is 0.01 on a 1mm ticket -- below
+#: any number the app displays, and far below anything that moves a hedge.
+FD_ATOL = 1e-8
 
 
 def _cases():
@@ -54,9 +58,8 @@ def test_analytic_greeks_match_central_differences(m, T, sigma, z, cp):
     K = strike_at(m, T, sigma, z)
     a = gk.gk_greeks(m.S, K, T, m.rd, m.rf, sigma, cp).as_dict()
     f = fd_greeks(m.S, K, T, m.rd, m.rf, sigma, cp)
-    bad = {g: (a[g], f[g], rel_err(a[g], f[g])) for g in GREEKS
-           if rel_err(a[g], f[g]) > FD_RTOL}
-    assert not bad, f"analytic vs FD mismatch: {bad}"
+    bad = greek_mismatch(a, f, GREEKS, rtol=FD_RTOL, atol=FD_ATOL * max(1.0, m.S))
+    assert not bad, f"analytic vs FD mismatch (analytic, fd, rel): {bad}"
 
 
 @pytest.mark.parametrize("m", MARKETS, ids=str)

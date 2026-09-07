@@ -71,6 +71,18 @@ def test_price_is_monotone_increasing_in_vol(m, cp):
 
 
 @pytest.mark.parametrize("m", MARKETS, ids=str)
+def test_call_price_rises_and_put_price_falls_with_spot(m):
+    """Monotonicity in spot -- the ladder is unreadable if this ever inverts."""
+    T, sigma = 0.25, 0.11
+    S = np.linspace(0.7 * m.S, 1.4 * m.S, 60)
+    K = m.S
+    c = np.array([gk.gk_price(float(s), K, T, m.rd, m.rf, sigma, +1) for s in S])
+    p = np.array([gk.gk_price(float(s), K, T, m.rd, m.rf, sigma, -1) for s in S])
+    assert np.all(np.diff(c) > 0)
+    assert np.all(np.diff(p) < 0)
+
+
+@pytest.mark.parametrize("m", MARKETS, ids=str)
 def test_call_price_falls_and_put_price_rises_with_strike(m):
     T, sigma = 0.5, 0.11
     K = np.linspace(0.6 * m.S, 1.6 * m.S, 60)
@@ -158,19 +170,29 @@ def test_theta_is_signed_and_negative_for_a_long_atm_option(m):
 
 @pytest.mark.parametrize("m", MARKETS, ids=str)
 def test_atm_breakeven_identity_at_zero_rates(m):
-    """docs/06 W-15 / arch s6.3: for a long ATM straddle at zero rates the daily
-    breakeven ``sqrt(|theta| / (0.005 gamma_1pct S))`` reduces to ``sigma / sqrt(365)``.
+    """The section-0 breakeven identity, in the units it is actually true in.
 
-    Run at zero rates because full GK theta also carries the rate terms, which the
-    gamma does not pay back -- the identity only holds on the gamma-theta component.
+    ``sqrt(|theta| / (0.005 gamma_1pct S))`` equals ``sigma / sqrt(365)`` **in
+    percent**, i.e. 100x the decimal daily move, because ``gamma_1pct`` is already
+    a per-1%-move quantity.  A screen that prints this number next to a decimal
+    sigma-day is out by 100 (see trader review W-5 on the same class of error), so
+    the test pins both spellings.
+
+    Run at zero rates: full GK theta also carries the rate terms, which the gamma
+    does not pay back, so the identity only holds on the gamma-theta component
+    (trader review W-15).
     """
     sigma, T, N = 0.10, 0.25, 10e6
     K = m.S           # zero rates -> F = S, and the DNS strike is S exp(w/2) ~ S
     c = gk.gk_greeks(m.S, K, T, 0.0, 0.0, sigma, +1, N, +1)
     p = gk.gk_greeks(m.S, K, T, 0.0, 0.0, sigma, -1, N, +1)
     theta, gamma_1pct = c.theta + p.theta, c.gamma_1pct + p.gamma_1pct
-    be = math.sqrt(abs(theta) / (0.005 * gamma_1pct * m.S))
-    assert be == pytest.approx(sigma / math.sqrt(365.0), rel=1e-3)
+    be_pct = math.sqrt(abs(theta) / (0.005 * gamma_1pct * m.S))
+    assert be_pct == pytest.approx(100.0 * sigma / math.sqrt(365.0), rel=1e-3)
+    # the same thing written in raw Greeks, where no factor of 100 hides
+    gamma = c.gamma + p.gamma
+    be_frac = math.sqrt(abs(theta) / (0.5 * gamma * m.S ** 2))
+    assert be_frac == pytest.approx(sigma / math.sqrt(365.0), rel=1e-3)
 
 
 @pytest.mark.parametrize("m", MARKETS, ids=str)
