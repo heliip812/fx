@@ -186,3 +186,51 @@ def build_surface(pair: str, asof: datetime, quotes: list[SmileQuotes],
 ```
 `method` in `{"vanna_volga", "sabr", "interp"}`. Every data provider produces
 `list[SmileQuotes]` per pair and calls `build_surface`. Nothing else crosses that boundary.
+
+---
+
+# AMENDMENT v1.1 — PM ruling on BA contract gaps CG-1…CG-7 (binding)
+
+Raised in `docs/02_requirements.md` §8.3. All other clauses of the contract stand unchanged.
+
+**CG-1 — reporting currency. RESOLVED: a conversion layer, not a change to `Greeks`.**
+`Greeks` stays purely numeric so `+` and `*` remain safe. Instead:
+- Per-position Greeks remain in the position's **native quote ccy** (unchanged).
+- `price_book(book, mkt)` gains two columns: `ccy` (native quote ccy) and `fx_to_report`
+  (multiplier into the reporting ccy), plus `*_rep` copies of every monetary Greek.
+- `book_greeks(book, mkt, report_ccy="USD")` returns Greeks **already converted** into
+  `report_ccy`. Aggregating across pairs in native ccy is forbidden.
+- `fxgamma/portfolio/risk.py` exposes `fx_rate(ccy, report_ccy, mkt) -> float`, which must
+  route through USD and raise if a leg is missing rather than defaulting to 1.0.
+  *Owner: quant-risk.*
+
+**CG-2 — per-position mark vol. RESOLVED: side-table, no type change.**
+`fxgamma/store.py` owns a `position_marks` table keyed on position `id`
+(`mark_vol`, `mark_source`, `asof`). `OptionPosition` stays frozen. *Owner: dev.*
+
+**CG-3 — APPROVED.** `hedge_bands(book, mkt, pair, *, gamma_budget=None, rule: HedgeRule | None = None)`.
+Cost-aware band maths lives in the library, never in `app/`. *Owner: quant-risk.*
+
+**CG-4 — APPROVED.** `time_decay(book, mkt, days=range(0,31), *, weights: Sequence[float] | None = None,
+calendar: str = "calendar")` with `calendar in {"calendar", "business", "event"}`. Calendar time stays
+the default; business/event weighting is opt-in and must be badged in the UI. *Owner: quant-risk.*
+
+**CG-5 — RESOLVED in `types.py` (already applied).** `SpotPosition.trade_time` and
+`OptionPosition.trade_time`, both `datetime | None = None`, UTC, appended last so construction
+stays backward-compatible. The hedge log orders by `trade_time` and falls back to `trade_date`.
+
+**CG-6 — ASSIGNED to `data`.** The event calendar is a versioned, user-editable
+`data/calendar/events.csv` shipped in the repo, loaded by `fxgamma/data/events.py`, surfaced through
+the existing `MarketDataProvider.events(start, end)`. Frozen columns:
+`date, time_utc, ccy, event, importance, source` with `importance in {1,2,3}` (3 = top tier:
+FOMC/ECB/BoJ/BoE decisions, US CPI, US NFP). Event weights for business time live in the library,
+not the data layer.
+
+**CG-7 — FROZEN key grammar for `MarketSnapshot.meta`.**
+```
+spot.<PAIR>        rate.<CCY>        fwd.<PAIR>.<TENOR>
+surface.<PAIR>     surface.<PAIR>.<TENOR>
+oi.<PAIR>          events
+```
+`PAIR` is the 6-letter uppercase symbol, `CCY` the 3-letter code, `TENOR` a `conventions.TENORS`
+key. Lookup is most-specific-first: a badge for `surface.EURUSD.1M` falls back to `surface.EURUSD`.

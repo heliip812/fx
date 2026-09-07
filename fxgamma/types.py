@@ -49,6 +49,7 @@ class OptionPosition:
     trade_vol: float | None = None
     cut: str = "NY10"
     tag: str = ""
+    trade_time: datetime | None = None   # UTC execution timestamp (v1.1)
 
     def signed_notional(self) -> float:
         return self.direction * abs(self.notional_base)
@@ -64,6 +65,7 @@ class SpotPosition:
     trade_date: date | None = None
     value_date: date | None = None
     tag: str = ""                    # "hedge" marks delta hedges for the P&L log
+    trade_time: datetime | None = None   # UTC; orders intraday hedges in the hedge log (v1.1)
 
 
 @dataclass(frozen=True)
