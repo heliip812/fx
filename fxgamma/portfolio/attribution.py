@@ -89,7 +89,8 @@ __all__ = ["daily_pnl", "residual_ratio", "top_offenders", "COMPONENTS"]
 COMPONENTS = ("delta", "gamma", "theta", "vega", "vanna", "volga",
               "rates", "carry", "hedge")
 
-_VOL_PT = 0.01
+_VOL_PT = 0.01          # vega/vanna/volga are quoted per 1 vol point
+_RATE_PT = 0.01         # rho_d / rho_f are quoted per 1 rate point (100bp)
 _YEAR = 365.0
 
 
@@ -170,8 +171,8 @@ def daily_pnl(book: Book, mkt_t0: MarketSnapshot, mkt_t1: MarketSnapshot,
                 "vega": float(a["vega"]) * dvp,
                 "vanna": float(a["vanna"]) * dS * dvp,
                 "volga": 0.5 * float(a["volga"]) * dvp * dvp,
-                "rates": (float(a["rho_d"]) * (rd1 - rd0) / _VOL_PT
-                          + float(a["rho_f"]) * (rf1 - rf0) / _VOL_PT),
+                "rates": (float(a["rho_d"]) * (rd1 - rd0) / _RATE_PT
+                          + float(a["rho_f"]) * (rf1 - rf0) / _RATE_PT),
                 "carry": 0.0, "hedge": 0.0,
                 "dvol": dvol, "vol_t0": sig0, "vol_t1": sig1,
                 "total": total,

@@ -123,8 +123,14 @@ def _interp_quotes(qs: list[SmileQuotes], T: float) -> tuple[float, float, float
         arr = np.array([float(v) for v in vals], float)  # type: ignore[arg-type]
         return float(np.interp(T, Ts, arr))              # np.interp clamps -> flat wings
 
-    return (atm, float(lin([q.rr25 for q in qs]) or 0.0),
-            float(lin([q.bf25 for q in qs]) or 0.0),
+    # explicit None checks: `x or 0.0` is the falsy-float trap.  rr/bf are signed
+    # decimals and a genuine 0.0 quote is perfectly ordinary, so the idiom happens
+    # to be harmless here only because 0.0 maps to 0.0 -- it would not survive
+    # someone changing the fallback to anything else.
+    rr25 = lin([q.rr25 for q in qs])
+    bf25 = lin([q.bf25 for q in qs])
+    return (atm, 0.0 if rr25 is None else float(rr25),
+            0.0 if bf25 is None else float(bf25),
             lin([q.rr10 for q in qs]), lin([q.bf10 for q in qs]))
 
 
@@ -340,9 +346,19 @@ class SABRSurface(smile.SmileSurfaceMixin):
                 p10, c10 = smile.rr_bf_to_vols(q.atm, q.rr10, bf10)
                 k_p10 = gk.strike_from_delta(0.10, spot, q.T, rd, rf, p10, -1, dc)
                 k_c10 = gk.strike_from_delta(0.10, spot, q.T, rd, rf, c10, +1, dc)
-                if np.isfinite(k_p10) and np.isfinite(k_c10):
+                # ORDER matters, not just finiteness: np.interp below and the fit
+                # itself both assume strictly increasing strikes and neither
+                # complains if they are not.  A premium-adjusted 10d call strike can
+                # legitimately land inside the 25d one (or come back nan when the
+                # delta is past the pa-call peak), so check rather than assume.
+                if (np.isfinite(k_p10) and np.isfinite(k_c10)
+                        and k_p10 < k_p and k_c10 > k_c):
                     Ks, Vs = [k_p10] + Ks + [k_c10], [p10] + Vs + [c10]
             F = float(spot) * math.exp((rd - rf) * q.T)
+            if not np.all(np.diff(Ks) > 0.0):
+                raise ValueError(
+                    f"{pair} T={q.T:.4f}: non-monotone SABR pillar strikes {Ks}; "
+                    "check the delta convention and the 10d quotes")
             fits.append(sabr.calibrate_sabr(F, q.T, np.array(Ks), np.array(Vs), beta=beta,
                                             atm_vol=float(np.interp(F, Ks, Vs)) if pin_atm else None))
         return cls(pair, asof, float(spot), float(rd), float(rf), tuple(fits), dc,

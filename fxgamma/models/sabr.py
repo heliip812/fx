@@ -105,11 +105,23 @@ def sabr_vol(K: Any, F: float, T: float, alpha: float, beta: float,
                       + (one_b ** 4 / 1920.0) * logFK ** 4)
 
     z = (nu / alpha) * FK_pow * logFK
+    # z/chi(z) has a removable singularity at z = 0.  Near it, `chi` is a difference
+    # of nearly equal logs and `z/chi` loses digits, so switch to the series
+    #     z/chi(z) = 1 + rho z / 2 + (2 - 3 rho^2) z^2 / 12 + O(z^3)
+    # whose next neglected term is O(z^3): at the |z| < 1e-6 switch point that is
+    # below 1e-18, i.e. the two branches agree to well inside double precision and
+    # the join is invisible.  (The old threshold was 1e-9, which is *tighter* than
+    # necessary and left `z/chi` evaluating in its badly-conditioned region.)
+    #
+    # The fallback when chi still misbehaves is the series, NOT the constant 1.0.
+    # Returning 1.0 is the ATM ratio; using it at a non-zero z silently prices a
+    # skewed strike as if it were at the money.
+    ser = 1.0 + 0.5 * rho * z + (2.0 - 3.0 * rho ** 2) * z * z / 12.0
     with np.errstate(divide="ignore", invalid="ignore"):
         chi = np.log((np.sqrt(1.0 - 2.0 * rho * z + z * z) + z - rho) / (1.0 - rho))
-        ratio = np.where(np.abs(z) < 1e-9,
-                         1.0 + 0.5 * rho * z + (2.0 - 3.0 * rho ** 2) * z * z / 12.0,
+        ratio = np.where(np.abs(z) < 1e-6, ser,
                          z / np.where(np.abs(chi) < _EPS, np.nan, chi))
+    ratio = np.where(np.isfinite(ratio), ratio, ser)
     ratio = np.where(np.isfinite(ratio), ratio, 1.0)
 
     corr = 1.0 + ((one_b ** 2 / 24.0) * alpha ** 2 / np.maximum(FK ** one_b, _EPS)
@@ -141,7 +153,15 @@ def alpha_from_atm(atm_vol: float, F: float, T: float, beta: float,
     c2 = 0.25 * rho * beta * nu * T / F ** (2.0 * one_b)        # coeff of alpha^2
     c1 = (1.0 + (2.0 - 3.0 * rho ** 2) * nu ** 2 * T / 24.0) / F ** one_b
     c0 = -atm_vol
-    roots = np.roots([c3, c2, c1, c0]) if abs(c3) > 1e-300 else np.roots([c2, c1, c0])
+    # Drop the cubic term when it is negligible *relative to the linear one*, not
+    # against an absolute 1e-300.  For the FX default beta = 1 the cubic coefficient
+    # is identically zero, but for beta = 0.999 it is ~1e-11 while c1 is ~1 -- a
+    # leading coefficient that small makes np.roots return a spurious ~1e11 root and
+    # loses precision on the real ones for no benefit.
+    cubic = abs(c3) > 1e-12 * max(abs(c1), 1e-300)
+    roots = np.roots([c3, c2, c1, c0]) if cubic else (
+        np.roots([c2, c1, c0]) if abs(c2) > 1e-12 * max(abs(c1), 1e-300)
+        else np.array([-c0 / c1]))
     real = [float(r.real) for r in np.atleast_1d(roots)
             if abs(r.imag) < 1e-9 and r.real > 0.0]
     return min(real) if real else float(atm_vol * F ** one_b)
