@@ -10,3 +10,6 @@ data/cache/*
 *.db
 .DS_Store
 .env
+
+# runtime artefacts: the user's persisted manual vol marks and book
+data/manual/
