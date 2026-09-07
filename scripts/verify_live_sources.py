@@ -107,7 +107,7 @@ GROUPS: dict[str, tuple[str, bool, str]] = {
     "spot":        ("any", True,  "spot & OHLC history"),
     "rates":       ("any", True,  "r_d / r_f short rates (FRED)"),
     "vol":         ("any", True,  "listed ETF option chains -> indicative smile"),
-    "vol-index":   ("any", False, "CBOE FX vol indices -> IV history for cones/z-scores"),
+    "vol-indices":   ("any", False, "CBOE FX vol indices -> IV history for cones/z-scores"),
     "cme":         ("any", False, "CME open interest -> Gamma Map"),
 }
 
@@ -549,7 +549,7 @@ def build_checks(ctx: Ctx) -> list[Check]:
                             f"{fred.GRAPH_CSV}?id={ids}", ccy == "USD"))
     for key in vi.CANDIDATES:
         ids = ",".join(s.fred_id for s in vi.CANDIDATES[key])
-        checks.append(Check(f"vol-index:{key}", "vol-index", _c_vol_index(key),
+        checks.append(Check(f"vol-indices:{key}", "vol-indices", _c_vol_index(key),
                             f"{fred.GRAPH_CSV}?id={ids}", key == "EUR"))
     return checks
 
@@ -560,7 +560,7 @@ VERIFIED_FLAGS = {
     "ecb-fix": ("fxgamma/data/spot_ecb.py", "VERIFIED"),
     "fred-rate:USD": ("fxgamma/data/rates_fred.py", "VERIFIED"),
     "yahoo-etf-chain:FXE": ("fxgamma/data/vol_etf_options.py", "VERIFIED"),
-    "vol-index:EUR": ("fxgamma/data/vol_indices.py", "VERIFIED"),
+    "vol-indices:EUR": ("fxgamma/data/vol_indices.py", "VERIFIED"),
     "cme-product-slate": ("fxgamma/data/cme_options.py", "VERIFIED"),
 }
 

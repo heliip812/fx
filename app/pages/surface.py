@@ -24,6 +24,7 @@ from dash import Input, Output, callback, dcc, html
 
 from fxgamma.conventions import PAIRS, TENORS, pair_spec, tenor_years
 from fxgamma.models.gk import gk_greeks
+from fxgamma.models.surface import build_surface
 from fxgamma.store import parse_strike
 
 from .. import analytics as A
@@ -51,7 +52,7 @@ def layout(**_kw):
     pair = s.setting("pair", "EURUSD")
     return html.Div([
         html.Div(id="surf-banner"),
-        panel(html.Div([
+        panel([html.Div([
             html.Div([html.Label("pair"),
                       dcc.Dropdown(id="surf-pair", options=ALL_PAIRS, value=pair,
                                    clearable=False)], style={"minWidth": "150px"}),
@@ -60,7 +61,11 @@ def layout(**_kw):
                                    value=s.setting("surface_method", "vanna_volga"),
                                    clearable=False)], style={"minWidth": "170px"}),
             html.Div(id="surf-status", style={"alignSelf": "center", "paddingTop": "14px"}),
-        ], className="row"), title="surface", sub="REQ-015 — build, switch method, re-render"),
+        ], className="row"),
+            note("The method selector re-fits THIS page's surface only. The book prices "
+                 "off the snapshot's method (Data & Settings) — refitting every pair on "
+                 "each click would blow the 400 ms per-surface budget twelve times over.")],
+              title="surface", sub="REQ-015 — build, switch method, re-render"),
 
         html.Div(id="surf-residuals"),
         grid([html.Div(dcc.Loading(dcc.Graph(id="surf-3d", config={"displaylogo": False}),
@@ -126,12 +131,26 @@ def _render(pair, method, _token):
     method = method or "vanna_volga"
     try:
         s.set_setting("pair", pair)
-        if method != s.setting("surface_method"):
-            s.set_setting("surface_method", method)
-            s.build(method=method)
         snap = s.snapshot()
         banner = synthetic_banner(snap.meta, page="surface")
+        quotes = s.smile_quotes(pair)
         surf = snap.surfaces.get(pair)
+        if method != s.setting("surface_method", "vanna_volga") and quotes:
+            # Re-fit ONLY the displayed pair (REQ-015: change method, re-render, no page
+            # reload).  Refitting the whole snapshot here would restamp every pair and
+            # blow the 400 ms/surface budget many times over, so the *book* keeps pricing
+            # on the snapshot's method - set that on the Data page - and this selector
+            # is a display fit.  The panel says so.
+            try:
+                S = snap.spot.get(pair)
+                spec = pair_spec(pair)
+                rd, rf = snap.rd_rf(pair, PAIRS)
+                surf = build_surface(pair, snap.asof, quotes, float(S), rd, rf,
+                                     method=method)
+            except Exception as exc:                       # noqa: BLE001
+                return (banner, note(f"{method} fit failed for {pair}: {exc}", tone="warn"),
+                        "", empty_figure("fit failed"), empty_figure("fit failed"),
+                        empty_figure("fit failed"), empty_figure("fit failed"))
         status, why = surface_status(snap.meta, pair)
         status_bar = html.Div([
             surface_status_badge(snap.meta, pair),
@@ -146,7 +165,6 @@ def _render(pair, method, _token):
                     empty_figure(msg), empty_figure(msg), empty_figure(msg),
                     empty_figure(msg))
 
-        quotes = s.smile_quotes(pair)
         rows = _residual_rows(surf, quotes)
         res_panel = _residual_panel(rows, method, pair, snap)
         S = snap.spot.get(pair)
@@ -413,3 +431,8 @@ def _whatif(strike_text, tenor, cp, notional_text, pair, _token):
     except Exception as exc:                               # noqa: BLE001
         log.exception("what-if failed")
         return note(f"what-if pricer failed: {exc}", tone="warn")
+
+
+#: Dash 4 resolves the page layout from the registry at request time, so bind it
+#: explicitly now that `layout` is defined.
+dash.page_registry[__name__]["layout"] = layout

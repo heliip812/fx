@@ -73,14 +73,13 @@ displayed always, not only when it breaches (trader Q-10.2).
 """
 from __future__ import annotations
 
-import math
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
-from ..conventions import PAIRS, pair_spec, year_fraction
+from ..conventions import PAIRS, pair_spec
 from ..types import Book, MarketSnapshot, PnLBreakdown, SpotPosition
 from .risk import fx_rate, price_book
 

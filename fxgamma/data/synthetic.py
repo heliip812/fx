@@ -39,6 +39,8 @@ import logging
 import math
 from datetime import date, datetime, timedelta, timezone
 
+import zlib
+
 import numpy as np
 import pandas as pd
 
@@ -144,6 +146,17 @@ def _bs_price(F: float, K: float, T: float, sigma: float, df: float, cp: int) ->
     return df * cp * (F * n.cdf(cp * d1) - K * n.cdf(cp * d2))
 
 
+def _pair_seed(pair: str) -> int:
+    """Stable per-pair seed offset.
+
+    Deliberately NOT ``hash(pair)``: since PEP 456 Python salts str hashing per
+    process, so ``hash`` gives a different value on every run and the "deterministic"
+    synthetic market silently changed each time it was loaded - which breaks
+    backtests and makes yesterday's screen unreproducible. crc32 is stable forever.
+    """
+    return zlib.crc32(pair.encode("utf-8"))
+
+
 class SyntheticProvider(MarketDataProvider):
     """Deterministic, offline, fully-badged fake market. See the module docstring."""
 
@@ -229,7 +242,7 @@ class SyntheticProvider(MarketDataProvider):
         if pair in self._ohlc:
             return self._ohlc[pair]
         c = self._closes[pair]
-        rng = np.random.default_rng(self.seed ^ (abs(hash(pair)) % (2 ** 31)))
+        rng = np.random.default_rng(self.seed ^ (_pair_seed(pair) % (2 ** 31)))
         o = c.shift(1).bfill()
         daily_sigma = np.abs(np.log(c / o).to_numpy())
         daily_sigma = np.where(daily_sigma > 0, daily_sigma, 1e-4)
@@ -301,7 +314,7 @@ class SyntheticProvider(MarketDataProvider):
         rr0, bf0 = RR25_BASE.get(pair, 0.0), BF25_BASE.get(pair, 0.002)
 
         # deterministic slow wiggle so richness z-scores are not constant across runs
-        wig = np.random.default_rng(self.seed ^ (abs(hash(pair)) % 9973))
+        wig = np.random.default_rng(self.seed ^ (_pair_seed(pair) % 9973))
         wr, wb = float(wig.normal(0, 0.18)), float(wig.normal(0, 0.14))
 
         out: list[SmileQuotes] = []
@@ -350,7 +363,7 @@ class SyntheticProvider(MarketDataProvider):
         spec = pair_spec(pair)
         S = float(self._closes[pair].iloc[-1])
         rd, rf = RATES.get(spec.quote, 0.0), RATES.get(spec.base, 0.0)
-        rng = np.random.default_rng(self.seed ^ 0x0117 ^ (abs(hash(pair)) % 9973))
+        rng = np.random.default_rng(self.seed ^ 0x0117 ^ (_pair_seed(pair) % 9973))
 
         step = 50.0 * spec.pip                       # 50 pips: the listed strike granularity
         fig = 100.0 * spec.pip                       # a "big figure": 0.0100 EURUSD, 1.00 JPY

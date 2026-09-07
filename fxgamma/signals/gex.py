@@ -51,8 +51,8 @@ the rest of the app draws on.
 from __future__ import annotations
 
 import math
-from datetime import date, datetime, timezone
-from typing import Mapping, Sequence
+from datetime import date
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -61,8 +61,9 @@ from ..conventions import PAIRS, pair_spec, year_fraction
 from ..models import gk
 from ..types import MarketSnapshot
 
-__all__ = ["CONTRACT_SIZE", "SIGN_ASSUMPTIONS", "market_gamma_profile",
-           "strike_magnets", "oi_expiry_ladder", "gamma_flip_level"]
+__all__ = ["CONTRACT_SIZE", "QUOTE_DENOMINATED", "SIGN_ASSUMPTIONS",
+           "market_gamma_profile", "gamma_profile_curve", "strike_magnets",
+           "oi_expiry_ladder", "gamma_flip_level"]
 
 #: CME FX option contract sizes, in **base ccy of the FORDOM pair** after the
 #: 6J/6C/6S reciprocal has been undone by the loader.  Source: CME product specs.
@@ -104,8 +105,6 @@ def _sign(assumption: str, cp: np.ndarray) -> np.ndarray:
 
 def market_gamma_profile(oi: pd.DataFrame, mkt: MarketSnapshot, pair: str, *,
                          sign_assumption: str = "unsigned",
-                         spot_grid: Sequence[float] | None = None,
-                         n_grid: int = 121, span_pct: float = 6.0,
                          spot_strikes: bool = True,
                          contract_size: float | None = None,
                          max_expiries: int = 4) -> pd.DataFrame:
@@ -121,11 +120,11 @@ def market_gamma_profile(oi: pd.DataFrame, mkt: MarketSnapshot, pair: str, *,
 
     Returns
     -------
-    DataFrame, long-form, one row per (strike, spot-grid node) aggregated to
-    per-strike totals:
-    ``strike, expiry, oi_contracts, notional_base, gamma_1pct_at_spot,
-    gamma_1pct_profile`` is returned by :func:`gamma_profile_curve`; this function
-    returns the **per-strike** table with ``gamma_1pct`` evaluated at current spot.
+    DataFrame, one row per (strike, expiry, call/put), with ``oi``,
+    ``notional_base``, ``T``, ``vol``, ``gamma_1pct_abs``, ``gamma_1pct_raw`` and the
+    ``gamma_1pct`` actually implied by ``sign_assumption``, plus the assumption, the
+    strike space and the contract size used.  :func:`gamma_profile_curve` turns it
+    into the aggregate profile against spot.
 
     Nothing in the output is called dealer gamma, and nothing may be relabelled as
     such downstream (REQ-023 as rewritten by W-11: unsigned only, "Listed positioning
@@ -193,7 +192,6 @@ def gamma_profile_curve(profile: pd.DataFrame, mkt: MarketSnapshot, pair: str, *
     """
     if not len(profile):
         return pd.DataFrame(columns=["spot", "gamma_1pct"])
-    spec = pair_spec(pair)
     S0 = float(mkt.spot[pair])
     rd, rf = mkt.rd_rf(pair, PAIRS)
     grid = S0 * (1.0 + np.linspace(-span_pct, span_pct, int(n)) / 100.0)

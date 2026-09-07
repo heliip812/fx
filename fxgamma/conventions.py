@@ -81,7 +81,14 @@ def tenor_years(tenor: str) -> float:
 
 def expiry_datetime(expiry: date, cut: str = "NY10") -> datetime:
     """Expiry date + cut -> a UTC timestamp, so T is unambiguous across pairs."""
-    t, tz = CUTS.get(cut, CUTS["NY10"])
+    try:
+        t, tz = CUTS[cut]
+    except KeyError:
+        # Never silently fall back to NY10: a typo'd cut would shift every expiry by
+        # hours, quietly changing T, theta and the pin clock on the affected legs.
+        raise ValueError(
+            f"unknown cut {cut!r}; known cuts: {sorted(CUTS)}"
+        ) from None
     return datetime.combine(expiry, t, tzinfo=ZoneInfo(tz)).astimezone(ZoneInfo("UTC"))
 
 

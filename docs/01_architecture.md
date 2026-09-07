@@ -14,7 +14,7 @@ fx/
 │   ├── types.py               # shared dataclasses (below)                             [quant]
 │   ├── store.py               # SQLite persistence for the book                        [dev]
 │   ├── data/                  # market data adapters + cache + synthetic               [data]
-│   │   ├── base.py  provider.py  synthetic.py  cache.py
+│   │   ├── base.py  provider.py  synthetic.py  cache.py  manual.py
 │   │   ├── spot_yahoo.py  spot_stooq.py  spot_ecb.py  rates_fred.py
 │   │   ├── vol_etf_options.py     # FXE/FXB/FXY/... listed chains -> implied vols
 │   │   ├── vol_indices.py         # CBOE EVZ/JYVIX/BPVIX via FRED
@@ -353,3 +353,46 @@ theta while the quoted gamma was already both-legs.
    implied = +USD 1,836) reproduces to USD 1,834 on the PM's own derivation.
 5. The trader's **W-7** stands and is accepted: `√365` for economics (breakeven, theta), `√252` for
    distance and touch probability. Never conflate them; print the basis on the panel.
+
+---
+
+# AMENDMENT v1.5 — manual marks registered; QA findings ruled (binding)
+
+**M-1 — the `manual` provider is now part of the frozen layout** (`fxgamma/data/manual.py`,
+added to §1). API: `ManualMark`, `ManualQuoteStore`, `ManualQuoteProvider`,
+`get_provider(..., manual=...)`, `ChainProvider.manual`, `ChainProvider.marked_pairs()`.
+Resolution order is **manual → live → cache → synthetic**, with manual hoisted to the front
+regardless of construction order. Marks persist to `data/manual/marks.json`, which is
+**gitignored** — it holds the user's own marks and is not source.
+
+**QA findings (`docs/05_test_report.md`), PM rulings:**
+
+**Q-1 — synthetic market was not reproducible across processes. FIXED (PM).** `synthetic.py`
+seeded three generators off `hash(pair)`. Since PEP 456 Python salts str hashing per process, so
+every run produced a *different* synthetic market: RR/BF, OHLC ranges and the entire open-interest
+table changed each time the module was loaded. That silently invalidates every backtest and breaks
+"does yesterday's screen still say what it said yesterday" — the charter promises determinism under
+a fixed seed and it was not being delivered. Replaced with `zlib.crc32`, which is stable across
+processes and versions. Verified: three separate interpreters now return an identical EURUSD 1M
+risk-reversal.
+
+**Q-2 — `sum(Greeks)` raised AttributeError. FIXED (PM)** in `types.py`: `sum()` seeds with the int
+`0`, and folding over an empty book is legitimate, so `__add__` now accepts a falsy numeric seed as
+well as `None`. It was latent only because `risk.py` happened to aggregate via pandas.
+
+**Q-3 — an unknown cut string silently became NY10. RESOLVED: it now raises.** A typo'd cut would
+shift every affected expiry by hours, quietly changing `T`, theta and the pin clock on those legs —
+precisely the silent substitution architecture §7 forbids. QA's strict-xfail is now a passing test.
+
+**Q-4 — `get_store(path)` ignores `path` after the first call. ASSIGNED to `dev`** (still in
+flight). A second book path silently returns the first store: a user opening a second book would
+write into the first.
+
+**Q-5 — SABR misses the 25d butterfly by ~0.09 vol points (a quarter of the BF). ASSIGNED to
+`quant`** — acceptable for interpolation, never acceptable as a mark. Must be stated in
+`docs/03_model_spec.md` and the surface method badged in the UI so SABR is never mistaken for a
+repricing surface. Vanna-volga (which reprices its inputs to ~1e-8) remains the default.
+
+**Standing test gap, acknowledged not closed:** every live adapter is unverified (hosts blocked
+here) and `manual.py` — now the *primary* mark path — has no test coverage. Both are first calls on
+the next QA pass; `scripts/verify_live_sources.py` covers the live half on the user's own machine.

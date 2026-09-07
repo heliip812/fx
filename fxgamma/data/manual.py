@@ -48,7 +48,7 @@ import logging
 import math
 import os
 import re
-from dataclasses import dataclass, field, replace as _replace
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -711,7 +711,9 @@ class ManualQuoteStore:
     def from_csv(self, path: str | Path, *, replace_pair: bool = True,
                  save: bool = True) -> int:
         """Read back a file written by :meth:`to_csv` (already decimal vols)."""
-        df = pd.read_csv(path)
+        # round_trip: the default parser is 1 ULP lossy, so a save/load cycle would not be
+        # bit-identical and any test asserting "the mark did not change" would flap.
+        df = pd.read_csv(path, float_precision="round_trip")
         cols = {c.lower().strip(): c for c in df.columns}
         need = [c for c in ("pair", "tenor", "atm") if c not in cols]
         if need:

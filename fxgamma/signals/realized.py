@@ -59,7 +59,7 @@ close-to-close and Yang-Zhang side by side (trader 3b) rather than to trust one.
 from __future__ import annotations
 
 import math
-from typing import Callable, Sequence
+from typing import Callable
 
 import numpy as np
 import pandas as pd

@@ -40,17 +40,17 @@ read across pairs.  Theta is kept **signed** everywhere it is displayed.
 from __future__ import annotations
 
 import math
-from datetime import date, datetime, timedelta
+from datetime import date
 from typing import Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
-from ..conventions import PAIRS, pair_spec, year_fraction
+from ..conventions import pair_spec
 from ..models import gk
 from ..portfolio.risk import (dhedge_pnl, gamma_pnl_pct, fx_rate, price_book)
 from ..types import Book, MarketSnapshot
-from .realized import ANNUAL, realized_vol, rolling_vol
+from .realized import ANNUAL, realized_vol
 
 __all__ = ["breakeven_pct", "gamma_theta", "daily_breakeven", "coverage_ratio",
            "gamma_carry_expectancy", "rv_iv_spread", "zscore", "quote_zscores",

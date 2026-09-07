@@ -340,6 +340,10 @@ it is not.
 **Substitute quality: 5/5 — it *is* the desk's mark.** The residual risk is operational, not
 statistical: a mistyped digit, or a mark left over from yesterday.
 
+`data/manual/marks.json` is created on first save and is **user data, not repo content** —
+it should be git-ignored (`data/manual/*`, keeping a `.gitkeep`) exactly like `data/cache/*`.
+That is a one-line change to a file the data role does not own; it is raised with the PM.
+
 ### 2.8 Synthetic market
 
 `synthetic.py` — deterministic from a seed, self-consistent (one factor per currency leg, so

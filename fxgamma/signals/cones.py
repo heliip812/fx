@@ -22,7 +22,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from .realized import ANNUAL, ESTIMATORS, realized_vol, rolling_vol
+from .realized import ANNUAL, ESTIMATORS, rolling_vol
 
 __all__ = ["vol_cone", "effective_n", "cone_percentile", "DEFAULT_HORIZONS",
            "DEFAULT_PCTILES"]

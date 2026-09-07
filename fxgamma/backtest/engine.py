@@ -34,14 +34,14 @@ enforces.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import pandas as pd
 
-from ..conventions import PAIRS, pair_spec
+from ..conventions import pair_spec
 from ..models import gk
 from ..portfolio.zones import COST_BP
 from ..types import HedgeRule
@@ -441,7 +441,7 @@ def run_backtest(path: PathData, cfg: BacktestConfig) -> BacktestResult:
             "time": now, "spot": S, "vol": vol, "pv": pv, "cash": cash,
             "spot_pos": pos, "delta_options": dl, "delta_total": dl + pos,
             "gamma": ga, "gamma_1pct": g1, "vega": ve, "theta": th,
-            "equity": equity, "pnl": equity - prev_equity if i else 0.0,
+            "equity": equity, "pnl": equity - prev_equity,
             "cost": step_cost, "cum_cost": cum_cost,
             "hedge_base": traded, "n_legs": len(legs),
         })

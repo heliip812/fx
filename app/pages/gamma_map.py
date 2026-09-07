@@ -279,3 +279,8 @@ def _mechanics(pair, oi, snap):
 def kv_rows(rows):
     from ..components.cards import kv
     return kv(rows)
+
+
+#: Dash 4 resolves the page layout from the registry at request time, so bind it
+#: explicitly now that `layout` is defined.
+dash.page_registry[__name__]["layout"] = layout

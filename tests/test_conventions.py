@@ -188,9 +188,8 @@ def test_year_fraction_is_monotone_in_the_expiry_date():
     assert all(b > a for a, b in zip(ts, ts[1:]))
 
 
-@pytest.mark.xfail(reason="expiry_datetime silently falls back to the NY10 cut for an "
-                          "unknown cut string; arch s7 forbids silent substitution",
-                   strict=True)
+# PM ruling (QA finding 3): resolved in favour of raising. A typo'd cut would shift
+# every affected expiry by hours, quietly changing T, theta and the pin clock.
 def test_unknown_cut_does_not_silently_become_ny10():
     """A typo'd cut ("NY1O", "TKO15") must not price at a different cut in silence."""
     with pytest.raises((KeyError, ValueError)):

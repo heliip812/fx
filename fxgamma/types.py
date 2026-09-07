@@ -94,7 +94,9 @@ class Greeks:
     _NON_ADDITIVE = ("delta_pct", "dual_delta")
 
     def __add__(self, other: "Greeks") -> "Greeks":
-        if other is None:
+        # `sum()` seeds with the int 0, and callers legitimately fold over an empty
+        # book, so accept both None and a falsy numeric seed rather than raising.
+        if other is None or (isinstance(other, (int, float)) and not other):
             return self
         return Greeks(*(float("nan") if f in Greeks._NON_ADDITIVE
                         else getattr(self, f) + getattr(other, f)

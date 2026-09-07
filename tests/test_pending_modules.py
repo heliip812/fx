@@ -154,24 +154,40 @@ def test_backtest_engine_is_importable_and_deterministic():
 # persistence
 # --------------------------------------------------------------------------- #
 def test_store_round_trips_a_book(tmp_path, demo_book):
+    """Positions survive a save/load cycle field-for-field (shallow check only)."""
     store = pytest.importorskip("fxgamma.store", reason="store.py has not landed yet")
-    db = tmp_path / "qa.sqlite"
-    saver = getattr(store, "save_book", None)
-    loader = getattr(store, "load_book", None)
-    if saver is None or loader is None:
-        pytest.skip("store.save_book / load_book not present yet")
-    saver(demo_book, str(db))
-    again = loader(demo_book.name, str(db))
-    assert {o.id for o in again.options} == {o.id for o in demo_book.options}
+    st = store.Store(tmp_path / "qa.sqlite")
+    try:
+        st.save_positions(demo_book.options + demo_book.spots, book=demo_book.name)
+        again = st.load_book(demo_book.name)
+        assert {o.id for o in again.options} == {o.id for o in demo_book.options}
+        assert {s.id for s in again.spots} == {s.id for s in demo_book.spots}
+        got = {o.id: o for o in again.options}
+        for o in demo_book.options:
+            assert got[o.id].strike == o.strike
+            assert got[o.id].expiry == o.expiry
+            assert got[o.id].cp == o.cp
+            assert got[o.id].direction == o.direction
+            assert got[o.id].notional_base == o.notional_base
+    finally:
+        st.close()
 
 
-def test_position_marks_table_exists(tmp_path):
-    """CG-2: per-position mark vol lives in a ``position_marks`` side table."""
+def test_position_marks_side_table_holds_the_mark_vol(tmp_path, demo_book):
+    """CG-2: per-position mark vol lives in a ``position_marks`` side table and
+    ``OptionPosition`` stays frozen."""
     store = pytest.importorskip("fxgamma.store", reason="store.py has not landed yet")
-    src = getattr(store, "SCHEMA", "") or ""
-    if not src:
-        pytest.skip("store.SCHEMA not exposed")
-    assert "position_marks" in src
+    st = store.Store(tmp_path / "marks.sqlite")
+    try:
+        st.save_positions(demo_book.options, book=demo_book.name)
+        st.set_mark_vol("o1", 0.0925, mark_source="user")
+        marks = st.marks()
+        assert "o1" in marks
+        assert float(marks["o1"].mark_vol) == pytest.approx(0.0925)
+        assert not hasattr(OptionPosition("x", "EURUSD", 1, 1.1, date(2026, 12, 18), 1e6),
+                           "mark_vol")
+    finally:
+        st.close()
 
 
 # --------------------------------------------------------------------------- #

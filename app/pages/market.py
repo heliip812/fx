@@ -285,3 +285,8 @@ def _rv_figure(pair, estimators, window, _token):
         log.exception("rv figure failed")
         return (empty_figure("realized-vol panel failed"),
                 note(f"realized-vol panel failed: {exc}", tone="warn"))
+
+
+#: Dash 4 resolves the page layout from the registry at request time, so bind it
+#: explicitly now that `layout` is defined.
+dash.page_registry[__name__]["layout"] = layout

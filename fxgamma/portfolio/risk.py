@@ -47,9 +47,8 @@ rows and flags them ``expired=True`` with their intrinsic PV and inherited delta
 """
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -58,7 +57,7 @@ import pandas as pd
 from ..conventions import PAIRS, pair_spec, year_fraction
 from ..models import gk
 from ..models.smile import SmileSurfaceMixin
-from ..types import Book, Greeks, MarketSnapshot, OptionPosition, SpotPosition
+from ..types import Book, Greeks, MarketSnapshot
 
 __all__ = [
     "price_book", "book_greeks", "spot_ladder", "scenario_grid", "time_decay",
@@ -504,7 +503,12 @@ def spot_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
     Only positions in ``pair`` are swept; other pairs are unaffected by this shock.
     The returned frame carries native-ccy Greeks and ``*_rep`` copies, plus
     ``pnl`` / ``pnl_rep``: the change in PV from the current spot, which is what
-    the ladder is actually read for.
+    the ladder is actually read for, and ``gamma_fd`` / ``gamma_1pct_fd``: the
+    *effective* gamma under the active convention, computed as the numerical slope
+    of the ladder's own delta.  Under sticky-strike that equals the Black-Scholes
+    ``gamma`` column; under sticky-delta it differs by the skew gamma
+    (``skew_gamma_1pct``), which is the part of the hedge a sticky-strike gamma
+    number silently omits.
     """
     mults = 1.0 + np.linspace(float(lo_pct), float(hi_pct), int(n)) / 100.0
     acc = _sweep(book, mkt, pair, mults, sticky=sticky, vol_add=vol_add,
@@ -525,6 +529,21 @@ def spot_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
                   report_ccy=report_ccy, marks=marks)
     df["pnl"] = df["pv"] - float(base["pv"][0])
     df["pnl_rep"] = df["pnl"] * fq
+    # Effective gamma *under the active convention*: the numerical slope of the
+    # ladder's own delta.  Under sticky-strike it reproduces the Black-Scholes
+    # `gamma` column to grid accuracy; under sticky-delta it is larger or smaller by
+    # the skew gamma `vanna * dsigma/dS`, which is precisely the part of the hedge
+    # the sticky-strike number leaves out (REQ-040, W-10b).  Both are returned so the
+    # figure can show the difference instead of hiding it behind a toggle.
+    if len(df) > 2:
+        gfd = np.gradient(df["delta_base"].to_numpy(float), df["spot"].to_numpy(float))
+    else:
+        gfd = df["gamma"].to_numpy(float)
+    df["gamma_fd"] = gfd
+    df["gamma_1pct_fd"] = gfd * df["spot"] * 0.01
+    df["gamma_fd_rep"] = df["gamma_fd"] * fb
+    df["gamma_1pct_fd_rep"] = df["gamma_1pct_fd"] * fb
+    df["skew_gamma_1pct"] = df["gamma_1pct_fd"] - df["gamma_1pct"]
     df["sticky"] = sticky
     df["pair"] = pair
     df["report_ccy"] = report_ccy.upper()
