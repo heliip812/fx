@@ -1012,8 +1012,17 @@ Severity: **E** blocks the write; **W** warns and requires acknowledgement.
 `premium_unit` is an **importer-side** convenience: it is normalised to a total in `premium_ccy`
 before constructing the frozen `OptionPosition` (which stores only a total). Conversions used:
 `total = pips · notional_base · pip`, `total = pct_base/100 · notional_base · S_trade`,
-`total = pct_quote/100 · notional_base · S_trade`. `S_trade` = `trade_spot`, else the snapshot spot;
-if neither exists the row is an ERROR.
+`total = pct_quote/100 · notional_base · strike`. `S_trade` = `trade_spot`, else the snapshot spot;
+if neither exists the row is an ERROR. All three give a total in the **quote** ccy.
+
+> **Correction (PM, rev 3).** Rev 2 gave `pct_base` and `pct_quote` the *same* formula
+> (`… · notional_base · S_trade`), which makes the two units indistinguishable. They are not:
+> a premium quoted as a percentage of the **base** notional is an amount of base ccy, so it
+> converts at **spot** (`pct_base/100 · N_base · S`); a premium quoted as a percentage of the
+> **quote** notional uses the quote notional, which by FX convention is `N_base × K`, so it
+> converts at the **strike** (`pct_quote/100 · N_base · K`). The two differ by `S/K` — identical
+> only for a spot-struck option, which is exactly why the bug survived the ATM worked example.
+> Raised by `dev`; ruled by the PM. Binding on the importer and the trade ticket.
 
 **Example A — EURUSD 1M ATM straddle, long 10mm per leg** (spot 1.0850, ATM 7.05%, premium 87.5 pips
 per leg; figures illustrative):
