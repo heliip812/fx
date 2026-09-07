@@ -143,11 +143,18 @@ def synthetic_banner(meta: dict | None, *, page: str = "") -> Any:
             "Nothing here is a mark and nothing here is tradable.",
             ", ".join(synth[:12]) + (" ..." if len(synth) > 12 else "")))
     if over:
-        bars.append(_bar(
-            KIND_COLORS["user_override"], "YOUR MARKS",
-            f"{len(over)} field(s) come from your own manual marks and override every "
-            "other source (amendment v1.2 T-1).",
-            ", ".join(over[:12]) + (" ..." if len(over) > 12 else "")))
+        marks = [k for k in over if k.startswith(("surface.", "spot.", "rate.", "fwd."))]
+        # An overridden *market* field is your mark and outranks every source (v1.2 T-1);
+        # a user-editable data file such as the event calendar is also user_override but
+        # is not a mark, so the two must not be announced with the same sentence.
+        word = "YOUR MARKS" if marks else "USER-SUPPLIED DATA"
+        text = (f"{len(marks)} market field(s) come from your own marks and override "
+                "every other source (amendment v1.2 T-1)."
+                if marks else
+                f"{len(over)} field(s) come from user-editable files, not from a market "
+                "source. They are not marks.")
+        bars.append(_bar(KIND_COLORS["user_override"], word, text,
+                         ", ".join(over[:12]) + (" ..." if len(over) > 12 else "")))
     if miss:
         bars.append(_bar(
             KIND_COLORS["unavailable"], "MISSING",

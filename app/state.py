@@ -19,7 +19,7 @@ import logging
 import threading
 import uuid
 from collections import OrderedDict
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd

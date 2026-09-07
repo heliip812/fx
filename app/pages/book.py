@@ -20,28 +20,26 @@ Three defences the trader review demanded live on this page:
 from __future__ import annotations
 
 import base64
-import io
 import logging
-import math
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
 import dash
 from dash import Input, Output, State, callback, ctx, dcc, html, no_update
 
-from fxgamma.conventions import CUTS, PAIRS, TENORS, pair_spec, tenor_years
-from fxgamma.store import (CSV_COLUMNS, MarketContext, OptionPosition, SpotPosition,
-                           parse_notional, parse_strike, validate_row)
+from fxgamma.conventions import CUTS, PAIRS, pair_spec
+from fxgamma.store import (CSV_COLUMNS, OptionPosition, SpotPosition,
+                           parse_notional, validate_row)
 
 from ..components.badges import provenance_badge, surface_status, synthetic_banner
 from ..components.cards import empty_state, grid, kv, metric, metric_row, note, panel
-from ..components.fmt import (EM_DASH, fmt_mm, fmt_money, fmt_pct, fmt_pips, fmt_spot,
-                              fmt_vol, fmt_vol_pts, greek_unit, theta_sentence)
+from ..components.fmt import (EM_DASH, fmt_mm, fmt_money, fmt_spot, fmt_vol,
+                              greek_unit, theta_sentence)
 from ..components.tables import col, data_table, empty_table_note, status_rules
-from ..pricing import (book_greeks, breakeven_daily_pct, gamma_pnl_pct, pair_totals,
-                       price_positions, sigma_day_move)
+from ..pricing import (book_greeks, breakeven_daily_pct, pair_totals,
+                       price_positions)
 from ..state import ALL_PAIRS, get_session
-from ..theme import ACCENT, KIND_COLORS, NEG, POS, TEXT_DIM, WARN
+from ..theme import KIND_COLORS, NEG, POS, TEXT_DIM, WARN
 
 log = logging.getLogger(__name__)
 
@@ -538,8 +536,6 @@ def _legs_from_ticket(s, values) -> tuple[list[dict], list[str]]:
         if not k2:
             raise ValueError("a butterfly needs the wing strike in 'second strike' "
                              "(e.g. 25dc) and the body in 'strike' (e.g. ATMF)")
-        legs = [leg(1, direction, k2), leg(-1, direction, f"-{_pips_of(k2)}"
-                                           if False else k2)]
         legs = [leg(1, direction, k2), leg(-1, direction, k2),
                 leg(1, -direction, k1), leg(-1, -direction, k1)]
         notes.append("smile butterfly: long the strangle, short the straddle, same "
@@ -560,17 +556,34 @@ def _legs_from_ticket(s, values) -> tuple[list[dict], list[str]]:
     return legs, notes
 
 
-def _pips_of(x):                                            # pragma: no cover
-    return x
-
-
 def _validate_legs(s, legs, allow_expired=False):
+    """Validate every leg of the ticket, minting a DISTINCT id for each.
+
+    ``store.next_id`` reads the table, so calling it once per leg before anything is
+    written hands every leg the same id and the structure collapses to one row on
+    save. The counter below is the same trick the CSV importer uses.
+    """
     ctx_ = s.ctx()
+    existing = s.store.existing_ids()
+    counters: dict[str, int] = {}
+    minted: set[str] = set()
+
+    def mint(prefix: str) -> str:
+        if prefix not in counters:
+            counters[prefix] = int(s.store.next_id(prefix).split("-")[1])
+        else:
+            counters[prefix] += 1
+        cand = f"{prefix}-{counters[prefix]:04d}"
+        while cand in existing or cand in minted:
+            counters[prefix] += 1
+            cand = f"{prefix}-{counters[prefix]:04d}"
+        minted.add(cand)
+        return cand
+
     results = []
     for i, raw in enumerate(legs, start=1):
         results.append(validate_row(raw, ctx_, row_no=i, allow_expired=allow_expired,
-                                    existing_ids=s.store.existing_ids(),
-                                    next_id=s.store.next_id))
+                                    existing_ids=existing, next_id=mint))
     return results
 
 
@@ -929,7 +942,7 @@ def _download(_a, _b, store):
             return dict(content=rep.rejects_csv(), filename="rejects.csv")
         return dict(content=s.store.export_csv(),
                     filename=f"fxgamma_book_{datetime.now():%Y%m%d_%H%M}.csv")
-    except Exception as exc:                               # noqa: BLE001
+    except Exception:                                      # noqa: BLE001
         log.exception("export failed")
         return no_update
 

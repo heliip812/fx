@@ -24,7 +24,7 @@ from typing import Any, Iterable
 
 from fxgamma.conventions import PAIRS, is_expired, pair_spec, year_fraction
 from fxgamma.models.gk import gk_greeks
-from fxgamma.types import Book, Greeks, MarketSnapshot, OptionPosition, SpotPosition
+from fxgamma.types import Book, Greeks, MarketSnapshot, OptionPosition
 
 MONEY_FIELDS = ("pv", "vega", "theta", "rho_d", "rho_f", "vanna", "volga")
 
@@ -48,7 +48,7 @@ def breakeven_daily_pct(gamma_1pct: float, theta: float, spot: float) -> float |
     gamma or no theta - the honest answer is "—", not 0.
     """
     denom = 0.005 * float(gamma_1pct) * float(spot)
-    if not denom or not theta or denom * theta > 0 and False:
+    if not denom or not theta:
         return None
     try:
         v = math.sqrt(abs(float(theta)) / abs(denom))

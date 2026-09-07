@@ -437,3 +437,40 @@ spot, so true gamma is *not* Black-Scholes gamma: the engine measures a **4.1%**
 reference book and now reports the difference explicitly. This is a real effect a trader hedging
 off BS gamma under a sticky-delta assumption would silently mis-size. Good work; surface it in the
 UI next to the sticky toggle.
+
+---
+
+# AMENDMENT v1.7 — model layer hardened; one new binding UI requirement
+
+**Root cause of the premium-adjusted bug, found and fixed.** The PM's earlier fix (strict `>` in
+`_pa_call_delta_peak`) treated the symptom. The cause was `_norm_cdf` computing `0.5(1+erf(x/√2))`,
+which returns **exactly 0.0** below x≈-8.3. `N(d2)` *is* the whole premium-adjusted delta, so the
+function manufactured the tie the `>=` then misread. Now `erfc`-based: verified `N(-9)=1.13e-19`
+and `N(-20)=2.75e-89` where the old form gave 0.0 for both. Both fixes stay — the strict comparison
+is still correct, and defence in depth is warranted on the convention that broke five of nine pairs.
+
+**A second, worse bug found in the same sweep.** The old wing damping let a negative right-wing
+slope drive total variance to zero into a `max(w, 1e-12)` floor. On a 3M USDJPY smile the floor
+engaged at **K=171.9**, and every strike above it priced at **0.01% vol** — about 9,500 of 20,001
+strikes scanned. Far-OTM yen calls would have looked nearly free. Verified fixed: the same surface
+now returns 8.70%-9.14% across strikes 100-300, with **zero** strikes below 1% vol. Replaced by a
+shared C1, Lee-bounded extrapolation (`smile.fit_wing`/`eval_wing`) used by both vanna-volga and
+the chain interpolator. Slope jump at the joins falls as h^2 to 7.7e-09 (the signature of true C1);
+density minimum -1.8e-08 (-2.2e-10 of peak) over 27 G3 slices; integral 0.9990-1.000000;
+calendar and butterfly clean on 9/9 surfaces.
+
+Also fixed in the sweep: `_norm_ppf` returning `-inf` for p<=1e-17; a `vv_vol` cancellation that put
+a discontinuity next to ATM; `implied_vol` conflating arbitrage tolerance with price resolution and
+returning **0.0 vol** on solvable JPY wings; an absolute density tolerance 320x looser for JPY than
+EUR; SABR's `z/chi` falling back to the ATM ratio; and an SVI wing bound at twice Lee's.
+
+**NEW BINDING UI REQUIREMENT (on `dev`) — `gk.max_attainable_delta`.**
+Premium-adjusted call delta is bounded, and the bound can sit *below* common quoting deltas: the
+PM verified **0.8745** at 3M/10% vol but only **0.2764** at 5Y/40% vol. So on USDJPY, USDCHF,
+USDCAD, USDSEK and USDNOK a "30-delta call" can simply **not exist**. The strike ticket and any
+delta-based strike entry (the `25dc` strike grammar) **must** call `max_attainable_delta` and render
+**"unattainable at this tenor/vol"** rather than showing a blank, a zero, or a `nan` strike. This is
+not cosmetic: silently coercing an unattainable delta is how a trader ends up with a strike they did
+not ask for.
+
+**No frozen signature changed.** All additions are keyword-only or appended with defaults.

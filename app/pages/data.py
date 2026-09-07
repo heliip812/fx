@@ -23,16 +23,15 @@ from datetime import datetime, timezone
 import dash
 from dash import Input, Output, State, callback, ctx, dcc, html, no_update
 
-from fxgamma.conventions import CCYS, G3, PAIRS, TENORS
+from fxgamma.conventions import CCYS, G3
 from fxgamma.store import ManualQuote
 
-from ..components.badges import (kind_of, provenance_badge, surface_status_badge,
-                                 synthetic_banner)
-from ..components.cards import empty_state, grid, kv, metric, metric_row, note, panel
+from ..components.badges import surface_status_badge, synthetic_banner
+from ..components.cards import empty_state, grid, kv, note, panel
 from ..components.fmt import EM_DASH, fmt_vol, fmt_vol_pts
 from ..components.tables import col, data_table
 from ..state import ALL_PAIRS, G3_TENORS, get_session
-from ..theme import ACCENT, KIND_COLORS, NEG, POS, TEXT_DIM, WARN
+from ..theme import KIND_COLORS, NEG, POS, TEXT_DIM, WARN
 
 log = logging.getLogger(__name__)
 

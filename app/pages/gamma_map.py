@@ -17,24 +17,22 @@ inventing a number.  So this page:
 from __future__ import annotations
 
 import logging
-import math
 
 import dash
-import numpy as np
 import pandas as pd
 from dash import Input, Output, callback, dcc, html
 
 from fxgamma.conventions import PAIRS, pair_spec, year_fraction
 from fxgamma.models.gk import gk_greeks
 
-from ..components.badges import kind_of, provenance_badge, synthetic_banner
+from ..components.badges import provenance_badge, synthetic_banner
 from ..components.cards import empty_state, grid, note, panel
 from ..components.charts import figure, spot_line
-from ..components.fmt import EM_DASH, fmt_mm, fmt_pct, fmt_spot, fmt_vol
+from ..components.fmt import EM_DASH, fmt_spot
 from ..components.tables import col, data_table
 from ..pricing import sigma_day_move
 from ..state import ALL_PAIRS, get_session
-from ..theme import ACCENT, KIND_COLORS, NEG, POS, SERIES, TEXT_DIM, WARN, empty_figure
+from ..theme import ACCENT, NEG, POS, empty_figure
 
 log = logging.getLogger(__name__)
 

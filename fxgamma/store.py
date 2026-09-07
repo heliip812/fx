@@ -40,12 +40,12 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable
 
-from .conventions import CUTS, PAIRS, TENORS, expiry_datetime, is_expired, pair_spec, tenor_years
+from .conventions import CUTS, PAIRS, TENORS, is_expired, pair_spec, tenor_years
 from .types import Book, OptionPosition, Provenance, SpotPosition
 
 log = logging.getLogger(__name__)

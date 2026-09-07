@@ -14,8 +14,6 @@ Missing OHLC degrades to close-to-close with a reason, never a crash.
 from __future__ import annotations
 
 import math
-from typing import Any
-
 import numpy as np
 import pandas as pd
 

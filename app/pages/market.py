@@ -20,17 +20,17 @@ import math
 import dash
 from dash import Input, Output, callback, dcc, html
 
-from fxgamma.conventions import G3, PAIRS, pair_spec
+from fxgamma.conventions import G3, pair_spec
 
 from .. import analytics as A
-from ..components.badges import kind_of, provenance_badge, surface_status, synthetic_banner
+from ..components.badges import kind_of, surface_status, synthetic_banner
 from ..components.cards import empty_state, grid, metric, metric_row, note, panel
-from ..components.charts import figure, zero_line
-from ..components.fmt import (EM_DASH, fmt_pct, fmt_spot, fmt_vol, fmt_vol_pts, move_both,
+from ..components.charts import figure
+from ..components.fmt import (EM_DASH, fmt_spot, fmt_vol, fmt_vol_pts, move_both,
                               pips_between)
 from ..components.tables import col, data_table
 from ..state import ALL_PAIRS, get_session
-from ..theme import ACCENT, KIND_COLORS, NEG, POS, SERIES, TEXT_DIM, WARN, empty_figure
+from ..theme import ACCENT, KIND_COLORS, NEG, POS, SERIES, WARN, empty_figure
 
 log = logging.getLogger(__name__)
 
@@ -94,8 +94,7 @@ def _headline(r: dict) -> html.Div:
         unit=verdict, tone=tone, sub=sub,
         hint=(f"spread = implied − realized, in vol points. Positive = implied over "
               f"realized = gamma expensive. RV window matched to {r['cal_days']} "
-              f"calendar days (W-8); annualised on sqrt(252)."),
-        badge=provenance_badge(None, "x", compact=True) if False else None)
+              f"calendar days (W-8); annualised on sqrt(252)."))
 
 
 def layout(**_kw):                                          # noqa: D401

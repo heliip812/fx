@@ -16,7 +16,6 @@ get" twenty times a day.
 from __future__ import annotations
 
 import logging
-import math
 
 import dash
 import numpy as np
@@ -30,14 +29,14 @@ from fxgamma.store import parse_strike
 from .. import analytics as A
 from ..components.badges import (provenance_badge, surface_status, surface_status_badge,
                                  synthetic_banner)
-from ..components.cards import empty_state, grid, kv, metric, metric_row, note, panel
+from ..components.cards import empty_state, grid, metric, metric_row, note, panel
 from ..components.charts import figure, spot_line
-from ..components.fmt import (EM_DASH, fmt_mm, fmt_money, fmt_pct, fmt_pips, fmt_spot,
-                              fmt_vol, fmt_vol_pts, greek_unit)
+from ..components.fmt import (EM_DASH, fmt_mm, fmt_money, fmt_spot, fmt_vol,
+                              fmt_vol_pts, greek_unit)
 from ..components.tables import col, data_table
 from ..pricing import breakeven_daily_pct, sigma_day_move
 from ..state import ALL_PAIRS, get_session
-from ..theme import ACCENT, DIVERGING, KIND_COLORS, NEG, POS, SERIES, WARN, empty_figure
+from ..theme import ACCENT, DIVERGING, NEG, SERIES, WARN, empty_figure
 
 log = logging.getLogger(__name__)
 
@@ -143,7 +142,6 @@ def _render(pair, method, _token):
             # is a display fit.  The panel says so.
             try:
                 S = snap.spot.get(pair)
-                spec = pair_spec(pair)
                 rd, rf = snap.rd_rf(pair, PAIRS)
                 surf = build_surface(pair, snap.asof, quotes, float(S), rd, rf,
                                      method=method)
@@ -333,12 +331,12 @@ def _fig_cone(s, pair, surf):
         return empty_figure("not enough history for a cone")
     x = [f"{int(h)}d" for h in c["horizon"]]
     traces = []
-    for band, colour, dash in (("p95", "#3d4b5a", "dot"), ("p75", "#4f6377", "dash"),
-                               ("p50", "#7d93a8", "solid"), ("p25", "#4f6377", "dash"),
-                               ("p5", "#3d4b5a", "dot")):
+    for band, colour, style in (("p95", "#3d4b5a", "dot"), ("p75", "#4f6377", "dash"),
+                                ("p50", "#7d93a8", "solid"), ("p25", "#4f6377", "dash"),
+                                ("p5", "#3d4b5a", "dot")):
         traces.append(dict(type="scatter", mode="lines", name=band, x=x,
                            y=[v * 100 for v in c[band]],
-                           line=dict(color=colour, width=1.2, dash=dash),
+                           line=dict(color=colour, width=1.2, dash=style),
                            hovertemplate=band + " %{y:.2f}%<extra></extra>"))
     traces.append(dict(type="scatter", mode="lines+markers", name="current RV", x=x,
                        y=[v * 100 for v in c["current"]],

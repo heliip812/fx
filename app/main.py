@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 
 import dash
-from dash import Input, Output, dcc, html
+from dash import Input, Output
 
 from .layout import header, shell
 from .state import Session, get_session, set_session
