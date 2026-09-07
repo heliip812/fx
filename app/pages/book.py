@@ -34,10 +34,9 @@ from fxgamma.store import (CSV_COLUMNS, OptionPosition, SpotPosition,
 from ..components.badges import provenance_badge, surface_status, synthetic_banner
 from ..components.cards import empty_state, grid, kv, metric, metric_row, note, panel
 from ..components.fmt import (EM_DASH, fmt_mm, fmt_money, fmt_spot, fmt_vol,
-                              greek_unit, theta_sentence)
+                              greek_unit)
 from ..components.tables import col, data_table, empty_table_note, status_rules
-from ..pricing import (aggregate, attainable_delta, headline, pair_totals,
-                       price_positions, unattainable_message)
+from ..pricing import (attainable_delta, headline, pair_totals, price_positions)
 from ..state import ALL_PAIRS, get_session
 from ..theme import KIND_COLORS, NEG, POS, TEXT_DIM, WARN
 

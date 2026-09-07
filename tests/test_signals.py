@@ -30,8 +30,20 @@ pytestmark = pytest.mark.contract
 
 @pytest.fixture(scope="module")
 def history(provider):
-    """Two years of synthetic EURUSD OHLC -- deterministic, offline."""
-    return provider.spot_history("EURUSD", dt.date(2024, 9, 1), dt.date(2026, 9, 1))
+    """~18 months of synthetic EURUSD OHLC -- deterministic, offline.
+
+    Long enough for a 63-day cone to have ~300 overlapping observations and short
+    enough to keep the suite in seconds; the estimators are all O(n) and the cones
+    O(n x horizon).
+    """
+    return provider.spot_history("EURUSD", dt.date(2025, 3, 1), dt.date(2026, 9, 1))
+
+
+@pytest.fixture(scope="module")
+def cone(history):
+    """One cone for the whole module -- ``vol_cone`` re-derives a rolling series per
+    horizon, which is the slowest thing in this file."""
+    return cones.vol_cone(history, horizons=(5, 21, 63))
 
 
 # --------------------------------------------------------------------------- #
@@ -131,19 +143,18 @@ class TestRealizedVol:
 # cones
 # --------------------------------------------------------------------------- #
 class TestVolCones:
-    def test_the_cone_has_a_row_per_horizon_with_ordered_percentiles(self, history):
-        c = cones.vol_cone(history, horizons=(5, 21, 63))
+    def test_the_cone_has_a_row_per_horizon_with_ordered_percentiles(self, cone):
+        c = cone
         assert len(c) == 3
         for _, r in c.iterrows():
             vals = [r[k] for k in ("p5", "p25", "p50", "p75", "p95") if k in c.columns]
             assert vals == sorted(vals), r
 
-    def test_the_cone_reports_its_effective_sample_size(self, history):
+    def test_the_cone_reports_its_effective_sample_size(self, cone):
         """C-6 / overlapping samples: 500 daily observations of a 63-day realized vol
         are ~8 independent ones.  A cone that prints n=437 invites a trader to treat
         a 95th percentile as a 1-in-20 event when it is closer to 1-in-8."""
-        c = cones.vol_cone(history, horizons=(5, 63))
-        assert any("n" in col for col in c.columns), c.columns.tolist()
+        assert any("n" in col for col in cone.columns), cone.columns.tolist()
         eff = cones.effective_n(500, 63)
         assert eff < 500 / 5, eff
         assert cones.effective_n(500, 1) == pytest.approx(500.0, rel=1e-9)
@@ -154,10 +165,10 @@ class TestVolCones:
         mid = cones.cone_percentile(history, 21, float(realized.realized_vol(history)))
         assert 0.0 <= lo <= mid <= hi <= 100.0
 
-    def test_longer_horizons_are_less_dispersed(self, history):
+    def test_longer_horizons_are_less_dispersed(self, cone):
         """Vol of vol falls with the averaging window; if it does not, the cone is
         being built on non-overlapping garbage."""
-        c = cones.vol_cone(history, horizons=(5, 63)).set_index("horizon")
+        c = cone.set_index("horizon")
         if {"p5", "p95"} <= set(c.columns):
             assert (c.loc[63, "p95"] - c.loc[63, "p5"]) < (c.loc[5, "p95"] - c.loc[5, "p5"])
 

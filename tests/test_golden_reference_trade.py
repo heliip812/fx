@@ -148,3 +148,116 @@ def test_economics_and_distance_bases_differ_by_twenty_percent():
     assert economics == pytest.approx(40.0, abs=0.2)
     assert distance == pytest.approx(48.1, abs=0.3)
     assert distance / economics == pytest.approx(math.sqrt(365 / 252), rel=1e-12)
+
+
+# --------------------------------------------------------------------------- #
+# AMENDMENT v1.4 ruling 3, extended: BE = sigma/sqrt(365) across the whole grid
+# --------------------------------------------------------------------------- #
+"""The single trade above pins the arbitrated numbers.  The identity behind it is
+general, and a bug that only shows up on a 147-handle pair, at 2Y, or when rd != rf
+would slip past a one-point fixture.  The sweep below re-derives the breakeven from a
+freshly priced straddle at every combination and requires the same identity to hold.
+
+Why it is worth the extra cases: ``BE% = sqrt(|theta_gamma| / (0.005 G1 S))`` closes
+only if gamma, the gamma-theta and the 1%-move scaling are all mutually consistent.
+The identity is *dimensionless* -- the handle, the pip size and the notional all
+cancel -- so a JPY-specific scaling slip (the W-16 family) or a 100x in Gamma_1pct
+(the W-5 family) breaks it, while a change in the pricer that is genuinely correct
+leaves it alone.
+"""
+
+_IDENTITY_PAIRS = ("EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCHF")
+_IDENTITY_SPOTS = {"EURUSD": 1.0840, "USDJPY": 147.50, "GBPUSD": 1.2650,
+                   "AUDUSD": 0.6500, "USDCHF": 0.8000}
+_IDENTITY_TENORS = (1 / 52, 1 / 12, 0.25, 0.5, 1.0, 2.0)
+_IDENTITY_RATES = ((0.00, 0.00), (0.04, 0.02), (0.02, 0.04), (0.05, 0.001))
+_IDENTITY_VOLS = (0.05, 0.0705, 0.12, 0.25)
+
+
+def _straddle_identity(S: float, T: float, rd: float, rf: float, sigma: float):
+    """(BE% from the priced straddle, sigma/sqrt(365) in percent)."""
+    from fxgamma.signals.richness import breakeven_pct, gamma_theta
+
+    K = smile.atm_strike(S, T, rd, rf, sigma, "dns")
+    c = gk.gk_greeks(S, K, T, rd, rf, sigma, +1, LEG, +1)
+    p = gk.gk_greeks(S, K, T, rd, rf, sigma, -1, LEG, +1)
+    g = c + p
+    be = breakeven_pct(gamma_theta(g.gamma, S, sigma), g.gamma_1pct, S)
+    return be, 100.0 * sigma / math.sqrt(365.0)
+
+
+@pytest.mark.parametrize("pair", _IDENTITY_PAIRS)
+@pytest.mark.parametrize("T", _IDENTITY_TENORS)
+def test_breakeven_identity_holds_across_pairs_and_tenors(pair, T):
+    """``BE = sigma/sqrt(365)`` on every pair and tenor, at realistic rates.
+
+    Amendment v1.4 ruling 3 asks for the identity to <1% on the reference trade; it
+    holds to machine precision everywhere, so this asserts the tight bound and would
+    catch a drift long before it reached 1%.
+    """
+    S = _IDENTITY_SPOTS[pair]
+    be, want = _straddle_identity(S, T, 0.04, 0.02, SIGMA)
+    assert be == pytest.approx(want, rel=1e-9), (pair, T, be, want)
+
+
+@pytest.mark.parametrize("rd,rf", _IDENTITY_RATES)
+@pytest.mark.parametrize("sigma", _IDENTITY_VOLS)
+def test_breakeven_identity_is_independent_of_the_rate_setting(rd, rf, sigma):
+    """Including ``rd < rf`` (the USDJPY case) and a near-zero domestic rate.
+
+    The identity uses the **gamma-theta**, not the full theta, which is exactly why it
+    survives a rate differential -- the carry part of theta is not a part gamma pays
+    back (trader W-15).  A version built on the full theta fails here at 4%/2% and
+    passes at 0/0, which is how a zero-rate-only test would have missed it.
+    """
+    be, want = _straddle_identity(147.50, 0.25, rd, rf, sigma)
+    assert be == pytest.approx(want, rel=1e-9), (rd, rf, sigma, be, want)
+
+
+def test_the_full_theta_version_of_the_identity_does_not_hold_at_non_zero_rates():
+    """The negative control for the test above: if the identity were built on the
+    *total* theta it would be rate-dependent, and the 39.9-pip breakeven card would
+    quietly change with the rate differential.  This is why W-15 matters."""
+    from fxgamma.signals.richness import breakeven_pct
+
+    S, T, sigma, rd, rf = 147.50, 1.0, 0.0705, 0.05, 0.001
+    K = smile.atm_strike(S, T, rd, rf, sigma, "dns")
+    g = (gk.gk_greeks(S, K, T, rd, rf, sigma, +1, LEG, +1)
+         + gk.gk_greeks(S, K, T, rd, rf, sigma, -1, LEG, +1))
+    be_full = breakeven_pct(g.theta, g.gamma_1pct, S)
+    want = 100.0 * sigma / math.sqrt(365.0)
+    assert abs(be_full / want - 1.0) > 0.05, (
+        "total-theta and gamma-theta breakevens agree here, so this control proves "
+        "nothing -- pick a rate setting where the carry term actually bites")
+
+
+@pytest.mark.parametrize("pair", _IDENTITY_PAIRS)
+def test_the_identity_is_scale_free_in_notional_and_handle(pair):
+    """Doubling the notional doubles gamma and theta and leaves the breakeven alone;
+    so does quoting the same market on a different handle.  A pip-size or handle
+    dependence (trader W-16) shows up here and nowhere else."""
+    from fxgamma.signals.richness import breakeven_pct, gamma_theta
+
+    S, T, sigma = _IDENTITY_SPOTS[pair], 0.25, 0.09
+    K = smile.atm_strike(S, T, 0.04, 0.02, sigma, "dns")
+
+    def be_for(notional: float, spot: float) -> float:
+        k = smile.atm_strike(spot, T, 0.04, 0.02, sigma, "dns")
+        g = (gk.gk_greeks(spot, k, T, 0.04, 0.02, sigma, +1, notional, +1)
+             + gk.gk_greeks(spot, k, T, 0.04, 0.02, sigma, -1, notional, +1))
+        return breakeven_pct(gamma_theta(g.gamma, spot, sigma), g.gamma_1pct, spot)
+
+    base = be_for(LEG, S)
+    assert be_for(4 * LEG, S) == pytest.approx(base, rel=1e-12)
+    assert be_for(LEG, S * 100.0) == pytest.approx(base, rel=1e-12)
+    assert base == pytest.approx(100.0 * sigma / math.sqrt(365.0), rel=1e-9)
+
+
+def test_the_desk_helper_reproduces_the_identity_on_every_setting():
+    """``richness.assert_breakeven_identity`` is the library's own acceptance test.
+    Run it across the grid so a regression fails here as well as inside the library."""
+    from fxgamma.signals.richness import assert_breakeven_identity
+
+    for sigma in _IDENTITY_VOLS:
+        for T in (1 / 52, 1 / 12, 0.25, 1.0):
+            assert assert_breakeven_identity(sigma=sigma, S=1.0850, T=T) < 1e-9

@@ -7,8 +7,11 @@ correct behaviour by pricing it: a long put reports ``delta_if_above 0``,
 spec's formula, and the wrong way round, so the trader hedges *into* the gap.  The
 jump is independent of call/put; the ``cp`` in the old formula is exactly what broke it.
 
-**Hedge bands** carry the amendment v1.6 CR-1 ruling on ``HedgeRule.band_pct``, which
-is where this file finds its live defect (see ``docs/05_test_report.md`` F-8).
+**Hedge bands** carry the amendment v1.6 CR-1 ruling on ``HedgeRule.band_pct`` -- a
+fraction of gross notional, not a percent.  This file found it read as a percent here
+(a band ~100x too tight); it was fixed in flight and these tests are the fence.  The
+backtest engine has *not* been fixed, so the two sites now disagree: see
+``docs/05_test_report.md`` F-8 and ``test_backtest.py``.
 """
 from __future__ import annotations
 
@@ -287,19 +290,14 @@ class TestHedgeBands:
 
     def test_the_frozen_default_rule_gives_the_band_amendment_v1_6_ruled_on(self,
                                                                            snapshot):
-        """**FINDING (docs/05_test_report.md F-8).**
+        """Amendment v1.6 CR-1, now honoured here (fixed in flight -- see F-8).
 
-        Amendment v1.6 CR-1: "``HedgeRule.band_pct`` ... is a FRACTION, not a percent
-        ... The intent was 25%.  ``types.py`` is amended to say so unambiguously; the
-        default value is unchanged and is now correct rather than dangerous."
-
-        ``types.HedgeRule`` carries that amended comment.  ``zones._band_width`` still
-        computes ``band_pct / 100 * gross``, so the frozen default of ``0.25`` produces
-        a **25,000** band on a 10mm book -- 0.25% of notional, the reading the PM
-        withdrew, and ~100x tighter than the 2.5mm the amendment specifies.  The
-        engine's own ``warning`` column tells the user to "set band_pct=15", which
-        contradicts the ruling.  Cost is pure churn: on a 1Y synthetic path the same
-        book rehedges 190 times instead of 23.
+        "``HedgeRule.band_pct`` ... is a FRACTION, not a percent ... The intent was
+        25%.  ``types.py`` is amended to say so unambiguously; the default value is
+        unchanged and is now correct rather than dangerous."  The frozen default of
+        ``0.25`` must therefore give a 2.5mm band on a 10mm book, not the 25k the
+        withdrawn percent reading produced -- a band ~100x too tight that rehedged a
+        1Y synthetic path 190 times instead of 23.
         """
         b = _one(+1, +1, days=60)                       # 10mm gross notional
         hb = zones.hedge_bands(b, snapshot, "EURUSD", rule=HedgeRule())
@@ -307,19 +305,27 @@ class TestHedgeBands:
             "band_pct is a FRACTION per amendment v1.6 CR-1: the frozen default 0.25 "
             "must mean 25% of gross notional (2.5mm on a 10mm book), not 0.25%")
 
+    def test_a_fraction_band_scales_linearly_and_is_labelled(self, snapshot):
+        b = _one(+1, +1, days=60)
+        for frac in (0.05, 0.15, 0.25, 0.50):
+            hb = zones.hedge_bands(b, snapshot, "EURUSD",
+                                   rule=HedgeRule(band_pct=frac))
+            assert float(hb["band_base"].iloc[0]) == pytest.approx(frac * N, rel=1e-9)
+            assert "band_source" in hb.columns and hb["band_source"].iloc[0]
+
     def test_the_band_scales_with_gross_notional(self, snapshot):
         small = zones.hedge_bands(_one(+1, +1, days=60), snapshot, "EURUSD",
-                                  rule=HedgeRule(band_pct=25.0))
+                                  rule=HedgeRule(band_pct=0.25))
         big = Book(options=[OptionPosition(id="x", pair="EURUSD", cp=+1, strike=1.165,
                                            expiry=in_days(60), notional_base=4 * N,
                                            direction=+1)], spots=[])
-        big_hb = zones.hedge_bands(big, snapshot, "EURUSD", rule=HedgeRule(band_pct=25.0))
+        big_hb = zones.hedge_bands(big, snapshot, "EURUSD", rule=HedgeRule(band_pct=0.25))
         assert float(big_hb["band_base"].iloc[0]) == \
             pytest.approx(4 * float(small["band_base"].iloc[0]), rel=1e-9)
 
     def test_the_band_frame_names_its_own_source_and_reporting_ccy(self, snapshot):
         hb = zones.hedge_bands(_one(+1, +1, days=60), snapshot, "EURUSD",
-                               rule=HedgeRule(band_pct=25.0))
+                               rule=HedgeRule(band_pct=0.25))
         assert "band_source" in hb.columns and hb["band_source"].iloc[0]
         assert (hb["report_ccy"] == "USD").all()
 

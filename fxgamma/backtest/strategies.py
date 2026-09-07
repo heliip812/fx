@@ -11,7 +11,7 @@ Presets
 ``long_straddle`` / ``short_straddle``
     Roll an ATM (delta-neutral-straddle strike) straddle at the chosen tenor, delta
     hedged on a band.  The band defaults to the desk standard: 15% of the pair's
-    gross option notional (trader Q-2), **not** the frozen ``HedgeRule.band_pct=0.25``
+    gross option notional (trader Q-2), **not** the frozen ``HedgeRule.band_pct=0.25`` (which v1.6 CR-1 fixed to mean 25%)
     which is ~60x too tight (W-13 / CR-1).
 ``gamma_carry``
     Long vol when trailing realized is above implied by ``threshold`` vol points,
@@ -39,7 +39,7 @@ __all__ = ["long_straddle", "short_straddle", "gamma_carry", "cone_rule",
            "always_on", "hedge_frequency_sweep", "run_grid", "DEFAULT_BAND_PCT"]
 
 #: trader Q-2: 15% of the pair's gross option notional
-DEFAULT_BAND_PCT = 15.0
+DEFAULT_BAND_PCT = 0.15   # v1.6 CR-1: a FRACTION of gross notional (15%)
 
 
 def always_on(direction: int = +1) -> Callable[[View], int]:
@@ -104,7 +104,7 @@ def long_straddle(pair: str = "EURUSD", *, tenor_days: int = 30,
     """Buy the ATM straddle, delta hedge on a band, roll at expiry."""
     return _base(pair, +1, tenor_days=tenor_days, notional_base=notional_base,
                  hedge=HedgeRule(mode="band", band_pct=band_pct),
-                 name=kw.pop("name", f"long straddle {tenor_days}d band {band_pct:g}%"),
+                 name=kw.pop("name", f"long straddle {tenor_days}d band {band_pct * 100:g}%"),
                  **kw)
 
 
@@ -114,7 +114,7 @@ def short_straddle(pair: str = "EURUSD", *, tenor_days: int = 30,
     """Sell the ATM straddle, delta hedge on a band, roll at expiry."""
     return _base(pair, -1, tenor_days=tenor_days, notional_base=notional_base,
                  hedge=HedgeRule(mode="band", band_pct=band_pct),
-                 name=kw.pop("name", f"short straddle {tenor_days}d band {band_pct:g}%"),
+                 name=kw.pop("name", f"short straddle {tenor_days}d band {band_pct * 100:g}%"),
                  **kw)
 
 

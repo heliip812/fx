@@ -278,7 +278,13 @@ def headline(book: Book, mkt: MarketSnapshot, pair: str, *,
     out["side"] = side
     be = be_pips = None
     try:
-        card = daily_breakeven(book.filter(pair), mkt, pair, days=d,
+        # Options only.  `richness.daily_breakeven` takes the vega-weighted vol of every
+        # live row, and a spot leg's `vol` is nan, so a pair carrying a spot hedge makes
+        # the whole card nan.  A spot leg has no gamma and no theta, so dropping it
+        # changes no number in the breakeven -- it only avoids the nan.  Library bug,
+        # reported to the PM; this is the input choice, not a re-implementation.
+        sub = Book([o for o in book.options if o.pair == pair], [], book.name)
+        card = daily_breakeven(sub, mkt, pair, days=d,
                                report_ccy=spec.quote, marks=mark_vols(marks))
         be = card.get("be_pct")
         be_pips = card.get("be_pips")

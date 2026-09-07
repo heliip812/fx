@@ -1028,13 +1028,37 @@ class Store:
     # ------------------------------------------------------------- plumbing
     @contextmanager
     def _tx(self):
+        """One transaction, however deeply nested (QA finding F-12).
+
+        ``_tx`` is re-entrant: ``save_positions`` opens a block and calls
+        ``save_position``, which opens another.  Committing on *every* exit meant row 1
+        was already committed by the time row 2 raised, so the outer rollback had
+        nothing to undo and the user was left with a half-imported book and no audit
+        row -- neither of the two states the preview gate described.  The depth counter
+        below makes the outermost block the only one that commits or rolls back, which
+        is what both docstrings ("all rows or none") already promised.
+
+        The lock is re-entrant (``RLock``), so nesting is safe; ``_failed`` marks a
+        transaction poisoned so an inner ``except`` cannot accidentally commit a
+        partially applied outer one.
+        """
         with self._lock:
+            self._depth = getattr(self, "_depth", 0) + 1
+            outermost = self._depth == 1
+            if outermost:
+                self._failed = False
             try:
                 yield self._conn
-                self._conn.commit()
             except Exception:
-                self._conn.rollback()
+                self._failed = True
                 raise
+            finally:
+                self._depth -= 1
+                if self._depth == 0:
+                    if self._failed:
+                        self._conn.rollback()
+                    else:
+                        self._conn.commit()
 
     def _migrate(self) -> None:
         with self._tx() as c:

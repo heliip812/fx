@@ -425,13 +425,15 @@ def _band_width(sub: Book, mkt: MarketSnapshot, pair: str, rule: HedgeRule | Non
         return float(rule.band_delta), "rule.band_delta", warn
     if rule.mode == "gamma_budget":
         return max(abs(rule.target_delta) or DEFAULT_CLIP, DEFAULT_CLIP), "rule.gamma_budget", warn
+    # Amendment v1.6 CR-1: band_pct is a FRACTION of gross option notional
+    # (0.25 = 25%), not "0.25 percent". Reading it as a percent made the frozen
+    # default ~60x too tight -- a 10mm book rehedging on a 25k delta drift.
     bp = float(rule.band_pct)
-    if abs(bp - 0.25) < 1e-12:
-        warn = ("rule.band_pct is the frozen default 0.25 (% of notional). At 15% desk "
-                "standard that is ~60x too tight and rehedges on a sub-pip move -- "
-                "trader W-13 / CR-1. Band computed as asked; set band_pct=15 for the "
-                "desk default.")
-    return max(bp / 100.0 * gross, 0.0), f"rule.band_pct={bp}% of gross notional", warn
+    if bp > 1.0:
+        warn = (f"rule.band_pct={bp} is a fraction of gross notional, so this asks for "
+                f"{bp * 100:.0f}% of notional. If you meant {bp:.0f}%, pass {bp / 100:g}.")
+    return (max(bp * gross, 0.0),
+            f"rule.band_pct={bp:g} ({bp * 100:g}% of gross notional)", warn)
 
 
 def hedge_bands(book: Book, mkt: MarketSnapshot, pair: str, *,

@@ -474,3 +474,37 @@ not cosmetic: silently coercing an unattainable delta is how a trader ends up wi
 not ask for.
 
 **No frozen signature changed.** All additions are keyword-only or appended with defaults.
+
+---
+
+# AMENDMENT v1.8 — v1.6 CR-1 implemented; attribution explain refined
+
+**Implementation of CR-1 (band_pct is a fraction).** The ruling had been recorded but not applied;
+three call sites still divided by 100, so the risk engine and the backtester disagreed with the
+contract *and* with each other. Now consistent: `zones._band_for`, `backtest/engine.py`, and
+`backtest/strategies.DEFAULT_BAND_PCT` (15.0 -> 0.15). The "60x too tight" warning is replaced by
+one that fires when `band_pct > 1.0`, i.e. a caller passing `15` meaning 15%. QA's
+`test_the_backtest_and_the_risk_engine_read_band_pct_identically` is the test that caught the
+divergence and is worth keeping.
+
+**Attribution explain — PM ruling on QA finding F-10, which contradicted QA's own suite.**
+F-10 proposed evaluating vega *and theta* at the midpoint of the two snapshots. That does cut the
+residual, but it breaks `TestElapsedTimeTheta`, which asserts exact pro-rata theta at `rel=1e-9`.
+Both cannot hold. Ruling:
+
+- **Vega moves to the midpoint** `0.5(vega_t0 + vega_t1)`. Vega decays, so charging the t0 vega
+  across a day where the clock also moved pushed the difference into `unexplained`; an ordinary
+  quarter-vol-point overnight alone breached REQ-052's 1% budget. A residual alarm that fires on
+  every ordinary day is an alarm the trader turns off, and the alarm is the instrument that catches
+  the *next* bug — so keeping it usable matters more than the few dollars involved.
+- **Theta stays pro-rata** (`theta_t0 * dt_days`). Theta *is* the time-derivative term; averaging it
+  double-counts the curvature it already represents, and W-14's pro-rata charging is a trader
+  requirement, not an implementation detail.
+- **Gamma, vanna and volga stay at t0.** Extending the trapezoid to them was tried and reverted: it
+  breaks "gamma is quadratic in the move" and the vanna cross-term test, which encode design
+  properties worth more than the residual they buy.
+
+**Open, and honestly so:** at a *half* vol point overnight the residual still exceeds 1%. The PM's
+reading is that this is genuine third-order error rather than a defect, and that a flat 1% budget
+independent of move size is the wrong specification. Referred back to QA to either disprove that or
+propose the budget REQ-052 should carry as a function of move size. Not silently widened.

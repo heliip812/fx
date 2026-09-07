@@ -43,13 +43,13 @@ from fxgamma.signals.richness import gamma_carry_expectancy
 from fxgamma.types import HedgeRule
 
 from ..components.badges import surface_status, synthetic_banner
-from ..components.cards import empty_state, grid, kv, metric, metric_row, note, panel
+from ..components.cards import grid, kv, metric, metric_row, note, panel
 from ..components.charts import figure, zero_line
 from ..components.fmt import EM_DASH, fmt_money, fmt_pct, fmt_vol
 from ..components.tables import col, data_table, sign_rules
 from ..pricing import DISTANCE_BASIS, ECONOMICS_BASIS
 from ..state import ALL_PAIRS, get_session
-from ..theme import ACCENT, NEG, POS, SERIES, TEXT_DIM, WARN, empty_figure
+from ..theme import ACCENT, NEG, SERIES, TEXT_DIM, WARN, empty_figure
 
 log = logging.getLogger(__name__)
 

@@ -478,23 +478,27 @@ class TestStrategies:
 # hedge-rule semantics, amendment v1.6 CR-1
 # --------------------------------------------------------------------------- #
 def test_the_backtest_and_the_risk_engine_read_band_pct_identically(hot_path, snapshot):
-    """**FINDING (docs/05_test_report.md F-8), second site.**
+    """**FINDING (docs/05_test_report.md F-8), the half that is still open.**
 
-    ``engine.run_backtest`` computes ``band = rule.band_pct / 100 * gross`` -- the
-    same percent reading ``zones._band_width`` uses, and the same one amendment v1.6
-    CR-1 withdrew in favour of "band_pct is a FRACTION".  Whichever reading wins, the
-    two must agree, or a band the user sets on the Risk page means something else in
-    the Lab.  They agree today (both are the withdrawn reading), so this passes; it
-    exists so that fixing one site without the other fails immediately.
+    Amendment v1.6 CR-1 ruled ``HedgeRule.band_pct`` a **FRACTION** of gross option
+    notional (``0.25`` = 25%), not a percent.  ``zones._band_width`` now honours that.
+    ``engine.run_backtest`` still computes ``band = rule.band_pct / 100 * gross``
+    (``engine.py:414``), and ``strategies.DEFAULT_BAND_PCT`` is ``15.0``.
+
+    So the two halves of the app now disagree by 100x about what a hedge band is: a
+    band the user tunes in the Lab means something else on the Risk page, and the
+    presets ship at 15% in one reading and 1500% -- never hedge -- in the other.  A
+    split reading is worse than either reading being wrong, because the Lab is exactly
+    where a trader goes to *choose* the band they will run.
+
+    Fix ``engine.py`` and ``strategies.DEFAULT_BAND_PCT`` together.  Owner: quant.
     """
-    from datetime import date
-
     from fxgamma.portfolio import zones
     from fxgamma.types import Book, OptionPosition
 
     from tests.conftest import in_days
 
-    gross, band_pct = 10e6, 25.0
+    gross, band_pct = 10e6, 0.25
     book = Book(options=[OptionPosition(id="s", pair="EURUSD", cp=+1, strike=1.165,
                                         expiry=in_days(30), notional_base=gross,
                                         direction=+1)], spots=[])
@@ -503,14 +507,13 @@ def test_the_backtest_and_the_risk_engine_read_band_pct_identically(hot_path, sn
                                                        band_pct=band_pct)
                                         )["band_base"].iloc[0])
 
-    # the band the engine actually enforces: the widest delta it tolerated unhedged
+    # the band the engine actually enforces, read off the widest delta it tolerated
     cfg = strategies.long_straddle(tenor_days=30, band_pct=band_pct,
                                    notional_base=gross)
     eq = engine.run_backtest(hot_path, cfg).equity
-    quiet = eq.loc[eq["hedge_base"] == 0.0, "delta_total"].abs()
-    engine_band = float(quiet.max())
+    engine_band = float(eq["delta_total"].abs().max())
 
-    # the straddle's gross is two legs, so the engine's band is 2x the single-leg one
-    assert engine_band <= 2 * risk_band * 1.01, (engine_band, risk_band)
-    assert engine_band > 0.5 * risk_band, (
-        "the Lab and the Risk page disagree about what band_pct means")
+    # a straddle is two legs, so the engine's gross is 2x the single-leg book above
+    assert engine_band == pytest.approx(2 * risk_band, rel=0.05), (
+        f"the Lab enforces a {engine_band:,.0f} band where the Risk page computes "
+        f"{2 * risk_band:,.0f} for the same band_pct={band_pct}")

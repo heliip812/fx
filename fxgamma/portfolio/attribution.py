@@ -97,6 +97,19 @@ def _utc(dt: datetime) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def _mid(x0: Any, x1: Any) -> float:
+    """Average of a Greek at the two snapshots, falling back to t0 if t1 is unusable.
+
+    Second-order accurate in the step where evaluating at t0 alone is only
+    first-order, which is what keeps the unexplained residual inside its budget.
+    """
+    a = float(x0)
+    b = float(x1)
+    if not np.isfinite(b):
+        return a
+    return 0.5 * (a + b)
+
+
 def daily_pnl(book: Book, mkt_t0: MarketSnapshot, mkt_t1: MarketSnapshot,
               hedges: Sequence[SpotPosition] | None = None, *,
               report_ccy: str = "USD",
@@ -166,8 +179,18 @@ def daily_pnl(book: Book, mkt_t0: MarketSnapshot, mkt_t1: MarketSnapshot,
             rec.update({
                 "delta": float(a["delta_base"]) * dS,
                 "gamma": 0.5 * float(a["gamma"]) * dS * dS,
+                # Vega alone is evaluated at the midpoint of the two snapshots (the
+                # trapezoidal rule) rather than at t0.
+                # Vega decays, so charging the t0 vega across a day where the clock also
+                # moved pushed the difference into `unexplained`: an ordinary quarter-
+                # vol-point overnight alone breached REQ-052's 1% budget, and a residual
+                # alarm that fires every ordinary day is an alarm the trader turns off.
+                # Theta deliberately stays at t0 x elapsed days: theta IS the time
+                # derivative, so averaging it would double-count the curvature it
+                # already represents and break the pro-rata charging W-14 requires.
+                # QA finding F-10.
                 "theta": float(a["theta"]) * dt_days,
-                "vega": float(a["vega"]) * dvp,
+                "vega": _mid(a["vega"], b["vega"]) * dvp,
                 "vanna": float(a["vanna"]) * dS * dvp,
                 "volga": 0.5 * float(a["volga"]) * dvp * dvp,
                 "rates": (float(a["rho_d"]) * (rd1 - rd0) / _RATE_PT

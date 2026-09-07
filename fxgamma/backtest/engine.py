@@ -242,7 +242,7 @@ class BacktestConfig:
     tenor_days: int = 30
     roll_days: int | None = None           # None -> roll at expiry
     strangle_delta: float = 0.25
-    hedge: HedgeRule = field(default_factory=lambda: HedgeRule(mode="band", band_pct=15.0))
+    hedge: HedgeRule = field(default_factory=lambda: HedgeRule(mode="band", band_pct=0.15))
     hedge_every_steps: int | None = None   # for mode="time": steps between hedges
     vega_spread_pts: float = 0.25          # option bid/offer, vol points, round trip
     cost_bp: float | None = None           # spot round-trip bp; None -> per-pair table
@@ -411,7 +411,7 @@ def run_backtest(path: PathData, cfg: BacktestConfig) -> BacktestResult:
         gross = sum(lg.notional_base for lg in legs) or cfg.notional_base
         if rule.mode == "band":
             band = (rule.band_delta if rule.band_delta > 0
-                    else rule.band_pct / 100.0 * gross)
+                    else rule.band_pct * gross)   # v1.6 CR-1: fraction, not percent
             if abs(delta_total - rule.target_delta) > band:
                 traded = -(delta_total - rule.target_delta)
         elif rule.mode == "time":
