@@ -437,8 +437,9 @@ class VannaVolgaSmile:
         # O(1e-5) error in the join slope is a visible kink in the density.  The VV
         # core is an analytic formula on both sides of its own pillars, so the
         # central stencil is legitimate here.
-        p1 = smile.wing_slope(core_w, k1)
-        p3 = smile.wing_slope(core_w, k3)
+        span = max(abs(k3 - k1), 1e-6)     # the smile's own length scale in k
+        p1 = smile.wing_slope(core_w, k1, scale=span)
+        p3 = smile.wing_slope(core_w, k3, scale=span)
 
         cR, kR_, wR_, qR = self._anchor(k3, w3, p3, kR, wR, +1)
         cL, kL_, wL_, qL = self._anchor(k1, w1, p1, kL, wL, -1)

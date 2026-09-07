@@ -224,7 +224,10 @@ class PnLBreakdown:
 @dataclass(frozen=True)
 class HedgeRule:
     mode: str = "band"           # band | time | gamma_budget | none
-    band_pct: float = 0.25       # rehedge when |delta| drifts this % of notional
+    band_pct: float = 0.25       # FRACTION of gross option notional (0.25 = 25%), not
+                                 # "0.25 percent" - see amendment v1.6 CR-1. On a 10mm
+                                 # book that is a 2.5mm delta band; reading it as 0.25%
+                                 # would rehedge on 25k and churn the book ~60x too often.
     band_delta: float = 0.0      # absolute base-ccy band (overrides band_pct if > 0)
     every_hours: float = 24.0    # for mode="time"
     cost_bp: float = 0.2         # round-trip spot cost in bp of notional

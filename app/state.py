@@ -67,7 +67,11 @@ class Session:
         self._sync_marks_from_store()
         if seed_demo and self.store.is_empty():
             try:
-                self.store.seed_demo_book()
+                # Stamp a snapshot FIRST so the demo legs are struck around the market
+                # the app is actually showing; seeded off anchor levels they would sit
+                # 7% out of the money and the screens would look wrong for no reason.
+                self.build()
+                self.store.seed_demo_book(self.ctx())
                 self.demo_seeded = True
             except Exception as exc:                       # noqa: BLE001
                 log.warning("demo book seed failed: %s", exc)

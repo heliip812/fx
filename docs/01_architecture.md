@@ -396,3 +396,44 @@ repricing surface. Vanna-volga (which reprices its inputs to ~1e-8) remains the 
 **Standing test gap, acknowledged not closed:** every live adapter is unverified (hosts blocked
 here) and `manual.py` — now the *primary* mark path — has no test coverage. Both are first calls on
 the next QA pass; `scripts/verify_live_sources.py` covers the live half on the user's own machine.
+
+---
+
+# AMENDMENT v1.6 — PM rulings on the risk engine's contract-change requests (binding)
+
+The PM verified the engine's headline claims independently before ruling. Pin risk: a **long put**
+now reports `delta_if_above 0 / delta_if_below -10mm / jump +10mm`, where REQ-045's old formula
+gave -10mm — a 20mm error, and the jump is correctly independent of call/put. Cross-ccy theta on a
+EURUSD+USDJPY book: naive sum **-209,974** (USD added to JPY) vs USD-converted **-3,424**, i.e.
+the un-converted number is **61x wrong**. CG-1 was worth the trouble.
+
+**CR-1 — `HedgeRule.band_pct` semantics. RESOLVED: it is a FRACTION, not a percent.**
+The frozen comment said "this % of notional" with a default of `0.25`, which reads as 0.25% and is
+~60x tighter than any desk would run: on a 10mm book it rehedges on a 25k delta drift. The intent
+was 25%. `types.py` is amended to say so unambiguously; the default value is unchanged and is now
+correct rather than dangerous. The engine's `warning` column stays — it costs nothing and catches a
+user who read the old comment. **The band remains open question Q-2 for the real user**; 25% of
+gross option notional, floored at a 1mm clip, is the shipping default until they say otherwise.
+`cost_bp` moves to the per-pair table `zones.COST_BP` (**approved**), with `HedgeRule.cost_bp`
+retained as a per-rule override.
+
+**CR-2 — CG-1 scope for base-ccy Greeks. RATIFIED as the engine read it.**
+`delta_base`, `gamma`, `gamma_1pct` and `vanna` are base-ccy *amounts*, not quote-ccy money, so
+amendment v1.1's "monetary Greeks" clause does not reach them. Aggregate natively when the book has
+a single base ccy; return `nan` across mixed bases (the T-2 precedent — a wrong number is worse
+than "n/a"); `book_greeks(..., base_as_value=True)` converts to report-ccy value when a single
+figure is wanted. This is the correct reading and the aggregate delta card depends on it.
+
+**CR-3 — `sticky="none"`. ACCEPTED as implemented.** For a strike-parameterised surface it is
+numerically identical to `"strike"`; shipping it as the documented pinned-vol fast path is right.
+
+**CR-4 — `GammaZoneDetail(GammaZone)` stays a subclass.** `list[GammaZoneDetail]` satisfies the
+frozen signature, so no contract change. **Binding on `dev`:** the extra fields (sigma-days on
+√252, touch probability, contributing strikes/expiries, P&L-to-centre, delta carried inside) are
+available and should be surfaced — they are the substance of "how sensitive each gamma zone is".
+
+**Recorded finding, no action needed — `skew_gamma_1pct`.** Under sticky-delta the vol moves with
+spot, so true gamma is *not* Black-Scholes gamma: the engine measures a **4.1%** gap on the
+reference book and now reports the difference explicitly. This is a real effect a trader hedging
+off BS gamma under a sticky-delta assumption would silently mis-size. Good work; surface it in the
+UI next to the sticky toggle.

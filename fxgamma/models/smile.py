@@ -342,15 +342,26 @@ def risk_neutral_density(vol_fn: Callable[[np.ndarray], np.ndarray],
 # necessary, not sufficient.  Always run :func:`risk_neutral_density`.
 
 
-def wing_slope(w_fn: Callable[[float], float], k0: float, *, h: float = 1e-5) -> float:
-    """Central difference ``dw/dk`` at ``k0``.
+def wing_slope(w_fn: Callable[[float], float], k0: float, *,
+               scale: float = 1.0, h: float | None = None) -> float:
+    """Central difference ``dw/dk`` at ``k0``, stepped relative to ``scale``.
 
-    Central rather than one-sided: the one-sided version is ``O(h)`` accurate, and
-    an ``O(1e-5)`` error in the join slope is a *visible* kink in the density.
-    Every smile core in this package is defined (as a formula) on both sides of
-    its own pillars, so the central stencil is always legitimate.
+    Central rather than one-sided: the one-sided version is only ``O(h)`` accurate,
+    and an error in the join slope is a *visible* kink in the density.  Every smile
+    core in this package is an analytic formula on both sides of its own pillars, so
+    the central stencil is always legitimate.
+
+    ``scale`` is the length in log-moneyness over which the curve actually varies --
+    for a smile, the 25d-to-25d span.  A **fixed** step cannot serve both ends of the
+    tenor grid: a 1Y G10 smile spans ~0.15 in ``k`` while an overnight one spans
+    ~0.002, so ``h = 1e-5`` is 7e-5 of the feature at 1Y and 5e-3 of it overnight,
+    where the resulting ``O((h/L)^2)`` truncation reaches ~1e-5 *relative* to the
+    slope.  ``h = eps^(1/3) * scale`` is the textbook optimum for a central
+    difference (truncation ``O(h^2)`` against round-off ``O(eps/h)``) and holds the
+    relative error near 1e-11 at every tenor.
     """
-    return float((w_fn(k0 + h) - w_fn(k0 - h)) / (2.0 * h))
+    hh = float(h) if h is not None else max(6e-6 * abs(float(scale)), 1e-12)
+    return float((w_fn(k0 + hh) - w_fn(k0 - hh)) / (2.0 * hh))
 
 
 def fit_wing(k_join: float, w_join: float, q_out: float, *,

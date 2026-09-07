@@ -770,6 +770,9 @@ def _mark(_a, _b, pid, vol, version):
             ok = s.store.clear_mark_vol(pid)
             return (note(f"mark cleared for {pid}; it prices off the surface again"
                          if ok else f"no mark on {pid}"), (version or 0) + 1)
+        if s.store.get_position(pid) is None:
+            return note(f"no position with id {pid} in this book — copy the id from the "
+                        "blotter", tone="warn"), no_update
         v = float(str(vol).replace("%", "").strip())
         warn = ""
         if v > 1.0:
