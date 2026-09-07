@@ -5,7 +5,14 @@ Contract references: docs/01_architecture.md sections 3 (types), 7 (provenance) 
 
 Every provider method returns data **plus** provenance.  ``snapshot()`` must populate
 ``MarketSnapshot.meta`` with a :class:`~fxgamma.types.Provenance` for every field it fills,
-keyed ``"<kind>.<name>"`` -- e.g. ``spot.EURUSD``, ``rates.USD``, ``surface.USDJPY``.
+using the key grammar frozen by amendment v1.1 CG-7::
+
+    spot.<PAIR>        rate.<CCY>        fwd.<PAIR>.<TENOR>
+    surface.<PAIR>     surface.<PAIR>.<TENOR>
+    oi.<PAIR>          events
+
+``PAIR`` is the 6-letter uppercase symbol, ``CCY`` the 3-letter code, ``TENOR`` a
+``conventions.TENORS`` key. Lookup is most-specific-first (:func:`meta_lookup`).
 Never badge synthetic data as live (contract section 7).
 """
 from __future__ import annotations
@@ -23,9 +30,10 @@ from ..types import MarketSnapshot, Provenance
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "MarketDataProvider", "SmileQuotes", "build_surface", "SPOT_COLUMNS", "OI_COLUMNS",
-    "EVENT_COLUMNS", "empty_spot_frame", "empty_oi_frame", "empty_event_frame",
-    "utcnow", "prov", "SourceStatus",
+    "MarketDataProvider", "SmileQuotes", "build_surface", "surface_backend",
+    "SPOT_COLUMNS", "OI_COLUMNS", "EVENT_COLUMNS", "SNAPSHOT_TENORS",
+    "empty_spot_frame", "empty_oi_frame", "empty_event_frame",
+    "utcnow", "prov", "meta_lookup", "SourceStatus",
 ]
 
 # --------------------------------------------------------------------------------------
@@ -70,9 +78,16 @@ def surface_backend() -> str:
 # --------------------------------------------------------------------------------------
 # Canonical frame schemas -- every provider returns exactly these columns, in this order.
 # --------------------------------------------------------------------------------------
-SPOT_COLUMNS = ["open", "high", "low", "close"]              # index: DatetimeIndex (UTC), name="date"
+SPOT_COLUMNS = ["open", "high", "low", "close"]        # index: DatetimeIndex (UTC), name="date"
 OI_COLUMNS = ["strike", "expiry", "cp", "oi", "settle"]
-EVENT_COLUMNS = ["datetime", "ccy", "event", "importance", "source"]
+
+# v1.1 CG-6 froze the on-disk calendar columns as
+#   date, time_utc, ccy, event, importance, source
+# `events()` returns those plus a derived tz-aware `datetime` for convenience.
+EVENT_COLUMNS = ["datetime", "date", "time_utc", "ccy", "event", "importance", "source"]
+
+#: tenors carried in `MarketSnapshot.forwards` / badged as `fwd.<PAIR>.<TENOR>` (CG-7)
+SNAPSHOT_TENORS = ("1W", "1M", "2M", "3M", "6M", "1Y")
 
 
 def empty_spot_frame() -> pd.DataFrame:
@@ -93,11 +108,23 @@ def empty_oi_frame() -> pd.DataFrame:
 def empty_event_frame() -> pd.DataFrame:
     return pd.DataFrame({
         "datetime": pd.Series(dtype="datetime64[ns, UTC]"),
+        "date": pd.Series(dtype="object"),
+        "time_utc": pd.Series(dtype="object"),
         "ccy": pd.Series(dtype="object"),
         "event": pd.Series(dtype="object"),
-        "importance": pd.Series(dtype="object"),
+        "importance": pd.Series(dtype="int64"),
         "source": pd.Series(dtype="object"),
     })
+
+
+def meta_lookup(meta: dict, key: str):
+    """CG-7 most-specific-first badge lookup: ``surface.EURUSD.1M`` -> ``surface.EURUSD``."""
+    parts = key.split(".")
+    for n in range(len(parts), 0, -1):
+        hit = meta.get(".".join(parts[:n]))
+        if hit is not None:
+            return hit
+    return None
 
 
 def utcnow() -> datetime:
@@ -170,10 +197,12 @@ class MarketDataProvider(ABC):
                           asof=asof or utcnow(), note=note)
 
     def forwards(self, pair: str, spot: float, rd: float, rf: float,
-                 tenors: Iterable[float] = (1 / 12, 0.25, 0.5, 1.0)) -> dict[float, float]:
-        """Covered-interest-parity forwards from the flat zero curves (v1)."""
+                 tenors: Iterable[str] = SNAPSHOT_TENORS) -> dict[float, float]:
+        """Covered-interest-parity forwards from the flat zero curves (v1). Keyed by T."""
         import math
-        return {float(T): spot * math.exp((rd - rf) * T) for T in tenors}
+
+        from ..conventions import tenor_years
+        return {tenor_years(t): spot * math.exp((rd - rf) * tenor_years(t)) for t in tenors}
 
     def snapshot(self, pairs: Sequence[str], asof: datetime | None = None,
                  *, method: str = "vanna_volga",
@@ -201,7 +230,7 @@ class MarketDataProvider(ABC):
         for c in ccys:
             if c in rr and rr[c] == rr[c]:
                 snap.rates[c] = float(rr[c])
-                snap.meta[f"rates.{c}"] = self.provenance(f"rates.{c}", asof=asof)
+                snap.meta[f"rate.{c}"] = self.provenance(f"rate.{c}", asof=asof)
 
         for p in pairs:
             if p not in snap.spot:
@@ -210,8 +239,9 @@ class MarketDataProvider(ABC):
             rd = snap.rates.get(spec.quote, 0.0)
             rf = snap.rates.get(spec.base, 0.0)
             snap.forwards[p] = self.forwards(p, snap.spot[p], rd, rf)
-            snap.meta[f"forwards.{p}"] = self.provenance(
-                f"forwards.{p}", note="CIP from flat zero curves", asof=asof)
+            for t in SNAPSHOT_TENORS:
+                snap.meta[f"fwd.{p}.{t}"] = self.provenance(
+                    f"fwd.{p}.{t}", note="CIP from flat zero curves", asof=asof)
             if not with_surfaces:
                 continue
             try:
