@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from .types import PairSpec
 
 __all__ = ["PAIRS", "G3", "G10_PAIRS", "CCYS", "CUTS", "TENORS", "tenor_years",
-           "year_fraction", "expiry_datetime", "pair_spec", "is_jpy_pair", "pip_value"]
+           "year_fraction", "expiry_datetime", "pair_spec", "is_jpy_pair", "pip_value", "is_expired"]
 
 ACT = 365.0
 
@@ -87,11 +87,24 @@ def expiry_datetime(expiry: date, cut: str = "NY10") -> datetime:
 
 def year_fraction(asof: datetime, expiry: date, cut: str = "NY10",
                   floor: float = 1 / (365 * 24)) -> float:
-    """ACT/365F to the cut, floored at one hour so expiring options stay priceable."""
+    """ACT/365F to the cut.
+
+    Returns exactly ``0.0`` once the cut has passed, so an expired option prices to
+    intrinsic and stops contributing gamma, vega and theta. The `floor` applies only
+    on the *live* side of the cut, keeping options priceable in their final minutes
+    without letting a dead option linger in the risk forever.
+    """
     if asof.tzinfo is None:
         asof = asof.replace(tzinfo=ZoneInfo("UTC"))
-    dt = expiry_datetime(expiry, cut) - asof.astimezone(ZoneInfo("UTC"))
-    return max(dt.total_seconds() / (ACT * 86400.0), floor)
+    secs = (expiry_datetime(expiry, cut) - asof.astimezone(ZoneInfo("UTC"))).total_seconds()
+    if secs <= 0.0:
+        return 0.0
+    return max(secs / (ACT * 86400.0), floor)
+
+
+def is_expired(asof: datetime, expiry: date, cut: str = "NY10") -> bool:
+    """True once `expiry`'s cut has passed. The book view uses this to retire legs."""
+    return year_fraction(asof, expiry, cut) == 0.0
 
 
 def pip_value(pair: str, notional_base: float, spot: float) -> float:

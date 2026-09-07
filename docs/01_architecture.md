@@ -234,3 +234,43 @@ oi.<PAIR>          events
 ```
 `PAIR` is the 6-letter uppercase symbol, `CCY` the 3-letter code, `TENOR` a `conventions.TENORS`
 key. Lookup is most-specific-first: a badge for `surface.EURUSD.1M` falls back to `surface.EURUSD`.
+
+---
+
+# AMENDMENT v1.2 — PM ruling on the trader review (binding)
+
+Source: `docs/06_trader_review.md` §1. Five defects were raised; three were in PM-owned files and
+are **already fixed**, two are spec errors assigned back to the BA.
+
+**T-1 — Manual vol marks are promoted to a PRIMARY input. ACCEPTED, and it changes the design.**
+The trader's blocking objection is correct: everything downstream is computed off a vol mark, and
+ETF-implied vol is not the desk's mark. Therefore:
+- `fxgamma/data/manual.py` (**data**) adds `ManualQuoteProvider`: a per-pair, per-tenor
+  ATM / 25d RR / 25d BF grid the user types or pastes, persisted, with `Provenance(kind="user_override")`.
+- `ChainProvider` resolution order becomes **manual → live → cache → synthetic**. A manual mark
+  always wins; it is never overwritten by a live pull.
+- The Data page (**dev**) gets a paste-and-go grid as its top panel, targeting <30 seconds to mark
+  the whole G3 book, not a buried override dialog.
+- ETF-implied and CBOE-index vols are demoted to what they are good at: **z-scores, cones and
+  richness**, never the mark. The Market Monitor may show them; the book is priced off the manual
+  curve when one exists, and the badge says which.
+
+**T-2 — `Greeks.__add__` summed intensive quantities. FIXED** in `types.py`: `delta_pct` and
+`dual_delta` are per-unit / per-strike and now aggregate to `nan`, so book-level cards read "n/a"
+rather than printing a confident wrong number. All extensive Greeks still add normally.
+
+**T-3 — expired options never died. FIXED** in `conventions.py`: `year_fraction` returns exactly
+`0.0` once the cut has passed (the one-hour floor now applies only on the live side), and
+`is_expired()` is added. Verified: an expired ITM call prices to intrinsic with full delta and zero
+gamma, vega and theta.
+
+**T-4 — `rd_rf` silently defaulted a missing rate to 0.0. FIXED** in `types.py`: it now raises with
+the missing ccy named. Assuming a zero rate put the USDJPY 1Y forward about four big figures out.
+
+**T-5 — spec errors, ASSIGNED TO BA.** REQ-045's pin-risk formula is the *inherited-if-ITM* delta,
+not the discontinuity, and is sign-wrong for puts; REQ-046's decay identity is out by 100x given the
+document's own definition of `Γ$`. Both to be corrected in `docs/02_requirements.md` with a
+worked numeric example each.
+
+**Scope note:** T-1 does not widen v1. It re-prioritises an existing requirement (REQ-068) from a
+buried override to the primary path, and adds one small provider plus one UI panel.

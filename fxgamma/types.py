@@ -86,11 +86,19 @@ class Greeks:
 
     _FIELDS = ("pv", "delta_base", "delta_pct", "gamma", "gamma_1pct", "vega",
                "theta", "rho_d", "rho_f", "vanna", "volga", "dual_delta")
+    #: Intensive (per-unit / per-strike) quantities that are NOT additive across
+    #: positions.  `delta_pct` is per 1 unit of notional and `dual_delta` is d(pv)/dK
+    #: at *that position's own strike*, so summing them across a book produces a
+    #: number with no meaning.  Aggregation sets them to nan so any card built on
+    #: them reads "n/a" instead of printing a confident wrong value.
+    _NON_ADDITIVE = ("delta_pct", "dual_delta")
 
     def __add__(self, other: "Greeks") -> "Greeks":
         if other is None:
             return self
-        return Greeks(*(getattr(self, f) + getattr(other, f) for f in Greeks._FIELDS))
+        return Greeks(*(float("nan") if f in Greeks._NON_ADDITIVE
+                        else getattr(self, f) + getattr(other, f)
+                        for f in Greeks._FIELDS))
 
     __radd__ = __add__
 
@@ -139,8 +147,20 @@ class MarketSnapshot:
     meta: dict[str, Provenance] = field(default_factory=dict)      # "spot.EURUSD" -> Provenance
 
     def rd_rf(self, pair: str, pairs: dict[str, PairSpec]) -> tuple[float, float]:
+        """(domestic, foreign) rate for `pair`.
+
+        Raises rather than defaulting a missing rate to 0.0: silently assuming a
+        zero rate misprices the forward (USDJPY 1Y lands about four big figures
+        away) and violates the provenance rule in architecture section 7.
+        """
         spec = pairs[pair]
-        return self.rates.get(spec.quote, 0.0), self.rates.get(spec.base, 0.0)
+        missing = [c for c in (spec.quote, spec.base) if c not in self.rates]
+        if missing:
+            raise KeyError(
+                f"no rate for {', '.join(missing)} needed by {pair}; "
+                f"have {sorted(self.rates)}. Supply it or set an explicit user_override."
+            )
+        return self.rates[spec.quote], self.rates[spec.base]
 
     def bump(self, *, spot_mult: dict[str, float] | None = None,
              vol_add: float = 0.0, days: float = 0.0) -> "MarketSnapshot":
