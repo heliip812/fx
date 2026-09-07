@@ -721,21 +721,27 @@ def validate_row(raw: dict[str, Any], ctx: MarketContext | None = None, *,
             if share > 0.25:
                 W("V-16", f"premium is {share * 100:.0f}% of notional - unit error?",
                   "premium_paid")
-        # W-12: the check that actually catches premium-unit errors - back out the
-        # implied vol and compare it with the surface.
-        if strike is not None and T and T > 0 and S and premium_paid:
+        # W-12(b): the check that actually catches premium-unit errors - back out the
+        # implied vol from the entered premium and compare it with the vol the row
+        # itself claims.  It only runs on a *fresh* trade: for a trade booked in the
+        # past, T today is shorter than T at execution, so the back-out would compare
+        # two different things and cry wolf on every historical import.  Against a
+        # stated `trade_vol` it is an internal-consistency check and blocks; against
+        # today's surface it can only warn, because the market has moved since.
+        fresh = (trade_date is None or trade_date == ctx.asof.date())
+        if fresh and strike is not None and T and T > 0 and S and premium_paid:
             iv = _implied_from_premium(pair, ctx, strike, T, cp, notional, premium_paid,
                                        premium_ccy, s_trade or S)
-            surf_v = ctx.vol_at(pair, strike, T)
-            if iv is not None and surf_v is not None:
-                diff = abs(iv - surf_v) * 100.0
-                if diff > 2.0:
-                    E("V-16b", f"premium implies {iv * 100:.2f}% vol vs surface "
-                               f"{surf_v * 100:.2f}% ({diff:.2f} vol pts) - check the "
-                               "premium unit/ccy", "premium_paid")
+            ref, ref_name, blocking = (trade_vol, "the trade vol on this row", True) \
+                if trade_vol else (ctx.vol_at(pair, strike, T), "the surface", False)
+            if iv is not None and ref is not None:
+                diff = abs(iv - ref) * 100.0
+                text = (f"premium implies {iv * 100:.2f}% vol vs {ref_name} "
+                        f"{ref * 100:.2f}% ({diff:.2f} vol pts)")
+                if diff > 2.0 and blocking:
+                    E("V-16b", text + " - check the premium unit and ccy", "premium_paid")
                 elif diff > 0.5:
-                    W("V-16b", f"premium implies {iv * 100:.2f}% vol vs surface "
-                               f"{surf_v * 100:.2f}% ({diff:.2f} vol pts)", "premium_paid")
+                    W("V-16b", text, "premium_paid")
 
     if not any(m.severity == "E" for m in res.messages):
         res.position = OptionPosition(
