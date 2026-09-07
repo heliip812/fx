@@ -556,10 +556,8 @@ class TestChainResolutionOrder:
             kinds.index(SyntheticProvider)
         assert kinds[-1] is SyntheticProvider, "synthetic must be the last resort"
 
-    @pytest.mark.xfail(strict=True, reason="PM ruling wanted -- see docs/05_test_report.md F-9: "
-                                           "ChainProvider hoists manual but does not demote "
-                                           "synthetic, so a mis-ordered construction answers "
-                                           "from synthetic while a live source is available")
+    # PM ruling (amendment v1.9): the class defends itself -- synthetic is demoted to
+    # the back however the chain was constructed.
     def test_synthetic_is_demoted_below_live_however_the_chain_was_constructed(self,
                                                                               marked_store):
         """Arch section 7: "Never silently substitute synthetic data for live data."

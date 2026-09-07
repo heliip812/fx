@@ -508,3 +508,48 @@ Both cannot hold. Ruling:
 reading is that this is genuine third-order error rather than a defect, and that a flat 1% budget
 independent of move size is the wrong specification. Referred back to QA to either disprove that or
 propose the budget REQ-052 should carry as a function of move size. Not silently widened.
+
+---
+
+# AMENDMENT v1.9 — QA's dissent upheld; attribution corrected; F-9/F-11/F-13 ruled
+
+**F-10 — QA dissented from the PM's own v1.8 fix, and QA was right. v1.8's vega change is
+REVERSED.** The PM verified the dissent before accepting it: evaluating vega at the interval
+midpoint adds an uplift equal to **0.95x the volga bar** at a quarter vol point (0.91x at a half,
+0.83x at one point). That uplift *is* the volga term, so the explicit volga bar then counted it a
+second time. QA's diagnostic was the giveaway and is worth recording as a technique: the residual
+grew **x3.96 per doubling** of the vol move — second order in dsigma, not the third order a genuine
+truncation error would show — while the spot leg, which has no double count, grew x8.9-10.6 as
+dS^3 should. The v1.8 combination was *worse* than no fix at all at one vol point.
+
+Corrected decomposition, which satisfies every constraint including the v1.8 pro-rata theta ruling:
+vega and volga both return to t0, and the real effect — that **vega decays across the interval** —
+becomes its own named bar, `veta`, isolated by stripping the vol and spot moves out of the observed
+vega change. `PnLBreakdown.veta` is added and `COMPONENTS` extended.
+
+Measured residual after the correction: **0.124%** at a quarter vol point (was 1.12%), **0.387%** at
+a half, 1.44% at one point, 4.66% at two.
+
+**REQ-052's budget is restated with an envelope, per QA:** 1% holds for |dsigma| <= 0.5 vol pt,
+|dS/S| <= 1%, dt <= 3 days. Beyond that the measured figures above are the expectation, and the
+panel must show the residual every day rather than only when it breaches. A flat budget independent
+of move size was the wrong specification.
+
+**A test that hardcoded a copy of `COMPONENTS` silently drifted** when `veta` was added, and the
+reconciliation test then passed over a component it was not summing. It now imports the tuple.
+
+**F-9 — RULED: the class defends itself.** `ChainProvider` hoisted manual to the front but never
+demoted synthetic, so `ChainProvider([synthetic, live])` answered every unmarked pair from the
+simulator while a live source sat behind it — the silent substitution architecture §7 forbids.
+Synthetic is now pushed to the back however the chain is constructed, mirroring the manual hoist.
+
+**F-13 — RULED: fixed.** `max_attainable_delta` returned `+inf` for the plain `fwd` convention
+where its own docstring said 1. Forward delta is `cp*N(cp*d1)`, so |delta| < 1 always and the
+supremum is 1, approached as K -> 0 and never attained. Returning inf told callers every delta was
+reachable, defeating the v1.7 guard on the one convention where the bound is exact. `_pa` **puts**
+correctly keep `inf`: `(K/S)e^{-rd T}N(-d2)` really is unbounded in strike.
+
+**F-11 — ACCEPTED, binding on `dev`.** `lookahead_report` certifies the **engine**, not the
+strategy: QA demonstrated a cheat rule that gains +3.2mm and still passes. The Lab panel must state
+which of the two it is attesting, so a green look-ahead badge is never read as "this strategy is
+clean".

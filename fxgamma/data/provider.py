@@ -361,7 +361,16 @@ class ChainProvider(_Badged):
         rest = [p for p in real if not isinstance(p, ManualQuoteProvider)]
         if manual and rest and not isinstance(real[0], ManualQuoteProvider):
             log.info("ChainProvider: hoisting %r to the front (v1.2 T-1)", manual[0])
-        self.providers = manual + rest
+        # Synthetic is pushed to the BACK for the mirror reason manual is hoisted to
+        # the front: a synthetic provider constructed ahead of a live one would answer
+        # first and a real mark would never be reached, which is the silent
+        # substitution architecture section 7 forbids. QA finding F-9.
+        synth = [p for p in rest if isinstance(p, SyntheticProvider)]
+        rest = [p for p in rest if not isinstance(p, SyntheticProvider)]
+        if synth and rest:
+            log.info("ChainProvider: demoting %r to the back of the chain (arch s7)",
+                     synth[0])
+        self.providers = manual + rest + synth
         self.allow_synthetic = allow_synthetic
 
     # ------------------------------------------------------------------ marks

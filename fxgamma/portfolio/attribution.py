@@ -85,7 +85,7 @@ from .risk import fx_rate, price_book
 
 __all__ = ["daily_pnl", "residual_ratio", "top_offenders", "COMPONENTS"]
 
-COMPONENTS = ("delta", "gamma", "theta", "vega", "vanna", "volga",
+COMPONENTS = ("delta", "gamma", "theta", "vega", "veta", "vanna", "volga",
               "rates", "carry", "hedge")
 
 _VOL_PT = 0.01          # vega/vanna/volga are quoted per 1 vol point
@@ -179,8 +179,15 @@ def daily_pnl(book: Book, mkt_t0: MarketSnapshot, mkt_t1: MarketSnapshot,
             rec.update({
                 "delta": float(a["delta_base"]) * dS,
                 "gamma": 0.5 * float(a["gamma"]) * dS * dS,
-                # Vega alone is evaluated at the midpoint of the two snapshots (the
-                # trapezoidal rule) rather than at t0.
+                # Vega and volga are both evaluated at t0. Evaluating vega at the
+                # interval midpoint was tried and reverted: the midpoint uplift is
+                # ~0.95x the volga bar at small moves, i.e. it *is* the volga term
+                # counted a second time, and the residual then grew as dsigma^2
+                # (x3.96 per doubling) rather than as a true third-order dsigma^3.
+                # The real effect it was chasing is that vega DECAYS across the
+                # interval; that is now its own named bar, `veta`, isolated by
+                # stripping the vol and spot moves out of the observed vega change.
+                # QA finding F-10 and its dissent.
                 # Vega decays, so charging the t0 vega across a day where the clock also
                 # moved pushed the difference into `unexplained`: an ordinary quarter-
                 # vol-point overnight alone breached REQ-052's 1% budget, and a residual
@@ -190,7 +197,10 @@ def daily_pnl(book: Book, mkt_t0: MarketSnapshot, mkt_t1: MarketSnapshot,
                 # already represents and break the pro-rata charging W-14 requires.
                 # QA finding F-10.
                 "theta": float(a["theta"]) * dt_days,
-                "vega": _mid(a["vega"], b["vega"]) * dvp,
+                "vega": float(a["vega"]) * dvp,
+                "veta": ((float(b["vega"]) - float(a["vega"]))
+                         - float(a["volga"]) * dvp
+                         - float(a["vanna"]) * dS) * dvp,
                 "vanna": float(a["vanna"]) * dS * dvp,
                 "volga": 0.5 * float(a["volga"]) * dvp * dvp,
                 "rates": (float(a["rho_d"]) * (rd1 - rd0) / _RATE_PT

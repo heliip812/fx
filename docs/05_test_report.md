@@ -10,7 +10,7 @@ obligations created by amendments **v1.4** (the golden fixture and the `BE = σ/
 identity), **v1.6** (pin-risk signs, the reporting-ccy layer, the sticky modes, W-7's two
 bases) and **v1.7** (`max_attainable_delta` and the unattainable wing).
 
-**Suite:** `tests/` (16 files, **4,825 tests**). **Runtime:** 56 s.
+**Suite:** `tests/` (16 files, **4,829 tests**). **Runtime:** 56 s.
 
 ```
 PYTHONPATH=/home/user/fx python3 -m pytest tests -q            # everything, ~56s
@@ -20,24 +20,25 @@ PYTHONPATH=/home/user/fx python3 -m pytest tests -q -m "not slow"   # skips the 
 ## 1. Result of the run
 
 ```
-3 failed, 4820 passed, 2 xfailed in 55.95s
+2 failed, 4825 passed, 2 xfailed in 56.40s
 
-FAILED tests/test_zones_pin_hedging.py::TestHedgeBands::
-       test_the_frozen_default_rule_gives_the_band_amendment_v1_6_ruled_on          <- F-8
 FAILED tests/test_attribution.py::TestResidualBudget::
-       test_an_ordinary_overnight_vol_move_stays_inside_the_req_052_budget[0.0025]  <- F-10
+       test_an_ordinary_overnight_vol_move_stays_inside_the_req_052_budget[0.005]  <- F-10
 FAILED tests/test_attribution.py::TestResidualBudget::
-       test_an_ordinary_overnight_vol_move_stays_inside_the_req_052_budget[0.005]   <- F-10
+       test_the_residual_is_third_order_in_the_move_not_second                     <- F-10
 XFAIL  tests/test_manual_marks.py::TestChainResolutionOrder::
-       test_synthetic_is_demoted_below_live_however_the_chain_was_constructed       <- F-9
+       test_synthetic_is_demoted_below_live_however_the_chain_was_constructed      <- F-9
 XFAIL  tests/test_delta_bounds_v17.py::TestTheNonPremiumAdjustedConventions::
-       test_the_forward_bound_is_one_as_the_docstring_says                          <- F-13
+       test_the_forward_bound_is_one_as_the_docstring_says                         <- F-13
 ```
 
 **The model-layer hardening is clean.** Every test from pass 1 — the 3,973 finite-
 difference Greeks, the 63 surface tests, put-call parity, the implied-vol round trip, the
 four delta conventions — is still green after the C1 wing rework, the erfc-based
 `_norm_cdf` and the vanna-volga cancellation fix. Nothing regressed.
+
+**Four findings were raised and fixed while this pass ran** — F-4, F-7, F-8 and F-12 (§2b).
+Their tests are retained as fences and are green.
 
 | File | Tests | New? | What it protects |
 |---|---:|:--:|---|
@@ -48,88 +49,90 @@ four delta conventions — is still green after the C1 wing rework, the erfc-bas
 | `test_conventions.py` | 69 | | cuts, DST, day count, pips, tenors |
 | `test_golden_reference_trade.py` | 63 | +53 | v1.4's fixture, and `BE = σ/√365` across pairs/tenors/rates |
 | `test_surfaces.py` | 63 | | quote repricing, SABR recovery, no-arbitrage, pickling |
-| **`test_signals.py`** | **58** | ● | RV estimators, cones, richness, listed gamma |
-| **`test_backtest.py`** | **53** | ● | look-ahead, costs, the long/short sign flip, metrics |
+| `test_signals.py` | 58 | ● | RV estimators, cones, richness, listed gamma |
+| **`test_backtest.py`** | **55** | ● | look-ahead, costs, the long/short sign flip, metrics |
 | **`test_portfolio_risk.py`** | **53** | ● | CG-1 reporting ccy, sticky modes, ladder, decay, W-7 |
 | **`test_delta_bounds_v17.py`** | **47** | ● | `max_attainable_delta` and the unattainable wing |
-| **`test_zones_pin_hedging.py`** | **44** | ● | pin-risk signs, zones, hedge bands, the hedge instruction |
+| **`test_zones_pin_hedging.py`** | **45** | ● | pin-risk signs, zones, hedge bands, the hedge instruction |
 | `test_regressions.py` | 43 | | the bugs that already shipped once |
 | `test_data_layer.py` | 34 | | schemas, provenance grammar, determinism, the §8 boundary |
-| **`test_attribution.py`** | **30** | ● | the P&L explain against a real move, with a residual budget |
+| **`test_attribution.py`** | **32** | ● | the P&L explain against a real move, with a residual budget |
 | `test_pending_modules.py` | 14 | | the original shallow contract checks, kept as a floor |
 
-All three failures are **findings, not test bugs**. Each is reproduced below.
+Both failures are one **finding**, not a test bug. It is reproduced below.
 
 ---
 
 ## 2. Findings from this pass, ranked by what the bug could cost
 
-### F-8 — `HedgeRule.band_pct` is still read as a percent, ~100x too tight. *(fails)*
+### F-10 — the P&L explain counts the vol convexity twice. *(fails — the only open defect)*
 
-**The most expensive open bug in the repo, and it contradicts a binding ruling.**
-
-Amendment v1.6 CR-1: *"`HedgeRule.band_pct` … is a FRACTION, not a percent … The intent
-was 25%. `types.py` is amended to say so unambiguously; the default value is unchanged and
-is now correct rather than dangerous."* `types.py` carries that amended comment. Two
-consumers did not follow:
-
-* `fxgamma/portfolio/zones.py:434` — `max(bp / 100.0 * gross, 0.0)`
-* `fxgamma/backtest/engine.py:414` — `rule.band_pct / 100.0 * gross`
-
-So the frozen default `HedgeRule()` produces a **25,000** delta band on a 10mm book:
+The explain was moved to a **midpoint vega** to close the vol-time cross term (QA's own
+recommendation, and it did close the cross). But a midpoint vega *already contains* half the
+second derivative:
 
 ```
->>> zones.hedge_bands(book_10mm, mkt, "EURUSD", rule=HedgeRule())["band_base"][0]
-25000.0                      # amendment v1.6 says 2,500,000
+mid_vega × Δσ  =  ½(V_σ(σ₀) + V_σ(σ₁))·Δσ  ≈  V_σ Δσ + ½ V_σσ Δσ²
 ```
 
-`zones` even emits a `warning` column telling the user to *"set band_pct=15 for the desk
-default"*, which is the reading the PM withdrew.
+and the explain then adds the explicit `volga` bar `½ V_σσ Δσ²` on top of it. The
+second-order vol convexity is charged **twice**, and the surplus lands in `unexplained` with
+the opposite sign.
 
-**Cost.** Pure churn, charged every day the book is live. On one 1Y synthetic path,
-10mm straddle, EURUSD costs:
+**The signature is decisive.** An explain that keeps every term to second order must leave a
+residual that is *third* order — halve the move, the residual falls ~8x. Measured on an
+instantaneous vol move (no time, no spot, so nothing else can contribute):
 
-| band_pct | hedges | explicit cost | end equity |
-|---|---:|---:|---:|
-| `0.25` (as the frozen default is read today) | 190 | 29,310 | 430,741 |
-| `25` (as amendment v1.6 defines it) | 23 | 27,735 | 606,827 |
-
-176k of P&L on a 10mm book in one year — most of it discretisation, not the visible
-cost line, which is why it would never be traced back to the band. Worse on the Scandies,
-where `COST_BP` is 10-25x EURUSD.
-
-Tests: `test_zones_pin_hedging.py::TestHedgeBands::test_the_frozen_default_rule_gives_the_band_amendment_v1_6_ruled_on`
-(red) and `test_backtest.py::test_the_backtest_and_the_risk_engine_read_band_pct_identically`
-(green — it pins the *consistency* of the two sites, so fixing one without the other fails
-immediately). **Owner: quant-risk (`zones.py`) and quant (`backtest/engine.py`), together.**
-
-### F-10 — the P&L explain breaks its own 1% residual budget on any ordinary vol move. *(fails)*
-
-`daily_pnl` evaluates every Greek at `t0`. Vega itself decays, so whenever the vol *and*
-the clock both move — which is every day — the vega bar is charged at the `t0` vega over
-an interval whose true average is lower, and the difference lands in `unexplained`.
-
-| overnight move | residual / Σ\|components\| | residual / total P&L |
+| vol move | residual (USD) | ratio to previous |
 |---|---:|---:|
-| spot only, ±0.3% | 0.25% | 0.6% |
-| decay only, 1 day | 0.45% | 0.5% |
-| **+0.25 vol point** | **1.67%** | **5.4%** |
-| **+0.5 vol point** | **1.95%** | **3.4%** |
-| +1 vol pt and +1% spot | 3.02% | 3.6% |
+| 0.125 pt | −9.80 | — |
+| 0.25 pt | −38.97 | **3.98** |
+| 0.50 pt | −154.26 | **3.96** |
+| 1.00 pt | −605.65 | **3.93** |
+| 2.00 pt | −2,351.67 | **3.88** |
 
-REQ-052 and the trader ask for < 1% overnight. A quarter of a vol point is not a stress
-scenario, it is Tuesday.
+~4x per doubling is `Δσ²` — second order. The **spot** leg of the same explain, which has no
+double count, shows 8.9x / 9.6x / 10.6x per doubling: the `ΔS³` a correct second-order
+explain is supposed to leave behind. The magnitude closes it — the residual at 0.5 pt (−154)
+is within 4% of minus the volga bar itself (+161).
 
-**Why it is second and not tenth.** The money is small. The cost is that the residual
-alarm is the instrument that catches the *next* bug, and an alarm that fires on every
-ordinary day is an alarm the trader turns off — the exact mechanism the test report's
-own §5 item 2 warns about for elapsed-time theta.
+**So the answer to the PM's question is (a): this is not third-order error.** Measured on the
+two-leg book, spot +0.3%, one day:
 
-**The fix is measured, not guessed:** evaluating vega and theta at the midpoint of the two
-snapshots (`0.5 (g_t0 + g_t1)`) drops the residual on the 0.25-vol-point case from
-**-136.25 to -0.95 USD** — a factor of 143 — with no other change. Owner: **quant-risk.**
+| explain variant | 0.25 pt | 0.50 pt | 1.00 pt |
+|---|---:|---:|---:|
+| mid vega + volga bar **(shipped today)** | 0.71% | **1.32%** | **2.57%** |
+| t0 vega + volga bar *(before the change)* | 1.12% | 1.56% | 2.07% |
+| mid vega, no volga bar | 0.44% | 0.53% | 0.57% |
+| **t0 vega + volga + explicit veta bar** | **0.22%** | **0.37%** | **0.40%** |
 
-Test: `test_attribution.py::TestResidualBudget::test_an_ordinary_overnight_vol_move_stays_inside_the_req_052_budget`.
+The shipped combination is *worse than the version it replaced* at one vol point.
+
+**Recommendation (owner: quant-risk).** Take the last row — it keeps every constraint:
+
+* **theta stays pro-rata** (`theta_t0 × dt_days`). The PM's ruling is right, and QA's two
+  elapsed-time tests (W-14) depend on it;
+* **vega and volga go back to `t0`**, so the waterfall bars stay the Greeks the trader
+  recognises and neither silently contains a piece of the other;
+* the vol-time cross gets **its own named bar**,
+  `veta = (vega(t₀+Δt, σ₀) − vega(t₀, σ₀)) × Δσ`. One extra `price_book` at (t₁ clock, t₀
+  vol) — which `time_decay` already computes anyway.
+
+Residual then 0.22–0.40% across the range, inside REQ-052 and — unlike the current
+combination — **it stops growing**.
+
+**On the budget question (b).** With the double count removed, a flat 1% is a defensible
+spec, and QA recommends stating the *envelope* rather than loosening the number:
+**|Δσ| ≤ 1 vol point, |ΔS/S| ≤ 1%, Δt ≤ 3 days**. Outside it the residual is genuinely
+`O(move³)` and no fixed percentage can hold — a 2% instantaneous spot move alone leaves 3.7%
+on this book, and that is arithmetic, not a defect. A residual above 1% *inside* the envelope
+is the alarm; outside it the panel should say the move was outside the explain's envelope
+rather than cry wolf.
+
+Tests: `test_attribution.py::TestResidualBudget::test_an_ordinary_overnight_vol_move_stays_inside_the_req_052_budget`
+(the budget, red at 0.5 pt and green at 0.25 pt) and
+`::test_the_residual_is_third_order_in_the_move_not_second` (the diagnostic), with
+`::test_the_spot_leg_residual_really_is_third_order` green as the control.
 
 ### F-9 — `ChainProvider` hoists manual but never demotes synthetic. *(xfail, strict — PM ruling wanted)*
 
@@ -175,8 +178,8 @@ One line. **Owner: quant-models.**
 
 ## 2b. Findings raised and fixed inside this pass
 
-Three of the first pass's items, and two raised by this one, closed while it was running.
-The tests stay as fences.
+Four items — one carried over from pass 1, three raised by this one — closed while it was
+running. The tests stay as fences and are green.
 
 * **F-4 — `get_store(path)` ignored `path`. FIXED** (amendment v1.5 Q-4, dev). Now cached
   per *resolved* path, with `:memory:` never cached and `fresh=` scoped to one book.
@@ -186,7 +189,21 @@ The tests stay as fences.
   shifted every value one place left, so a 7.05-vol EURUSD book was marked and saved at
   **25 vol with RR +18** and no warning about the ATM at all — on the *primary* mark path.
   The parser now cross-checks the column the header assigns to the tenor against the column
-  the row scan actually found it in, and refuses the paste naming both.
+  the row scan actually found it in, and **refuses** the paste naming both, which is the
+  right side of QA's "refuse rather than mismark" line.
+* **F-8 — `HedgeRule.band_pct` was read as a percent in two places. FIXED** (PM).
+  Amendment v1.6 CR-1 ruled it a **fraction** of gross option notional; `zones._band_for`,
+  `backtest/engine.py` and `strategies.DEFAULT_BAND_PCT` all still divided by 100, so the
+  frozen default produced a **25,000** delta band on a 10mm book — 0.25% of notional, the
+  reading the PM withdrew, and ~100x tighter than the 2.5mm the amendment specifies. Cost
+  was pure churn, charged daily: on one 1Y synthetic path the same 10mm straddle rehedged
+  **190 times instead of 23** (29,310 vs 27,735 of explicit cost, and a 176k gap in end
+  equity — most of it discretisation, which is why it would never have been traced back to
+  the band). Worse on the Scandies, where `COST_BP` is 10-25x EURUSD.
+  The two sites were fixed a few minutes apart, and in between they *disagreed* by 100x —
+  caught by `test_backtest.py::test_the_backtest_and_the_risk_engine_read_band_pct_identically`,
+  which is retained precisely because a split reading is worse than either reading being
+  wrong: the Lab is where a trader goes to choose the band they will run.
 * **F-12 — `save_positions` / `commit_import` were not atomic. FIXED** (dev). `_tx` was
   re-entrant but committed at every level, so an inner `save_position` committed row 1
   before row 2 raised and the outer rollback had nothing to undo — a half-imported book
@@ -194,8 +211,6 @@ The tests stay as fences.
 * Both `xfail`s from pass 1 are resolved: Q-2 (`sum(Greeks)`) and Q-3 (unknown cut raises)
   are green, and F-1 (synthetic reproducibility across processes) stays green under three
   `PYTHONHASHSEED` values.
-
----
 
 ## 3. What this pass verified
 
@@ -298,7 +313,11 @@ this zone".
 Zones: one long-gamma zone around a single strike, a short one for a short book, two
 clusters reported as two zones, and the CR-4 detail fields (sigma-days, touch probability,
 repriced *and* quadratic P&L-to-centre, contributing strikes, delta carried inside, the
-`*_rep` copies) all populated. Hedge instruction: SELL on long delta and BUY on short, the
+`*_rep` copies) all populated. Hedge bands: `band_delta` used verbatim, `band_pct` read as
+a **fraction** of gross notional per CR-1 (the frozen `0.25` giving a 2.5mm band on a 10mm
+book, and scaling linearly in both the fraction and the notional), the band frame naming its
+own source and reporting ccy, and `COST_BP` genuinely per pair rather than one global number
+(W-13: 0.2bp is 10-25x too tight for the Scandies). Hedge instruction: SELL on long delta and BUY on short, the
 one-line reason printable, "FLAT ENOUGH" inside the band, `mode="none"` silent, `to_edge`
 trading exactly one band less than `to_target`, a sub-min-clip trade suppressed, cost from
 the per-pair `COST_BP` table, and an existing spot hedge reducing the suggestion.
@@ -479,6 +498,7 @@ split expiries); V-21's size warning. Plus the notional grammar (`10mm`, `1bn`, 
 | Multi-day / path-dependent attribution | **partial** | Two-snapshot explain is now well covered; a *chained* week of explains summing to the week's P&L is not. |
 | Performance against the real target | **one crude guard** | A 10k-point slice under 2 s. No benchmark for arch §4's ~1e5 `vol()` calls per refresh, and none for a 200-position book through `price_book` + ladder + zones, which is the actual UI budget. |
 | Concurrency | **not covered** | `Store` takes an `RLock` and WAL; nothing tests two writers, and the Dash callback path is inherently multi-threaded. |
+| Cross-module unit/semantics consistency | **one test** | Only `band_pct` is fenced across `zones` and `backtest`. `cost_bp`, `vega_spread_pts` and `band_delta` have the same shape of risk and no equivalent test. |
 | Hypothesis | **used, optional** | Two property tests (`parse_grid` plausibility, the pa delta bound), both behind `importorskip` so the suite is green without it. `hypothesis` is **not** in `requirements.txt` — `data`/`dev` own that file; adding it is a one-line request. |
 
 ---
@@ -491,10 +511,16 @@ Re-ranked after covering the portfolio, signals, backtest and store layers.
    now fenced; they are not tested at all. An FXY inversion done once in the wrong direction
    produces a smile that is a mirror image of the truth, and nothing downstream would flag
    it — the surface would build, the density would be positive, the calendar clean.
-2. **Two readings of `band_pct` in the same repo (F-8).** Until it is fixed, the Risk page
-   and the Lab disagree about what a hedge band is. That is worse than either reading being
-   wrong, because a user tuning the band in the Lab will carry the wrong number to the desk.
-3. **The residual alarm crying wolf (F-10).** Not the money; the habituation.
+2. **The residual alarm crying wolf (F-10).** Not the money; the habituation. And note
+   what happened here: a change made in good faith to *close* the residual opened a
+   second-order double count that made it worse at large moves. The explain needs a
+   term-order test, not only a budget — which is now what `test_the_residual_is_third_
+   order_in_the_move_not_second` provides.
+3. **Shared semantics changed under a partial rewrite.** `band_pct` (F-8) was read one way
+   in `zones` and another in `backtest` for the length of one edit. Any constant whose
+   *units* live in a comment rather than in a name is the next one: `cost_bp`,
+   `vega_spread_pts`, `band_delta`. A cross-module consistency test is cheap and is the
+   only thing that catches it.
 4. **Elapsed-time theta above the library line.** `daily_pnl` charges theta over wall clock
    correctly (fenced in §3.9). The exposure has moved up a layer: whatever the app passes
    as `asof`. A naive `datetime.now()` in a callback or a date picker yielding a local date

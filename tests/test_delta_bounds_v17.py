@@ -144,11 +144,8 @@ class TestTheNonPremiumAdjustedConventions:
         assert math.isfinite(gk.strike_from_delta(b * 0.99, 1.16, 1.0, 0.04, 0.02, 0.10,
                                                   +1, "spot"))
 
-    @pytest.mark.xfail(strict=True,
-                       reason="PM ruling wanted -- docs/05_test_report.md F-13: "
-                              "max_attainable_delta returns inf for the plain 'fwd' "
-                              "convention where its own docstring says the supremum "
-                              "is 1")
+    # PM ruling (amendment v1.9): fixed. Forward delta is cp*N(cp*d1), so the
+    # supremum is 1; returning inf told callers every delta was reachable.
     def test_the_forward_bound_is_one_as_the_docstring_says(self):
         """The docstring reads: "the supremum is the trivial one (``e^{-rf T}`` for
         ``spot``, ``1`` for ``fwd``, ``+inf`` in strike for a ``_pa`` put)".  The code

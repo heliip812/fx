@@ -206,6 +206,7 @@ class PnLBreakdown:
     gamma: float = 0.0
     theta: float = 0.0
     vega: float = 0.0
+    veta: float = 0.0          # vega decay over the interval, interacted with dsigma
     vanna: float = 0.0
     volga: float = 0.0
     rates: float = 0.0
@@ -217,7 +218,7 @@ class PnLBreakdown:
 
     def as_dict(self) -> dict[str, float]:
         return {k: getattr(self, k) for k in
-                ("delta", "gamma", "theta", "vega", "vanna", "volga",
+                ("delta", "gamma", "theta", "vega", "veta", "vanna", "volga",
                  "rates", "carry", "hedge", "unexplained", "total")}
 
 

@@ -626,7 +626,14 @@ def max_attainable_delta(S: float, T: float, rd: float, rf: float, sigma: float,
     if conv not in DELTA_CONVENTIONS:
         raise ValueError(f"convention must be one of {DELTA_CONVENTIONS}, got {convention!r}")
     if int(np.sign(cp)) < 0 or not conv.endswith("_pa"):
-        return float(math.exp(-rf * max(T, 0.0))) if conv == "spot" else float("inf")
+        if conv == "spot":
+            return float(math.exp(-rf * max(T, 0.0)))
+        if conv == "fwd":
+            # forward delta is cp*N(cp*d1), so |delta| < 1 always: the supremum is 1,
+            # approached as K -> 0 and never attained. Returning +inf here (QA F-13)
+            # told callers every delta was reachable, defeating the v1.7 guard.
+            return 1.0
+        return float("inf")   # premium-adjusted put: (K/S)e^{-rd T}N(-d2) is unbounded in K
     if S <= 0 or sigma <= 0 or T <= T_MIN:
         return float("nan")
     k_peak = pa_call_delta_peak(S, T, rd, rf, sigma)

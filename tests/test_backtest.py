@@ -198,7 +198,7 @@ class TestTheVolExperiment:
         """REQ-056: the sigma_r that would have made gamma pay the theta bill.  On a
         well-hedged long straddle it must recover the path's own 14%."""
         r = engine.run_backtest(hot_path,
-                                strategies.long_straddle(tenor_days=30, band_pct=5.0))
+                                strategies.long_straddle(tenor_days=30, band_pct=0.05))
         assert float(r.stats["realized_vol_captured"]) == pytest.approx(0.14, abs=0.03)
 
     def test_a_never_hedged_book_is_a_different_and_noisier_trade(self, hot_path):
@@ -235,9 +235,9 @@ class TestCostsAreCharged:
 
     def test_a_tighter_band_hedges_more_often_and_costs_more(self, hot_path):
         wide = engine.run_backtest(hot_path, strategies.long_straddle(
-            tenor_days=30, band_pct=40.0)).stats
+            tenor_days=30, band_pct=0.40)).stats
         tight = engine.run_backtest(hot_path, strategies.long_straddle(
-            tenor_days=30, band_pct=2.0)).stats
+            tenor_days=30, band_pct=0.02)).stats
         assert tight["n_hedges"] > wide["n_hedges"]
         assert tight["hedge_cost"] > wide["hedge_cost"]
         assert tight["turnover_base"] > wide["turnover_base"]
@@ -286,14 +286,18 @@ class TestAccounting:
                                  strategies.long_straddle(tenor_days=30)).equity
         assert np.allclose(eq["pnl"].cumsum(), eq["equity"], rtol=1e-10, atol=1e-6)
 
-    @pytest.mark.parametrize("band_pct", [5.0, 10.0, 25.0])
+    @pytest.mark.parametrize("band_pct", [0.05, 0.10, 0.25])
     def test_the_recorded_delta_never_leaves_the_band(self, hot_path, band_pct):
         """``delta_total`` is recorded *after* the step's hedge, so the band is a hard
         bound on it.  A band that is not binding means the hedger is not running; one
-        that is exceeded means the trade size is wrong."""
+        that is exceeded means the trade size is wrong.
+
+        ``band_pct`` is a **fraction** of gross option notional (amendment v1.6 CR-1),
+        so ``0.10`` is a 2mm band on a two-legged 10mm straddle -- not 200k.
+        """
         eq = engine.run_backtest(hot_path, strategies.long_straddle(
             tenor_days=30, band_pct=band_pct)).equity
-        band = band_pct / 100.0 * 2 * 10e6          # a straddle is two 10mm legs
+        band = band_pct * 2 * 10e6                  # a straddle is two 10mm legs
         d = eq["delta_total"].abs().max()
         assert d <= band * (1 + 1e-9)
         assert d > 0.5 * band, "the band is not the binding constraint"
@@ -448,7 +452,7 @@ class TestStrategies:
         path = engine.synthetic_path(n_days=90, sigma_r=0.12, sigma_i=0.08, seed=9)
         sw = strategies.hedge_frequency_sweep(path,
                                               strategies.long_straddle(tenor_days=30),
-                                              bands=(5, 25), intervals=(1, 5))
+                                              bands=(0.05, 0.25), intervals=(1, 5))
         assert set(sw["rule"]) == {"band", "time"}
         assert int(sw["argmax"].sum()) == 1
         assert sw["in_sample"].all()
@@ -458,9 +462,9 @@ class TestStrategies:
         path = engine.synthetic_path(n_days=90, sigma_r=0.12, sigma_i=0.08, seed=9)
         sw = strategies.hedge_frequency_sweep(path,
                                               strategies.long_straddle(tenor_days=30),
-                                              bands=(2, 40), intervals=None)
+                                              bands=(0.02, 0.40), intervals=None)
         by = sw.set_index("param")
-        assert by.loc[2.0, "n_hedges"] > by.loc[40.0, "n_hedges"]
+        assert by.loc[0.02, "n_hedges"] > by.loc[0.40, "n_hedges"]
 
     def test_run_grid_stacks_one_row_per_config(self, hot_path):
         df = strategies.run_grid(hot_path, [strategies.long_straddle(tenor_days=30),
@@ -468,9 +472,12 @@ class TestStrategies:
         assert len(df) == 2 and "total_pnl_net" in df.columns
 
     def test_the_config_serialises_to_something_a_user_can_copy(self):
-        d = strategies.long_straddle(tenor_days=21, band_pct=10.0).as_dict()
+        cfg = strategies.long_straddle(tenor_days=21, band_pct=0.10)
+        d = cfg.as_dict()
         assert d["structure"] == "straddle" and d["tenor_days"] == 21
-        assert d["hedge"]["band_pct"] == 10.0
+        assert d["hedge"]["band_pct"] == 0.10
+        # the label is the human-readable percent; the field is the fraction (CR-1)
+        assert "band 10%" in cfg.name
         assert isinstance(d["entry"], str)
 
 
@@ -478,20 +485,17 @@ class TestStrategies:
 # hedge-rule semantics, amendment v1.6 CR-1
 # --------------------------------------------------------------------------- #
 def test_the_backtest_and_the_risk_engine_read_band_pct_identically(hot_path, snapshot):
-    """**FINDING (docs/05_test_report.md F-8), the half that is still open.**
+    """Amendment v1.6 CR-1: one definition of ``band_pct`` across the whole app.
 
-    Amendment v1.6 CR-1 ruled ``HedgeRule.band_pct`` a **FRACTION** of gross option
-    notional (``0.25`` = 25%), not a percent.  ``zones._band_width`` now honours that.
-    ``engine.run_backtest`` still computes ``band = rule.band_pct / 100 * gross``
-    (``engine.py:414``), and ``strategies.DEFAULT_BAND_PCT`` is ``15.0``.
+    This test caught the engine/zones divergence (docs/05_test_report.md F-8): the
+    risk engine had been moved to the fraction reading while ``engine.run_backtest``
+    still divided by 100, so a band the user tuned in the Lab meant something 100x
+    different on the Risk page -- and the Lab is exactly where a trader goes to
+    *choose* the band they will run.  Both sites now read it as a fraction.
 
-    So the two halves of the app now disagree by 100x about what a hedge band is: a
-    band the user tunes in the Lab means something else on the Risk page, and the
-    presets ship at 15% in one reading and 1500% -- never hedge -- in the other.  A
-    split reading is worse than either reading being wrong, because the Lab is exactly
-    where a trader goes to *choose* the band they will run.
-
-    Fix ``engine.py`` and ``strategies.DEFAULT_BAND_PCT`` together.  Owner: quant.
+    It compares the band the risk engine computes with the band the backtest actually
+    enforces, read off the widest delta the engine tolerated, so it stays honest even
+    if the formula is refactored in either place.
     """
     from fxgamma.portfolio import zones
     from fxgamma.types import Book, OptionPosition
@@ -506,8 +510,8 @@ def test_the_backtest_and_the_risk_engine_read_band_pct_identically(hot_path, sn
                                         rule=HedgeRule(mode="band",
                                                        band_pct=band_pct)
                                         )["band_base"].iloc[0])
+    assert risk_band == pytest.approx(band_pct * gross, rel=1e-9)
 
-    # the band the engine actually enforces, read off the widest delta it tolerated
     cfg = strategies.long_straddle(tenor_days=30, band_pct=band_pct,
                                    notional_base=gross)
     eq = engine.run_backtest(hot_path, cfg).equity
@@ -517,3 +521,15 @@ def test_the_backtest_and_the_risk_engine_read_band_pct_identically(hot_path, sn
     assert engine_band == pytest.approx(2 * risk_band, rel=0.05), (
         f"the Lab enforces a {engine_band:,.0f} band where the Risk page computes "
         f"{2 * risk_band:,.0f} for the same band_pct={band_pct}")
+
+
+def test_the_shipped_default_band_is_the_desk_standard_not_a_fraction_of_a_percent():
+    """Trader Q-2 / CR-1: 15% of gross option notional is the shipping default.  If
+    ``DEFAULT_BAND_PCT`` is ever re-read as a percent again it becomes 0.15% -- a
+    ~100x tighter band that churns the book -- and this fails."""
+    assert strategies.DEFAULT_BAND_PCT == pytest.approx(0.15)
+    assert 0.01 <= strategies.DEFAULT_BAND_PCT <= 1.0, (
+        "band_pct is a fraction: a shipping default outside 1%-100% of notional is "
+        "a unit error, not a policy choice")
+    from fxgamma.types import HedgeRule as _HR
+    assert 0.01 <= _HR().band_pct <= 1.0

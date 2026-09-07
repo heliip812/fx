@@ -29,8 +29,10 @@ from tests.conftest import in_days
 
 pytestmark = pytest.mark.contract
 
-COMPONENTS = ("delta", "gamma", "theta", "vega", "vanna", "volga", "rates", "carry",
-              "hedge")
+# Imported, never re-typed: a hardcoded copy silently drifted from the library when
+# the `veta` bar was added, and the reconciliation test then passed over a component
+# it was not summing.
+COMPONENTS = attribution.COMPONENTS
 
 
 def _t1(snapshot, *, spot_mult=1.0, vol_add=0.0, days=0.0, rate_add=0.0):
@@ -70,28 +72,97 @@ class TestResidualBudget:
     @pytest.mark.parametrize("vol_add", [0.0025, 0.005])
     def test_an_ordinary_overnight_vol_move_stays_inside_the_req_052_budget(
             self, eur_book, snapshot, vol_add):
-        """**FINDING (docs/05_test_report.md F-10).**
+        """**FINDING (docs/05_test_report.md F-10): the vol convexity is counted twice.**
 
-        The explain evaluates every Greek at ``t0`` only.  Vega itself decays, so on
-        any day the vol *and* the clock both move, the vega bar is charged at the t0
-        vega over an interval where the true average is lower, and the difference
-        lands in ``unexplained``.  A quarter of a vol point -- a thoroughly ordinary
-        overnight -- leaves 1.7% residual (5.4% of the day's total P&L) on this
-        two-leg book, against REQ-052's < 1%.
+        Vega is now evaluated at the midpoint of the two snapshots, which closed the
+        vol-time cross term.  But a midpoint vega already *contains* half the second
+        derivative -- ``vega(t1) = V_s + V_ss ds + ...``, so
+        ``mid_vega x ds = V_s ds + 1/2 V_ss ds^2`` -- and the explain then adds the
+        explicit ``volga`` bar ``1/2 V_ss ds^2`` on top.  The second-order vol
+        convexity is charged twice, and the surplus lands in ``unexplained`` with the
+        opposite sign.
 
-        It is not a sign error and it is not large in money; it matters because the
-        residual alarm is the instrument that catches the *next* bug, and an alarm
-        that fires on every ordinary day is an alarm the trader turns off.
+        The signature is unmistakable and is asserted by the companion test below: the
+        residual grows as ``ds^2``, not ``ds^3``.  A genuine truncation error would be
+        one order higher than the terms retained.
 
-        Measured fix: evaluating vega and theta at the midpoint of the two snapshots
-        (``0.5 (g_t0 + g_t1)``) drops the residual on the 0.25-vol-point case from
-        -136 to -0.95 USD, a factor of 143.  Owner: quant-risk.
+        Measured on this two-leg book, spot +0.3%, one day:
+
+        ==============================  =======  =======  =======
+        explain variant                 0.25pt   0.50pt   1.00pt
+        ==============================  =======  =======  =======
+        mid vega + volga  (shipped)      0.71%   *1.32%*  *2.57%*
+        t0 vega + volga   (before)       1.12%    1.56%    2.07%
+        mid vega, no volga bar           0.44%    0.53%    0.57%
+        **t0 vega + volga + veta**      **0.22%** **0.37%** **0.40%**
+        ==============================  =======  =======  =======
+
+        The last row is the recommendation: keep theta pro-rata (W-14, and QA's two
+        elapsed-time tests depend on it), keep vega and volga at ``t0`` so the
+        waterfall bars stay the Greeks the trader recognises, and add the vol-time
+        cross as its own named ``veta`` bar,
+        ``(vega(t0+dt, s0) - vega(t0, s0)) x ds``.  That is inside REQ-052's 1% at
+        every move size tested and, unlike the current combination, stops growing.
+        **Owner: quant-risk.**
         """
         t1 = _t1(snapshot, spot_mult=1.003, vol_add=vol_add, days=1.0)
         pnl = attribution.daily_pnl(eur_book, snapshot, t1)
         assert attribution.residual_ratio(pnl) < 0.01, (
             f"residual {attribution.residual_ratio(pnl):.3%} on a {vol_add * 100:g} "
             f"vol point overnight move: {pnl}")
+
+    def test_the_residual_is_third_order_in_the_move_not_second(self, eur_book,
+                                                                snapshot):
+        """The diagnostic behind F-10, and the answer to "is it just third order?".
+
+        An explain that keeps every term up to second order must leave a residual that
+        is **third** order: halve the move and the residual falls ~8x.  Measured on an
+        instantaneous vol move (no time, no spot, so nothing else can contribute):
+
+        ===========  =========  ==================
+        vol move     residual   ratio to previous
+        ===========  =========  ==================
+        0.125 pt        -9.80   --
+        0.25 pt        -38.97   3.98
+        0.50 pt       -154.26   3.96
+        1.00 pt       -605.65   3.93
+        2.00 pt      -2351.67   3.88
+        ===========  =========  ==================
+
+        A factor of ~4 per doubling is ``ds^2``.  For comparison, the *spot* leg -- which
+        has no double count -- shows ~9-10x per doubling, which is the ``dS^3`` a
+        correct second-order explain is supposed to leave behind.
+
+        The magnitude closes the case: the residual is within a few percent of minus
+        the volga bar itself.
+        """
+        ratios = []
+        prev = None
+        for va in (0.00125, 0.0025, 0.005, 0.010):
+            pnl = attribution.daily_pnl(eur_book, snapshot,
+                                        _t1(snapshot, vol_add=va, days=0.0))
+            r = abs(pnl.unexplained)
+            if prev is not None:
+                ratios.append(r / prev)
+            prev = r
+        assert all(x > 5.0 for x in ratios), (
+            "the residual doubles-and-quadruples with the vol move, i.e. it is second "
+            f"order: a second-order term is being double-counted.  ratios={ratios}")
+
+    def test_the_spot_leg_residual_really_is_third_order(self, eur_book, snapshot):
+        """The control for the test above: the *spot* side of the same explain has no
+        double count, and behaves the way a correct second-order explain should --
+        ~8x per doubling of the move."""
+        ratios = []
+        prev = None
+        for x in (0.0025, 0.005, 0.010, 0.020):
+            pnl = attribution.daily_pnl(eur_book, snapshot,
+                                        _t1(snapshot, spot_mult=1 + x, days=0.0))
+            r = abs(pnl.unexplained)
+            if prev is not None:
+                ratios.append(r / prev)
+            prev = r
+        assert all(x > 5.0 for x in ratios), ratios
 
     def test_total_equals_the_repriced_pv_change(self, eur_book, snapshot):
         """The one thing that must hold exactly: the explain explains *this* book."""
