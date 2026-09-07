@@ -31,7 +31,7 @@ __all__ = [
     "rr_bf_to_vols", "vols_to_rr_bf", "delta_pillar_strikes",
     "risk_neutral_density", "DensityReport", "StrangleConvention",
     "total_variance", "vol_from_total_variance", "atm_convention_for",
-    "pchip_slopes", "pchip_eval",
+    "pchip_slopes", "pchip_eval", "SmileSurfaceMixin",
 ]
 
 #: ATM strike conventions.  FX **defaults to ``"dns"``** (delta-neutral straddle) for
@@ -327,3 +327,110 @@ def pchip_eval(xq: Any, x: np.ndarray, y: np.ndarray, m: np.ndarray,
         out = np.where(lo, y[0] + m[0] * (xq_arr - x[0]), out)
         out = np.where(hi, y[-1] + m[-1] * (xq_arr - x[-1]), out)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# shared VolSurface protocol plumbing
+# --------------------------------------------------------------------------- #
+class SmileSurfaceMixin:
+    """Implements the ``VolSurface`` protocol on top of a single primitive.
+
+    A concrete surface only has to provide
+
+    * attributes ``spot``, ``rd``, ``rf``, ``delta_convention`` (and ``pair``,
+      ``asof`` for the protocol), and
+    * ``_vol_impl(K, T)`` -- vectorised in ``K``, scalar ``T``, returning decimals.
+
+    The mixin then supplies ``vol``, ``slice``, ``vol_by_delta``, ``atm``, ``rr``,
+    ``bf`` with the correct FX conventions: DNS ATM (premium-adjusted variant where
+    the pair requires it) and *smile-consistent* delta strikes, i.e. the fixed point
+    ``sigma = surface_vol(strike_from_delta(delta, sigma))``.  Getting that fixed
+    point wrong (using the ATM vol to place the 25d strike) is the single most
+    common way a surface fails to reprice its own risk reversal.
+
+    No mutable state is stored, so subclasses stay ``frozen`` and picklable.
+    """
+
+    spot: float
+    rd: float
+    rf: float
+    delta_convention: str
+
+    # -- helpers ---------------------------------------------------------- #
+    def forward(self, T: float) -> float:
+        """Outright forward at ``T`` from the flat-curve rate differential."""
+        return float(self.spot * math.exp((self.rd - self.rf) * max(T, 0.0)))
+
+    def _vol_impl(self, K: Any, T: float) -> Any:      # pragma: no cover - abstract
+        raise NotImplementedError
+
+    # -- VolSurface protocol ---------------------------------------------- #
+    def vol(self, K: float, T: float) -> float:
+        """Implied vol (decimal) at strike ``K`` and expiry ``T`` years."""
+        out = self._vol_impl(K, float(T))
+        return float(out) if np.ndim(K) == 0 else out
+
+    def slice(self, T: float, strikes: np.ndarray) -> np.ndarray:
+        """Vectorised smile slice at expiry ``T`` -- the fast path for plotting and
+        for the spot ladder."""
+        return np.asarray(self._vol_impl(np.asarray(strikes, float), float(T)), float)
+
+    def vol_by_delta(self, delta: float, T: float, cp: int) -> float:
+        """Vol at a given delta, solving the strike/vol fixed point (see class doc).
+
+        ``delta`` may be signed or a magnitude; ``cp`` decides the sign.  Returns
+        ``nan`` if the delta is unattainable in the pair's convention (possible for
+        premium-adjusted calls -- see :func:`gk.strike_from_delta`).
+        """
+        s = float(self.atm(T))
+        for i in range(60):
+            K = gk.strike_from_delta(delta, self.spot, T, self.rd, self.rf, s, cp,
+                                     self.delta_convention)
+            if not np.isfinite(K):
+                return float("nan")
+            s_new = float(self._vol_impl(float(K), float(T)))
+            if abs(s_new - s) < 1e-13:
+                return s_new
+            s = 0.5 * (s + s_new) if i > 20 else s_new
+        return s
+
+    def strike_by_delta(self, delta: float, T: float, cp: int) -> float:
+        """Smile-consistent strike at a given delta."""
+        s = self.vol_by_delta(delta, T, cp)
+        if not np.isfinite(s):
+            return float("nan")
+        return float(gk.strike_from_delta(delta, self.spot, T, self.rd, self.rf, s, cp,
+                                          self.delta_convention))
+
+    def atm_strike(self, T: float) -> float:
+        """Delta-neutral-straddle strike, solving ``K = F exp(+/- sigma(K)^2 T / 2)``."""
+        conv = atm_convention_for(self.delta_convention)
+        s = float(self._vol_impl(self.forward(T), float(T)))
+        K = self.forward(T)
+        for _ in range(50):
+            K_new = atm_strike(self.spot, T, self.rd, self.rf, s, conv)
+            s_new = float(self._vol_impl(K_new, float(T)))
+            if abs(K_new - K) < 1e-14 * max(1.0, K) and abs(s_new - s) < 1e-14:
+                return float(K_new)
+            K, s = K_new, s_new
+        return float(K)
+
+    def atm(self, T: float) -> float:
+        """ATM vol on the FX (delta-neutral straddle) convention."""
+        return float(self._vol_impl(self.atm_strike(T), float(T)))
+
+    def rr(self, T: float, d: float = 0.25) -> float:
+        """Risk reversal at delta ``d``: ``sigma(d call) - sigma(d put)``, decimal."""
+        return float(self.vol_by_delta(d, T, +1) - self.vol_by_delta(d, T, -1))
+
+    def bf(self, T: float, d: float = 0.25) -> float:
+        """Smile butterfly at delta ``d``: ``mean(wing vols) - ATM``, decimal."""
+        return float(0.5 * (self.vol_by_delta(d, T, +1) + self.vol_by_delta(d, T, -1))
+                     - self.atm(T))
+
+    # -- risk checks ------------------------------------------------------ #
+    def density(self, T: float, *, n: int = 601, n_std: float = 5.0) -> DensityReport:
+        """Breeden-Litzenberger density of this surface at expiry ``T``."""
+        return risk_neutral_density(lambda K: self._vol_impl(K, float(T)),
+                                    self.spot, float(T), self.rd, self.rf,
+                                    n=n, n_std=n_std)

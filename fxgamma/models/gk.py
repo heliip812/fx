@@ -483,32 +483,39 @@ def delta_from_strike(K: Any, S: Any, T: Any, rd: Any, rf: Any, sigma: Any, cp: 
     return _scalarise(out, S_, K_, T_, rd_, rf_, sg_, cp_)
 
 
-def _pa_call_delta_peak(S: float, T: float, rd: float, rf: float, sigma: float,
-                        premium_adjusted_fwd: bool) -> float:
+def _pa_call_delta_peak(S: float, T: float, rd: float, rf: float, sigma: float) -> float:
     """Strike at which the premium-adjusted **call** delta is maximal.
 
-    ``Delta_pa_call(K) = (K/S) e^{-rd T} N(d2(K))`` is 0 at both ends of the strike
-    axis, so it has an interior maximum and is *two-to-one*.  Market convention
+    ``Delta_pa_call(K) = (K/S) e^{-rd T} N(d2(K))`` tends to 0 at *both* ends of the
+    strike axis (``K -> 0``: the ``K`` factor wins; ``K -> inf``: ``N(d2)`` wins), so
+    it has an interior maximum and is **two-to-one** in K.  Market convention
     (Reiswich-Wystup 2010 s3.2) selects the root on the **decreasing** branch, i.e.
-    ``K >= K_peak``.  We locate ``K_peak`` by bisecting ``d/dk [k N(d2)] = 0`` in
-    log-strike, where the derivative is ``N(d2) - phi(d2)/(sigma sqrt(T))`` (the
-    ``K/S e^{-rdT}`` prefactor and the ``fwd`` variant only rescale, not relocate).
+    ``K >= K_peak``.
+
+    ``d/dK [K N(d2)] = N(d2) - phi(d2) / (sigma sqrt(T))`` -- positive for small K,
+    negative for large K (by the Mills-ratio asymptotic ``N(d2) ~ phi(d2)/|d2|``), so
+    the peak is the unique sign change from ``+`` to ``-``, found by bisection in
+    log-strike.  The ``K/S e^{-rd T}`` prefactor and the ``fwd_pa`` variant only
+    rescale the delta, they do not move the peak.
     """
     sqT = sigma * math.sqrt(max(T, T_MIN))
 
     def g(lnK: float) -> float:
-        K = math.exp(lnK)
-        _, d2, _ = d1_d2(S, K, T, rd, rf, sigma)
+        _, d2, _ = d1_d2(S, math.exp(lnK), T, rd, rf, sigma)
         return float(_norm_cdf(d2)) - float(_norm_pdf(d2)) / sqT
 
     lo, hi = math.log(S) - 12.0 * sqT - 1.0, math.log(S) + 12.0 * sqT + 1.0
-    if g(lo) > 0.0:          # already decreasing everywhere in range
+    if g(lo) <= 0.0:         # already on the decreasing branch at the left edge
         return math.exp(lo)
-    if g(hi) < 0.0:
+    if g(hi) > 0.0:          # genuinely still increasing at the right edge
         return math.exp(hi)
+    # NB: strict `>`.  Far out of the money both N(d2) and phi(d2) underflow to
+    # exactly 0.0, so g(hi) == 0.0 there; treating that tie as "still increasing"
+    # would return the right-hand bracket edge as the peak and poison the Brent
+    # bracket below, making every premium-adjusted call delta unsolvable (nan).
     for _ in range(200):
         mid = 0.5 * (lo + hi)
-        if g(mid) < 0.0:
+        if g(mid) > 0.0:     # still increasing -> peak is to the right
             lo = mid
         else:
             hi = mid
@@ -565,7 +572,7 @@ def strike_from_delta(delta: float, S: float, T: float, rd: float, rf: float, si
     k_lo = F * math.exp(-12.0 * sqT - 0.5 * sqT * sqT)
     k_hi = F * math.exp(+12.0 * sqT + 0.5 * sqT * sqT)
     if cp > 0:
-        k_peak = _pa_call_delta_peak(S, T, rd, rf, sigma, conv == "fwd_pa")
+        k_peak = _pa_call_delta_peak(S, T, rd, rf, sigma)
         peak_val = abs(float(delta_from_strike(k_peak, S, T, rd, rf, sigma, cp, conv)))
         if peak_val < dl:
             return float("nan")          # delta unattainable on the pa call branch

@@ -1,0 +1,178 @@
+date,time_utc,ccy,event,importance,source
+2026-01-02,13:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2026-01-12,13:30,USD,US CPI,3,approx:bls.gov
+2026-01-16,21:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2026-01-30,21:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2026-02-06,13:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2026-02-12,13:30,USD,US CPI,3,approx:bls.gov
+2026-02-20,21:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2026-02-27,21:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2026-03-06,13:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2026-03-12,12:30,USD,US CPI,3,approx:bls.gov
+2026-03-20,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2026-03-31,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2026-04-03,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2026-04-13,12:30,USD,US CPI,3,approx:bls.gov
+2026-04-17,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2026-04-30,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2026-05-01,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2026-05-12,12:30,USD,US CPI,3,approx:bls.gov
+2026-05-15,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2026-05-29,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2026-06-05,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2026-06-12,12:30,USD,US CPI,3,approx:bls.gov
+2026-06-19,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2026-06-30,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2026-07-03,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2026-07-13,12:30,USD,US CPI,3,approx:bls.gov
+2026-07-17,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2026-07-31,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2026-08-07,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2026-08-12,12:30,USD,US CPI,3,approx:bls.gov
+2026-08-21,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2026-08-31,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2026-09-04,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2026-09-09,13:45,CAD,BoC rate decision,3,approx:bankofcanada.ca
+2026-09-10,12:15,EUR,ECB Governing Council decision,3,approx:ecb.europa.eu
+2026-09-14,12:30,USD,US CPI,3,approx:bls.gov
+2026-09-16,18:00,USD,FOMC rate decision,3,approx:federalreserve.gov
+2026-09-17,11:00,GBP,BoE MPC decision,3,approx:bankofengland.co.uk
+2026-09-18,03:00,JPY,BoJ policy decision,3,approx:boj.or.jp
+2026-09-18,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2026-09-24,07:30,CHF,SNB monetary policy assessment,3,approx:snb.ch
+2026-09-29,04:30,AUD,RBA rate decision,3,approx:rba.gov.au
+2026-09-30,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2026-10-02,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2026-10-07,01:00,NZD,RBNZ OCR decision,3,approx:rbnz.govt.nz
+2026-10-12,12:30,USD,US CPI,3,approx:bls.gov
+2026-10-16,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2026-10-28,13:45,CAD,BoC rate decision,3,approx:bankofcanada.ca
+2026-10-28,18:00,USD,FOMC rate decision,3,approx:federalreserve.gov
+2026-10-29,13:15,EUR,ECB Governing Council decision,3,approx:ecb.europa.eu
+2026-10-30,03:00,JPY,BoJ policy decision,3,approx:boj.or.jp
+2026-10-30,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2026-11-03,03:30,AUD,RBA rate decision,3,approx:rba.gov.au
+2026-11-05,12:00,GBP,BoE MPC decision,3,approx:bankofengland.co.uk
+2026-11-06,13:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2026-11-12,13:30,USD,US CPI,3,approx:bls.gov
+2026-11-20,21:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2026-11-25,01:00,NZD,RBNZ OCR decision,3,approx:rbnz.govt.nz
+2026-11-30,21:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2026-12-04,13:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2026-12-08,03:30,AUD,RBA rate decision,3,approx:rba.gov.au
+2026-12-09,14:45,CAD,BoC rate decision,3,approx:bankofcanada.ca
+2026-12-09,19:00,USD,FOMC rate decision,3,approx:federalreserve.gov
+2026-12-10,08:30,CHF,SNB monetary policy assessment,3,approx:snb.ch
+2026-12-14,13:30,USD,US CPI,3,approx:bls.gov
+2026-12-17,12:00,GBP,BoE MPC decision,3,approx:bankofengland.co.uk
+2026-12-17,13:15,EUR,ECB Governing Council decision,3,approx:ecb.europa.eu
+2026-12-18,03:00,JPY,BoJ policy decision,3,approx:boj.or.jp
+2026-12-18,21:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2026-12-31,21:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2027-01-01,13:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2027-01-12,13:30,USD,US CPI,3,approx:bls.gov
+2027-01-15,21:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2027-01-20,14:45,CAD,BoC rate decision,3,approx:bankofcanada.ca
+2027-01-22,03:00,JPY,BoJ policy decision,3,approx:boj.or.jp
+2027-01-27,19:00,USD,FOMC rate decision,3,approx:federalreserve.gov
+2027-01-29,21:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2027-02-02,03:30,AUD,RBA rate decision,3,approx:rba.gov.au
+2027-02-04,12:00,GBP,BoE MPC decision,3,approx:bankofengland.co.uk
+2027-02-04,13:15,EUR,ECB Governing Council decision,3,approx:ecb.europa.eu
+2027-02-05,13:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2027-02-12,13:30,USD,US CPI,3,approx:bls.gov
+2027-02-17,01:00,NZD,RBNZ OCR decision,3,approx:rbnz.govt.nz
+2027-02-19,21:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2027-02-26,21:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2027-03-05,13:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2027-03-10,14:45,CAD,BoC rate decision,3,approx:bankofcanada.ca
+2027-03-11,13:15,EUR,ECB Governing Council decision,3,approx:ecb.europa.eu
+2027-03-12,13:30,USD,US CPI,3,approx:bls.gov
+2027-03-16,03:30,AUD,RBA rate decision,3,approx:rba.gov.au
+2027-03-17,18:00,USD,FOMC rate decision,3,approx:federalreserve.gov
+2027-03-18,03:00,JPY,BoJ policy decision,3,approx:boj.or.jp
+2027-03-18,12:00,GBP,BoE MPC decision,3,approx:bankofengland.co.uk
+2027-03-19,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2027-03-25,08:30,CHF,SNB monetary policy assessment,3,approx:snb.ch
+2027-03-31,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2027-04-02,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2027-04-12,12:30,USD,US CPI,3,approx:bls.gov
+2027-04-14,02:00,NZD,RBNZ OCR decision,3,approx:rbnz.govt.nz
+2027-04-16,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2027-04-21,13:45,CAD,BoC rate decision,3,approx:bankofcanada.ca
+2027-04-22,12:15,EUR,ECB Governing Council decision,3,approx:ecb.europa.eu
+2027-04-28,18:00,USD,FOMC rate decision,3,approx:federalreserve.gov
+2027-04-30,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2027-05-01,03:00,JPY,BoJ policy decision,3,approx:boj.or.jp
+2027-05-04,04:30,AUD,RBA rate decision,3,approx:rba.gov.au
+2027-05-06,11:00,GBP,BoE MPC decision,3,approx:bankofengland.co.uk
+2027-05-07,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2027-05-12,12:30,USD,US CPI,3,approx:bls.gov
+2027-05-21,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2027-05-26,02:00,NZD,RBNZ OCR decision,3,approx:rbnz.govt.nz
+2027-05-31,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2027-06-04,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2027-06-09,13:45,CAD,BoC rate decision,3,approx:bankofcanada.ca
+2027-06-10,12:15,EUR,ECB Governing Council decision,3,approx:ecb.europa.eu
+2027-06-14,12:30,USD,US CPI,3,approx:bls.gov
+2027-06-15,04:30,AUD,RBA rate decision,3,approx:rba.gov.au
+2027-06-16,18:00,USD,FOMC rate decision,3,approx:federalreserve.gov
+2027-06-17,03:00,JPY,BoJ policy decision,3,approx:boj.or.jp
+2027-06-17,07:30,CHF,SNB monetary policy assessment,3,approx:snb.ch
+2027-06-17,11:00,GBP,BoE MPC decision,3,approx:bankofengland.co.uk
+2027-06-18,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2027-06-30,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2027-07-02,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2027-07-07,02:00,NZD,RBNZ OCR decision,3,approx:rbnz.govt.nz
+2027-07-12,12:30,USD,US CPI,3,approx:bls.gov
+2027-07-14,13:45,CAD,BoC rate decision,3,approx:bankofcanada.ca
+2027-07-16,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2027-07-22,12:15,EUR,ECB Governing Council decision,3,approx:ecb.europa.eu
+2027-07-28,18:00,USD,FOMC rate decision,3,approx:federalreserve.gov
+2027-07-30,03:00,JPY,BoJ policy decision,3,approx:boj.or.jp
+2027-07-30,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2027-08-03,04:30,AUD,RBA rate decision,3,approx:rba.gov.au
+2027-08-05,11:00,GBP,BoE MPC decision,3,approx:bankofengland.co.uk
+2027-08-06,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2027-08-12,12:30,USD,US CPI,3,approx:bls.gov
+2027-08-18,02:00,NZD,RBNZ OCR decision,3,approx:rbnz.govt.nz
+2027-08-20,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2027-08-31,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2027-09-03,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2027-09-08,13:45,CAD,BoC rate decision,3,approx:bankofcanada.ca
+2027-09-09,12:15,EUR,ECB Governing Council decision,3,approx:ecb.europa.eu
+2027-09-13,12:30,USD,US CPI,3,approx:bls.gov
+2027-09-16,11:00,GBP,BoE MPC decision,3,approx:bankofengland.co.uk
+2027-09-17,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2027-09-21,03:00,JPY,BoJ policy decision,3,approx:boj.or.jp
+2027-09-21,04:30,AUD,RBA rate decision,3,approx:rba.gov.au
+2027-09-22,18:00,USD,FOMC rate decision,3,approx:federalreserve.gov
+2027-09-23,07:30,CHF,SNB monetary policy assessment,3,approx:snb.ch
+2027-09-30,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2027-10-01,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2027-10-06,01:00,NZD,RBNZ OCR decision,3,approx:rbnz.govt.nz
+2027-10-12,12:30,USD,US CPI,3,approx:bls.gov
+2027-10-15,20:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2027-10-27,13:45,CAD,BoC rate decision,3,approx:bankofcanada.ca
+2027-10-28,12:15,EUR,ECB Governing Council decision,3,approx:ecb.europa.eu
+2027-10-29,03:00,JPY,BoJ policy decision,3,approx:boj.or.jp
+2027-10-29,20:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2027-11-02,03:30,AUD,RBA rate decision,3,approx:rba.gov.au
+2027-11-03,18:00,USD,FOMC rate decision,3,approx:federalreserve.gov
+2027-11-04,12:00,GBP,BoE MPC decision,3,approx:bankofengland.co.uk
+2027-11-05,12:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2027-11-12,13:30,USD,US CPI,3,approx:bls.gov
+2027-11-19,21:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2027-11-24,01:00,NZD,RBNZ OCR decision,3,approx:rbnz.govt.nz
+2027-11-30,21:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day
+2027-12-03,13:30,USD,US Non-Farm Payrolls,3,rule:first-friday-0830ET
+2027-12-07,03:30,AUD,RBA rate decision,3,approx:rba.gov.au
+2027-12-08,14:45,CAD,BoC rate decision,3,approx:bankofcanada.ca
+2027-12-13,13:30,USD,US CPI,3,approx:bls.gov
+2027-12-15,19:00,USD,FOMC rate decision,3,approx:federalreserve.gov
+2027-12-16,08:30,CHF,SNB monetary policy assessment,3,approx:snb.ch
+2027-12-16,12:00,GBP,BoE MPC decision,3,approx:bankofengland.co.uk
+2027-12-16,13:15,EUR,ECB Governing Council decision,3,approx:ecb.europa.eu
+2027-12-17,03:00,JPY,BoJ policy decision,3,approx:boj.or.jp
+2027-12-17,21:00,USD,Listed option expiry (CME/ETF),2,rule:third-friday-1600ET
+2027-12-31,21:00,USD,Month-end fix (WMR 16:00 LDN / NY close),2,rule:last-business-day

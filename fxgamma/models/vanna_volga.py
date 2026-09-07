@@ -243,19 +243,31 @@ def market_to_smile_bf(atm: float, rr: float, bf_market: float, S: float, T: flo
 class VannaVolgaSmile:
     """A single-tenor FX smile.  Immutable, picklable, cheap to evaluate.
 
-    Built by :meth:`from_quotes`.  With only 25d quotes it is a pure three-point
-    vanna-volga smile; when 10d quotes are supplied it becomes a five-pillar
-    monotone-cubic (PCHIP) smile in log-moneyness that reprices all five quotes
-    exactly -- the standard desk treatment of a "5-point smile", since VV itself
-    is defined on exactly three instruments.
+    Built by :meth:`from_quotes`.
+
+    Shape
+    -----
+    * **Core**, between the 25d put and 25d call strikes: the vanna-volga vol
+      (second-order formula, or the exact replication price inverted).
+    * **Wings**, outside them: continued in **total variance** ``w = sigma^2 T`` so
+      that the join is ``C^1`` (value *and* slope match).  A slope discontinuity in
+      ``w`` puts a Dirac in ``w''`` and therefore a spike -- usually negative -- in
+      the Breeden-Litzenberger density, which is exactly the artefact a naive
+      "damped wing" produces.  When 10d quotes are supplied the wing is the unique
+      quadratic in ``k`` that matches value+slope at the 25d strike **and passes
+      through the 10d quote**, so all five quotes reprice exactly; beyond the 10d
+      strike it becomes linear in ``w``.
+    * Wing slopes are capped at ``|dw/dk| <= lee_cap`` (default 2.0), which is
+      **Lee's moment formula** bound -- the asymptotic limit beyond which the
+      implied density has no finite moments and butterfly arbitrage is guaranteed.
 
     Attributes
     ----------
     S, T, rd, rf : market state for this tenor.
-    strikes, vols : the pillar strikes and their market vols (3 or 5, increasing).
+    strikes, vols : pillar strikes and their market vols (3, or 5 with 10d quotes),
+        strictly increasing in strike.  These are the points the smile reprices exactly.
     atm_vol : the ATM (DNS) vol -- the ``s2`` of the VV algebra.
     method : ``"approx"`` (second-order formula) or ``"exact"`` (price replication).
-    wing_lo, wing_hi : log-moneyness bounds outside which the wing is damped.
     """
 
     S: float
@@ -269,11 +281,11 @@ class VannaVolgaSmile:
     method: str = "approx"
     delta: float = 0.25
     delta_convention: str = "spot"
-    wing_damping: float = 0.5
-    _slopes: np.ndarray | None = field(default=None, repr=False)
-    _wing_slopes: tuple[float, float] = field(default=(0.0, 0.0), repr=False)
+    lee_cap: float = 2.0
+    #: (k1, k3, w1, w3, w1p, w3p, cL, cR, kL, kR, wLp, wRp) -- wing coefficients
+    _wing: tuple[float, ...] = field(default=(), repr=False)
+    #: (l1, l2, l3, dn1, dn2, dn3, s1, s2, s3, A1, A3, c0, sqT) -- VV scalar fast path
     _fast: tuple[float, ...] = field(default=(), repr=False)
-    _lkp: np.ndarray | None = field(default=None, repr=False)
 
     # -- construction ---------------------------------------------------- #
     @classmethod
@@ -282,23 +294,21 @@ class VannaVolgaSmile:
                     rr10: float | None = None, bf10: float | None = None,
                     *, delta: float = 0.25, delta_convention: str = "spot",
                     atm_convention: str | None = None, method: str = "approx",
-                    bf_convention: str = "smile", wing_damping: float = 0.5
+                    bf_convention: str = "smile", lee_cap: float = 2.0
                     ) -> "VannaVolgaSmile":
         """Build a smile from broker quotes for one tenor.
 
         Parameters
         ----------
         atm, rr25, bf25 : decimals (0.085, -0.0035, 0.0022).
-        rr10, bf10 : optional 10-delta quotes; when both are given the smile
-            switches to the five-pillar PCHIP form.
+        rr10, bf10 : optional 10-delta quotes.  When both are given the wings are
+            anchored to them (see the class docstring); the core stays 3-point VV.
         delta_convention : the pair's convention, ``{"spot","spot_pa","fwd","fwd_pa"}``.
         atm_convention : defaults to the DNS variant matching ``delta_convention``.
         bf_convention : ``"smile"`` (default, algebraic) or ``"market"``, in which
-            case ``bf25``/``bf10`` are first converted via :func:`market_to_smile_bf`.
+            case the butterflies are first converted via :func:`market_to_smile_bf`.
         method : ``"approx"`` | ``"exact"`` -- see the module docstring.
-        wing_damping : 0..1.  Fraction of the pillar-edge slope retained outside
-            the outermost pillars.  ``0`` = flat wings, ``1`` = full linear
-            continuation.  Default 0.5 tames the VV wing blow-up.
+        lee_cap : cap on ``|dw/dk|`` in the wings (Lee's moment bound is 2.0).
         """
         if method not in VV_METHODS:
             raise ValueError(f"method must be one of {VV_METHODS}, got {method!r}")
@@ -317,51 +327,73 @@ class VannaVolgaSmile:
         k_p, k_atm, k_c = smile.delta_pillar_strikes(
             S, T, rd, rf, atm, p25, c25, delta=delta,
             delta_convention=delta_convention, atm_convention=ac)
-        strikes = [k_p, k_atm, k_c]
-        vols = [p25, atm, c25]
+        core_K = np.array([k_p, k_atm, k_c], float)
+        core_V = np.array([p25, atm, c25], float)
+        if not np.all(np.diff(core_K) > 0.0) or not np.all(np.isfinite(core_K)):
+            raise ValueError(f"non-monotone or non-finite pillar strikes: {core_K}")
 
+        l1, l2, l3 = (math.log(float(k)) for k in core_K)
+        s1, s2, s3 = (float(v) for v in core_V)
+        a1, b1, _ = gk.d1_d2(S, float(core_K[0]), T, rd, rf, s2)
+        a3, b3, _ = gk.d1_d2(S, float(core_K[2]), T, rd, rf, s2)
+        fast = (l1, l2, l3,
+                (l2 - l1) * (l3 - l1), (l2 - l1) * (l3 - l2), (l3 - l1) * (l3 - l2),
+                s1, s2, s3,
+                float(a1 * b1) * (s1 - s2) ** 2, float(a3 * b3) * (s3 - s2) ** 2,
+                math.log(S) + (rd - rf) * T, s2 * math.sqrt(max(T, gk.T_MIN)))
+
+        obj = cls(float(S), float(T), float(rd), float(rf), core_K, core_V, float(atm),
+                  float(k_atm), method, float(delta), str(delta_convention),
+                  float(lee_cap), (), fast)
+
+        # ---- wing anchors -------------------------------------------- #
+        F = obj.forward
+        k1, k3 = math.log(core_K[0] / F), math.log(core_K[2] / F)
+        kL = kR = float("nan")
+        wL = wR = 0.0
+        pill_K, pill_V = list(core_K), list(core_V)
         if rr10 is not None and bf10 is not None:
             p10, c10 = smile.rr_bf_to_vols(atm, rr10, bf10)
             k_p10 = gk.strike_from_delta(0.10, S, T, rd, rf, p10, -1, delta_convention)
             k_c10 = gk.strike_from_delta(0.10, S, T, rd, rf, c10, +1, delta_convention)
-            if np.isfinite(k_p10) and np.isfinite(k_c10) and k_p10 < k_p and k_c10 > k_c:
-                strikes = [k_p10] + strikes + [k_c10]
-                vols = [p10] + vols + [c10]
+            if np.isfinite(k_p10) and np.isfinite(k_c10) and k_p10 < core_K[0] < core_K[2] < k_c10:
+                kL, wL = math.log(k_p10 / F), p10 * p10 * T
+                kR, wR = math.log(k_c10 / F), c10 * c10 * T
+                pill_K = [float(k_p10)] + pill_K + [float(k_c10)]
+                pill_V = [float(p10)] + pill_V + [float(c10)]
 
-        K = np.asarray(strikes, float)
-        V = np.asarray(vols, float)
-        if not np.all(np.diff(K) > 0.0) or not np.all(np.isfinite(K)):
-            raise ValueError(f"non-monotone or non-finite pillar strikes: {K}")
-
-        slopes = None
-        wing = (0.0, 0.0)
-        fwd = S * math.exp((rd - rf) * T)
-        lkp = np.log(K / fwd)
-        if K.size == 5:
-            slopes = smile.pchip_slopes(lkp, V)
-        else:
-            # one-sided d(sigma)/d(ln K) just inside each edge pillar, precomputed
-            # once so vol() stays allocation-light in the ladder's inner loop.
-            eps = 1e-4
-            k1, k3 = float(K[0]), float(K[-1])
-            m_lo = (float(vv_vol(k1 * math.exp(eps), S, T, rd, rf, *K, *V)) - float(V[0])) / eps
-            m_hi = (float(V[-1]) - float(vv_vol(k3 * math.exp(-eps), S, T, rd, rf, *K, *V))) / eps
-            wing = (m_lo, m_hi)
-        # constants for the scalar fast path (see _vol_scalar)
-        fast: tuple[float, ...] = ()
-        if K.size == 3:
-            l1, l2, l3 = (math.log(float(k)) for k in K)
-            s1, s2, s3 = (float(v) for v in V)
-            a1, b1, _ = gk.d1_d2(S, float(K[0]), T, rd, rf, s2)
-            a3, b3, _ = gk.d1_d2(S, float(K[2]), T, rd, rf, s2)
-            fast = (l1, l2, l3,
-                    (l2 - l1) * (l3 - l1), (l2 - l1) * (l3 - l2), (l3 - l1) * (l3 - l2),
-                    s1, s2, s3,
-                    float(a1 * b1) * (s1 - s2) ** 2, float(a3 * b3) * (s3 - s2) ** 2,
-                    math.log(S) + (rd - rf) * T, s2 * math.sqrt(max(T, gk.T_MIN)))
-        return cls(float(S), float(T), float(rd), float(rf), K, V, float(atm),
+        wing = obj._build_wing(k1, k3, kL, wL, kR, wR)
+        return cls(float(S), float(T), float(rd), float(rf),
+                   np.asarray(pill_K, float), np.asarray(pill_V, float), float(atm),
                    float(k_atm), method, float(delta), str(delta_convention),
-                   float(wing_damping), slopes, wing, fast, lkp)
+                   float(lee_cap), wing, fast)
+
+    def _build_wing(self, k1: float, k3: float, kL: float, wL: float,
+                    kR: float, wR: float) -> tuple[float, ...]:
+        """Precompute the C1 wing coefficients (see the class docstring)."""
+        T = self.T
+        eps = 1e-5
+        def core_sigma(k: float) -> float:
+            return float(self._core_vol(np.array([self.forward * math.exp(k)]))[0])
+
+        s_1, s_3 = core_sigma(k1), core_sigma(k3)
+        w1, w3 = s_1 * s_1 * T, s_3 * s_3 * T
+        w1p = ((core_sigma(k1 + eps) ** 2 - core_sigma(k1) ** 2) / eps) * T
+        w3p = ((core_sigma(k3) ** 2 - core_sigma(k3 - eps) ** 2) / eps) * T
+        cap = float(self.lee_cap)
+
+        if np.isfinite(kL):
+            cL = (wL - w1 - w1p * (kL - k1)) / (kL - k1) ** 2
+            wLp = float(np.clip(w1p + 2.0 * cL * (kL - k1), -cap, cap))
+        else:
+            cL, wLp, kL, wL = 0.0, float(np.clip(w1p, -cap, cap)), k1, w1
+        if np.isfinite(kR):
+            cR = (wR - w3 - w3p * (kR - k3)) / (kR - k3) ** 2
+            wRp = float(np.clip(w3p + 2.0 * cR * (kR - k3), -cap, cap))
+        else:
+            cR, wRp, kR, wR = 0.0, float(np.clip(w3p, -cap, cap)), k3, w3
+        return (k1, k3, w1, w3, float(np.clip(w1p, -cap, cap)), float(np.clip(w3p, -cap, cap)),
+                cL, cR, kL, kR, wLp, wRp, wL, wR)
 
     # -- evaluation ------------------------------------------------------ #
     @property
@@ -369,38 +401,66 @@ class VannaVolgaSmile:
         """Outright forward for this tenor."""
         return float(self.S * math.exp((self.rd - self.rf) * self.T))
 
+    def _core_vol(self, K: np.ndarray) -> np.ndarray:
+        """Vanna-volga vol on the core region (no wing treatment)."""
+        K1, K2, K3 = self.strikes[0], self.strikes[len(self.strikes) // 2], self.strikes[-1]
+        if self.strikes.size == 5:
+            K1, K2, K3 = self.strikes[1], self.strikes[2], self.strikes[3]
+        s1, s2, s3 = (self.vols[1], self.vols[2], self.vols[3]) if self.strikes.size == 5 \
+            else (self.vols[0], self.vols[1], self.vols[2])
+        if self.method == "exact":
+            return self._exact_vol(np.asarray(K, float))
+        return np.asarray(vv_vol(np.asarray(K, float), self.S, self.T, self.rd, self.rf,
+                                 K1, K2, K3, s1, s2, s3), float)
+
     def vol(self, K: Any) -> Any:
-        """Implied vol at strike(s) ``K`` (decimal).  Vectorised over arrays and with a
-        pure-python scalar fast path (~2 us/call) because the spot ladder hits this
-        ~1e5 times per refresh.  Wings outside the outer pillars are damped-linear in
-        log-moneyness (see ``wing_damping``)."""
-        if np.ndim(K) == 0 and self.method == "approx" and self._fast:
+        """Implied vol (decimal) at strike(s) ``K``.
+
+        Vectorised, with a pure-python scalar fast path (~2 us) because the spot
+        ladder hits this ~1e5 times per refresh.
+        """
+        if np.ndim(K) == 0 and self.method == "approx":
             return self._vol_scalar(float(K))
         Karr = np.asarray(K, float)
-        if self.strikes.size == 5:
-            lk = np.log(Karr / self.forward)
-            out = smile.pchip_eval(lk, self._lkp, self.vols, self._slopes, extrap="linear")
-            out = self._damp(out, lk, self._lkp)
-        elif self.method == "approx":
-            K1, K2, K3 = self.strikes
-            s1, s2, s3 = self.vols
-            core = vv_vol(Karr, self.S, self.T, self.rd, self.rf, K1, K2, K3, s1, s2, s3)
-            out = self._damp_vv(np.asarray(core, float), Karr)
-        else:
-            out = self._exact_vol(Karr)
+        k = np.log(np.maximum(Karr, 1e-300) / self.forward)
+        (k1, k3, w1, w3, w1p, w3p, cL, cR, kL, kR, wLp, wRp, wL, wR) = self._wing
+        out = np.empty(np.shape(k), float)
+        mid = (k >= k1) & (k <= k3)
+        if np.any(mid):
+            out[mid] = self._core_vol(self.forward * np.exp(k[mid]))
+        left = k < k1
+        if np.any(left):
+            kk = k[left]
+            w = np.where(kk >= kL,
+                         w1 + w1p * (kk - k1) + cL * (kk - k1) ** 2,
+                         wL + wLp * (kk - kL))
+            out[left] = np.sqrt(np.maximum(w, 1e-12) / max(self.T, gk.T_MIN))
+        right = k > k3
+        if np.any(right):
+            kk = k[right]
+            w = np.where(kk <= kR,
+                         w3 + w3p * (kk - k3) + cR * (kk - k3) ** 2,
+                         wR + wRp * (kk - kR))
+            out[right] = np.sqrt(np.maximum(w, 1e-12) / max(self.T, gk.T_MIN))
         out = np.clip(out, _VOL_FLOOR, _VOL_CAP)
         return out if np.ndim(K) else float(out)
 
     def _vol_scalar(self, K: float) -> float:
-        """Scalar three-pillar second-order VV vol, no numpy, no allocation.
+        """Scalar three-pillar VV vol plus wings; no numpy, no allocation.
 
-        Numerically identical to the vectorised path (asserted in the validation
-        script); it exists purely so ``vol()`` costs ~2 us instead of ~80 us.
+        Numerically identical to the vectorised path (asserted in validation).
         """
         (l1, l2, l3, dn1, dn2, dn3, s1, s2, s3, A1, A3, c0, sqT) = self._fast
+        (k1, k3, w1, w3, w1p, w3p, cL, cR, kL, kR, wLp, wRp, wL, wR) = self._wing
+        lnF = math.log(self.forward)
+        k = math.log(K) - lnF
+        if k < k1:
+            w = (w1 + w1p * (k - k1) + cL * (k - k1) ** 2) if k >= kL else (wL + wLp * (k - kL))
+            return min(max(math.sqrt(max(w, 1e-12) / max(self.T, gk.T_MIN)), _VOL_FLOOR), _VOL_CAP)
+        if k > k3:
+            w = (w3 + w3p * (k - k3) + cR * (k - k3) ** 2) if k <= kR else (wR + wRp * (k - kR))
+            return min(max(math.sqrt(max(w, 1e-12) / max(self.T, gk.T_MIN)), _VOL_FLOOR), _VOL_CAP)
         lk = math.log(K)
-        if self.strikes.size == 5:                       # not fast-pathed
-            return float(self.vol(np.array([K]))[0])
         y1 = (l2 - lk) * (l3 - lk) / dn1
         y2 = (lk - l1) * (l3 - lk) / dn2
         y3 = (lk - l1) * (lk - l2) / dn3
@@ -408,48 +468,17 @@ class VannaVolgaSmile:
         D2 = y1 * A1 + y3 * A3
         d1 = (c0 - lk) / sqT + 0.5 * sqT
         d2 = d1 - sqT
-        p = d1 * d2
-        rad = s2 * s2 + p * (2.0 * s2 * D1 + D2)
-        sig = s2 + (-s2 + math.sqrt(rad)) / p if (abs(p) > 1e-12 and rad > 0.0) else s2 + D1
-        if K < self.strikes[0]:
-            sig = self.vols[0] + self.wing_damping * self._wing_slopes[0] * (lk - l1)
-        elif K > self.strikes[2]:
-            sig = self.vols[2] + self.wing_damping * self._wing_slopes[1] * (lk - l3)
+        pp = d1 * d2
+        rad = s2 * s2 + pp * (2.0 * s2 * D1 + D2)
+        sig = s2 + (-s2 + math.sqrt(rad)) / pp if (abs(pp) > 1e-12 and rad > 0.0) else s2 + D1
         return min(max(sig, _VOL_FLOOR), _VOL_CAP)
-
-    def _damp(self, v: np.ndarray, lk: np.ndarray, lkp: np.ndarray) -> np.ndarray:
-        """Blend the extrapolated wing back towards the edge vol by ``wing_damping``."""
-        d = self.wing_damping
-        lo = lk < lkp[0]
-        hi = lk > lkp[-1]
-        v = np.where(lo, self.vols[0] + d * (v - self.vols[0]), v)
-        v = np.where(hi, self.vols[-1] + d * (v - self.vols[-1]), v)
-        return v
-
-    def _damp_vv(self, v: np.ndarray, K: np.ndarray) -> np.ndarray:
-        """VV wings: replace the quadratic continuation with a damped straight line.
-
-        Outside ``[K1, K3]`` the second-order VV formula is extrapolating a parabola
-        in log-strike, which blows up.  We continue with the *pillar-edge slope*
-        scaled by ``wing_damping``, which keeps the wing monotone and the density
-        positive far further out.
-        """
-        K1, K3 = float(self.strikes[0]), float(self.strikes[-1])
-        s1, s3 = float(self.vols[0]), float(self.vols[-1])
-        d = self.wing_damping
-        m_lo, m_hi = self._wing_slopes
-        lo = K < K1
-        hi = K > K3
-        with np.errstate(divide="ignore", invalid="ignore"):
-            v = np.where(lo, s1 + d * m_lo * np.log(np.maximum(K, 1e-300) / K1), v)
-            v = np.where(hi, s3 + d * m_hi * np.log(np.maximum(K, 1e-300) / K3), v)
-        return v
 
     def _exact_vol(self, K: np.ndarray) -> np.ndarray:
         """Implied vol from the exact VV replication price (slow path)."""
-        K1, K2, K3 = self.strikes
-        s1, s2, s3 = self.vols
-        Kf = np.atleast_1d(K).ravel()
+        idx = (1, 2, 3) if self.strikes.size == 5 else (0, 1, 2)
+        K1, K2, K3 = (float(self.strikes[i]) for i in idx)
+        s1, s2, s3 = (float(self.vols[i]) for i in idx)
+        Kf = np.atleast_1d(np.asarray(K, float)).ravel()
         cp = np.where(Kf >= self.forward, 1.0, -1.0)
         px = np.asarray(vv_price(Kf, cp, self.S, self.T, self.rd, self.rf,
                                  K1, K2, K3, s1, s2, s3), float)
@@ -465,19 +494,19 @@ class VannaVolgaSmile:
         ``sigma = smile.vol(strike_from_delta(delta, sigma))``.
 
         The fixed point is required because in FX the strike itself depends on the
-        vol.  Converges in 3-6 iterations for |delta| in [0.02, 0.5]; falls back to
-        the last iterate (and never raises) if it stalls.
+        vol.  Converges in 3-6 iterations for ``|delta|`` in [0.02, 0.5]; damped
+        after 20 iterations and never raises.
         """
         s = float(self.atm_vol)
-        for _ in range(60):
+        for i in range(60):
             K = gk.strike_from_delta(delta, self.S, self.T, self.rd, self.rf, s, cp,
                                      self.delta_convention)
             if not np.isfinite(K):
                 return float("nan")
-            s_new = float(self.vol(K))
-            if abs(s_new - s) < 1e-12:
+            s_new = float(self.vol(float(K)))
+            if abs(s_new - s) < 1e-13:
                 return s_new
-            s = 0.5 * (s + s_new) if _ > 20 else s_new     # damp if slow
+            s = 0.5 * (s + s_new) if i > 20 else s_new
         return s
 
     def strike_by_delta(self, delta: float, cp: int) -> float:

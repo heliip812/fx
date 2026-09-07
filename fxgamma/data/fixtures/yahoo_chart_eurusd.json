@@ -1,0 +1,41 @@
+{
+ "chart": {
+  "result": [
+   {
+    "meta": {
+     "currency": "USD",
+     "symbol": "EURUSD=X",
+     "exchangeName": "CCY",
+     "instrumentType": "CURRENCY",
+     "firstTradeDate": 1070236800,
+     "regularMarketTime": 1757260800,
+     "gmtoffset": 0,
+     "timezone": "GMT",
+     "exchangeTimezoneName": "Europe/London",
+     "regularMarketPrice": 1.16512,
+     "chartPreviousClose": 1.16104,
+     "priceHint": 4,
+     "dataGranularity": "1d",
+     "range": "",
+     "validRanges": ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]
+    },
+    "timestamp": [1756944000, 1757030400, 1757116800, 1757203200, 1757289600],
+    "indicators": {
+     "quote": [
+      {
+       "open":  [1.16104, 1.16233, 1.16410, 1.16287, 1.16501],
+       "high":  [1.16480, 1.16590, 1.16702, 1.16640, 1.16733],
+       "low":   [1.15920, 1.16050, 1.16188, 1.16101, 1.16320],
+       "close": [1.16233, 1.16410, 1.16287, 1.16501, 1.16512],
+       "volume": [0, 0, 0, 0, 0]
+      }
+     ],
+     "adjclose": [
+      {"adjclose": [1.16233, 1.16410, 1.16287, 1.16501, 1.16512]}
+     ]
+    }
+   }
+  ],
+  "error": null
+ }
+}
