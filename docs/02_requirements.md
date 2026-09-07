@@ -1,12 +1,16 @@
 # Requirements — FX Gamma Desk (G3 + G10)
 
-**Owner:** Business Analyst (`ba`) · **Status:** M1 draft for trader review · **Reads against:**
-`docs/00_charter.md`, `docs/01_architecture.md` (both FROZEN), `fxgamma/types.py`,
-`fxgamma/conventions.py`.
+**Owner:** Business Analyst (`ba`) · **Status:** M6a — corrected after trader review (rev 2,
+2026-09-07; see §11 changelog) · **Reads against:**
+`docs/00_charter.md`, `docs/01_architecture.md` (FROZEN) **+ AMENDMENT v1.1 (CG rulings) + AMENDMENT
+v1.2 (trader-review rulings, incl. T-5 assigned to the BA)**, `docs/06_trader_review.md`,
+`fxgamma/types.py`, `fxgamma/conventions.py`.
 
 This document is the build contract for behaviour. Where it names a function it means the one in
 architecture §4–§5. Where it needs something the frozen contract does not provide, it is marked
 **[CONTRACT-GAP-n]** and listed in §8.3 for PM arbitration. Nothing here changes the contract.
+All seven gaps CG-1…CG-7 were ruled on in arch AMENDMENT v1.1; §8.3 now records the ruling per gap
+and is **closed**. §10 records the trader's answers to §9 and which of them are still open.
 
 **Notation used throughout**
 
@@ -14,22 +18,41 @@ architecture §4–§5. Where it needs something the frozen contract does not pr
 |---|---|---|
 | `S` | spot, quote ccy per 1 base ccy | e.g. 1.0850, 147.20 |
 | `Γ₁` | `Greeks.gamma_1pct` — change in `delta_base` for a **+1% spot move** | base ccy |
-| `Γ$` | `Γ₁ × S` — quote-ccy value of that delta change | quote ccy per 1% |
+| `Γ$` | `Γ₁ × S` — quote-ccy value of that delta change, **per 1% move** | quote ccy per 1% |
+| `Γ_S²` | `Γ·S² = 100·Γ$` — **cash gamma**; the coefficient in every delta-hedged P&L identity | quote ccy |
 | `θ` | `Greeks.theta` — quote ccy per **calendar** day | quote ccy/day |
 | `ν` | `Greeks.vega` — quote ccy per **1.00 vol point** (0.01 of σ) | quote ccy/vol pt |
 | `σ` | implied vol, decimal (0.085 = 8.5%) | — |
 | `x` | spot move in **percent** | % |
 | BE | daily breakeven move (§4.1) | % and pips |
 
-**Derived identity used by several screens (developers: implement once, in one helper).**
+**Derived identities used by several screens (developers: implement once, in one helper module —
+`fxgamma/portfolio/risk.py`; every screen calls it, no screen re-derives it).**
 Gamma P&L over a move of `x` percent is `0.5·Γ·dS²` with `Γ = Γ₁/(0.01·S)` and `dS = 0.01·x·S`:
 
 ```
-gamma_pnl(x%)  = 0.005 · Γ₁ · S · x²        [quote ccy]
-BE_daily (%)   = sqrt( |θ| / (0.005 · Γ₁ · S) )
+gamma_pnl(x%)      = 0.005 · Γ₁ · S · x²                       [quote ccy]
+BE_daily (%)       = sqrt( |θ| / (0.005 · Γ₁ · S) )            [%]
+sigma_day_move (%) = 100 · σ_ATM / sqrt(252)                   [%]
+dhedge_pnl         = 50 · Γ₁ · S · (σ_r² − σ_i²) · Δt_years    [quote ccy]
+                   = 0.5 · Γ_S² · (σ_r² − σ_i²) · Δt_years
 ```
 
-For a pure ATM position this reduces exactly to `σ_ATM / sqrt(365)`. QA uses that as a check.
+For a pure ATM position `BE_daily` reduces exactly to `σ_ATM / sqrt(365)`. QA uses that as a check.
+
+**The 1% scaling trap (this document got it wrong once — see §11).** `Γ₁` and therefore `Γ$` are
+defined **per 1% spot move**, not per unit of spot. Any identity written in terms of `Γ·S²` must
+therefore carry a factor of **100** when re-expressed in `Γ$`: `Γ·S² = 100·Γ$ = 100·Γ₁·S`. The
+delta-hedged carry constant is consequently **50**, never 0.5. Derivation and a worked, unit-testable
+example are in **§2.5 → "Normative derivation for REQ-046 / REQ-064"**. Nothing in the document may
+restate this identity locally; REQ-046, REQ-056 and REQ-064 all call the same helper.
+
+**Two sigma-day bases, never conflated** (trader review §3a/W-7, accepted): `BE_daily` is an
+*economics* quantity and annualises on **√365**, because theta is paid on calendar days;
+`sigma_day_move` is a *distance/probability* quantity and annualises on **√252**, because spot only
+moves on trading days. Every "distance in sigma-days" on any screen (REQ-025, REQ-042, REQ-045)
+divides by `sigma_day_move`; every breakeven divides by `BE_daily`; the basis is printed on the
+panel. Using √365 for distance overstates every distance-in-sigma-days by ~20%.
 
 ---
 
@@ -102,7 +125,10 @@ Refresh restamps once and every open figure updates from the new snapshot.
 **REQ-002 (M) — Provenance badge on every market number.**
 G: a rendered number derives from `MarketSnapshot`. W: the user hovers/inspects it.
 T: a badge shows `source`, `kind` ∈ {live, cached, synthetic, user_override} and the field `asof`,
-from `MarketSnapshot.meta`; `synthetic` renders purple, `user_override` blue, `cached` amber,
+from `MarketSnapshot.meta` under the **frozen key grammar of [CG-7 RESOLVED — arch AMENDMENT v1.1]**
+(`spot.<PAIR>`, `rate.<CCY>`, `fwd.<PAIR>.<TENOR>`, `surface.<PAIR>`, `surface.<PAIR>.<TENOR>`,
+`oi.<PAIR>`, `events`), looked up **most-specific-first** so a badge for `surface.EURUSD.1M` falls
+back to `surface.EURUSD`; `synthetic` renders purple, `user_override` blue, `cached` amber,
 `live` green; a page that contains **any** synthetic field shows a persistent page-level banner.
 Live data is never silently replaced by synthetic (charter §3).
 
@@ -115,8 +141,13 @@ trade", no traceback, no blank white panel, and the aggregate Greek cards read e
 G: any page. W: the user changes the pair selector or the reporting currency (default USD).
 T: the selection persists across pages and sessions (SQLite settings); all cross-pair aggregates
 are converted to the reporting currency using the snapshot spot, and the conversion rate used is
-disclosed on hover. **[CONTRACT-GAP-1]** `Greeks` has no currency tag and `book_greeks` returns one
-untagged `Greeks`, so the conversion must live in the app layer.
+disclosed on hover. **[CG-1 RESOLVED — arch AMENDMENT v1.1]**: the conversion is a **library**
+layer, not an app one, and `Greeks` gains no `ccy` field (so `+`/`*` stay safe). Per-position Greeks
+stay in the position's native quote ccy; `price_book` carries `ccy`, `fx_to_report` and `*_rep`
+columns; `book_greeks(book, mkt, report_ccy="USD")` returns already-converted Greeks; aggregating
+across pairs in native ccy is forbidden; `risk.fx_rate(ccy, report_ccy, mkt)` routes through USD and
+**raises** on a missing leg rather than defaulting to 1.0. Default `report_ccy` is **USD**
+(§10/Q-5, market standard, settled), with per-pair sub-totals in the pair's quote ccy underneath.
 
 **REQ-005 (S) — Keyboard-first navigation.**
 G: any page. W: the user presses `1`–`8`. T: the corresponding page loads; `r` refreshes the
@@ -145,13 +176,18 @@ crash.
 G: a surface and an RV series per pair. W: the page loads.
 T: for each pair a panel shows ATM implied at the tenor matching the RV horizon, the RV, the spread
 `σ_i − σ_r` in vol points, and its z-score over a user-set lookback (default 1y); the sign
-convention is stated on the panel ("positive = implied over realized = gamma expensive").
+convention is stated on the panel ("positive = implied over realized = gamma expensive"). This is a
+**relative** screen, so an `INDICATIVE` (ETF/CBOE) surface is a legitimate input here per REQ-068(d)
+— but the panel names the surface status it used, and where a `MARK` exists for the pair the
+richness is computed off the mark and the ETF basis (REQ-068(e)) is shown next to it.
 
 **REQ-010 (M) — Cross-pair richness table with ranking.**
 G: all pairs priced. W: the page loads.
 T: one row per pair with ATM 1M, RV21, spread, spread z, RR25 z, BF25 z, and a rank column; the
 table can be sorted and the top/bottom 3 by spread-z are highlighted; pairs with stale or missing
-inputs are greyed with the reason.
+inputs are greyed with the reason; a **surface-status column** shows `MARK` or `INDICATIVE` per pair
+(REQ-068(c)), because a richness ranking that mixes marked and unmarked pairs is comparing two
+different things and must say so.
 
 **REQ-011 (S) — RV–IV heat strip through time.**
 G: ≥1y of paired IV/RV history. W: the user picks a pair.
@@ -180,10 +216,12 @@ on the panel.
 ### 2.2 Page 2 — Vol Surface (`/surface`)
 
 **REQ-015 (M) — Surface build from broker-style quotes.**
-G: a provider that emits `list[SmileQuotes]` per pair. W: the user selects pair and method
+G: a provider that emits `list[SmileQuotes]` per pair — **the manual grid of REQ-068 first, then
+live, cache, synthetic** (arch AMENDMENT v1.2). W: the user selects pair and method
 ∈ {vanna_volga, sabr, interp}. T: `build_surface` is called and the 3-D surface (strike × tenor ×
 vol), the smile-by-tenor slice and the ATM term structure render; changing the method re-renders
-without a page reload and shows the method name on the figure.
+without a page reload and shows the method name **and the surface status (`MARK` / `INDICATIVE`,
+REQ-068(c)) with the quote source per tenor** on the figure.
 
 **REQ-016 (M) — Calibration residuals are visible.**
 G: a built surface. W: the page loads.
@@ -222,14 +260,27 @@ T: the panel returns vol, price in quote ccy and in pips and in % of base notion
 **REQ-022 (M) — Market gamma by strike.**
 G: CME settlement + open interest by strike for the pair's `cme_code`. W: the page loads.
 T: a bar chart shows open interest and estimated dealer gamma by strike for the front expiries, in
-the pair's quote convention (CME quotes USD per foreign ccy; inverted products must be converted
-and the conversion stated), with spot drawn as a vertical line.
+the pair's quote convention, with spot drawn as a vertical line. **Constraints settled in §10/Q-8
+(market standard, not taste), all mandatory and all displayed:** OI is shown **unsigned** — it
+carries no side tag, so no signed "dealer gamma" is printed; the **contract multiplier** is applied
+and stated (6E = EUR 125,000, 6B = GBP 62,500, **6J = JPY 12,500,000**, 6A/6C/6N = 100,000,
+6S = CHF 125,000) because OI in contracts is meaningless until multiplied; these are options **on
+futures**, so the futures→spot conversion is stated rather than assumed away; and inverting a quote
+is **not** a rescale — for a product quoted USD per JPY with `X = 1/F`,
+`d²V/dX² = F⁴·V_FF + 2F³·V_F`, i.e. the gamma conversion carries a **delta term**, and any adapter
+that scales gamma on inversion is wrong in a way nobody notices. The page is titled
+**"Listed positioning (indicative)"**. *MoSCoW unchanged in this pass: the trader's demotion of
+REQ-022/023/024 to Should is a priority ruling for the PM, recorded in §10/Q-8.*
 
 **REQ-023 (M) — Dealer-gamma sign assumption is explicit.**
 G: any market-gamma figure. W: the page loads.
-T: the sign convention and the assumption used to infer dealer positioning are printed on the
-figure ("assumes customers buy calls/puts as tagged; OI is not net dealer position"); no screen
-presents inferred dealer gamma as fact.
+T: **no signed dealer gamma is presented at all.** The previous acceptance criterion — printing the
+assumption "customers buy calls/puts as tagged" — is withdrawn: that is not an assumption but a
+placeholder, because open interest carries no side tag whatever (every contract has a buyer and a
+seller), and a signed chart with a caption underneath is read as the chart, not the caption
+(§10/Q-8, R-14). Instead the figure shows unsigned OI as a **strike-concentration and notional
+map**, states the multiplier and the futures→spot conversion used, and carries the words
+"open interest — not a dealer position" in the title, not in a footnote.
 
 **REQ-024 (M) — Expiry ladder.**
 G: CME/OI data. W: the page loads.
@@ -239,7 +290,9 @@ time and the number of business days to it.
 **REQ-025 (S) — Strike magnets / pin candidates.**
 G: OI by strike. W: the page loads.
 T: strikes holding > 5% of front-expiry OI within ±2% of spot are labelled as magnets, with
-distance in pips and %, and in **sigma-days** (`distance% / (100·σ_ATM/√365)`).
+distance in pips and %, and in **sigma-days** on the distance basis of §0
+(`distance% / sigma_day_move` with `sigma_day_move = 100·σ_ATM/√252` — **not** √365, which is the
+economics basis and overstates every distance by ~20%); the basis is printed on the panel.
 
 **REQ-026 (S) — My book overlaid on the market's gamma.**
 G: a non-empty book. W: the user toggles "overlay my book".
@@ -282,7 +335,9 @@ soft (row kept with `deleted_at`) so historical P&L snapshots remain reconstruct
 G: a book of ≤ 200 positions. W: the snapshot refreshes.
 T: `price_book` output renders one row per position with PV (quote ccy and reporting ccy), current
 vol used, `delta_base`, `Γ₁`, `ν`, `θ`, vanna, volga, days to expiry, and P&L since trade
-(`PV − premium_paid`); the whole table recomputes in < 500 ms (§6.1).
+(`PV − premium_paid`); the **vol used carries its surface status** (`MARK` / `INDICATIVE` /
+`user_override`, REQ-068(c)) in the row, so no PV is ever read without knowing whose vol produced
+it; the whole table recomputes in < 500 ms (§6.1).
 
 **REQ-033 (M) — CSV import with a preview gate.**
 G: a CSV per §3.5. W: the user uploads it.
@@ -302,11 +357,16 @@ daily breakeven and in θ; nothing is persisted; a Commit button on the same pan
 preview into a real trade.
 
 **REQ-036 (S) — Mark-vol override per position.**
-G: a position. W: the user sets a manual mark vol on it.
+G: a position already priced off the REQ-068 curve. W: the user sets a manual mark vol on that
+single position.
 T: the position prices off that vol, the row is badged `user_override`, and the P&L page shows
-"mark-to-my-vol vs mark-to-surface" as a separate line. **[CONTRACT-GAP-2]** `OptionPosition` is
-frozen and has no `mark_vol`; the override must be stored in a `store.py` side-table keyed by
-position `id`.
+"mark-to-this-position's-vol vs mark-to-the-curve" as a separate line.
+**[CG-2 RESOLVED — arch AMENDMENT v1.1]**: `OptionPosition` stays frozen; the override lives in a
+`store.py` `position_marks` side-table keyed on position `id` (`mark_vol`, `mark_source`, `asof`).
+*Priority note:* the trader review §3b asks to promote this to **M** on the grounds that "the
+trader's own mark is the book". That argument is now discharged by REQ-068 being a Must — the book
+is marked to the user's curve by default, and REQ-036 is the **per-position exception** on top of
+it, which is genuinely a Should. Recorded in §10 for the PM.
 
 **REQ-037 (S) — Book grouping and filters.**
 G: a book with tags. W: the user filters by pair / tag / expiry bucket / structure.
@@ -319,14 +379,28 @@ in the page header so no screen ever silently shows a subset.
 G: a non-empty book. W: the page loads.
 T: cards show PV, `delta_base` (per pair, in base ccy mm), `Γ₁` (base ccy mm per 1%), `ν` (per vol
 pt), `θ` (per calendar day), vanna, volga, and dual delta, each with its unit written on the card;
-per-pair values are in that pair's quote ccy, and the totals row is in the reporting currency with
-the conversion disclosed.
+per-pair values are in that pair's quote ccy, and the totals row is in the reporting currency
+(default USD) with the conversion disclosed. The totals row comes from
+`book_greeks(book, mkt, report_ccy=...)` per **[CG-1 RESOLVED]** — the page never sums native-ccy
+Greeks itself. **Acceptance (settled, §10/Q-5):** QA asserts that the per-pair sub-totals converted
+at the disclosed rate sum to the aggregate to §6.4 ε, on every monetary Greek — this is R-15
+promoted from a risk-register line to a test.
+*Open, not actioned in this pass:* trader review W-3 (aggregate `dual_delta` is meaningless and
+`types.py` now returns `nan` for it, arch v1.2/T-2 — so the card must render "n/a" and dual delta
+should be dropped from the aggregate card set), W-10 (single-number vega should be tenor-bucketed;
+the delta card must name its sticky convention) and MISS-10 (delta shown in base mm, USD equivalent
+and P&L-per-pip). All three are W-item corrections outside the T-5 assignment; recorded in §10.
 
 **REQ-039 (M) — Daily breakeven card.**
 G: `Γ₁`, `θ`, `S`. W: the page loads.
 T: a card shows the daily breakeven move per pair in % and in pips using the §0 identity, the
-number of realized-vol-implied sigma this represents (`BE% ÷ (100σ_r/√365)`), and the gamma/theta
-ratio `Γ$/|θ|`; for an ATM-only test book the value equals `σ_ATM/√365` to within ε.
+number of realized-vol-implied sigma this represents (`BE% ÷ (100σ_r/√365)`, economics basis), and
+a **dimensionless gamma/theta coverage ratio**
+`coverage = gamma_pnl(x_realized%) / |θ_to_next_mark|`, where `x_realized` is the last completed
+mark-to-mark spot move; `coverage = 1.0` exactly at breakeven and `= (σ_r/σ_i)²` for an ATM book.
+The superseded ratio `Γ$/|θ|` is **withdrawn**: `Γ$` is quote ccy per 1% and `θ` is quote ccy per
+day, so the quotient has units of days-per-percent and cannot be compared across pairs, which was
+its stated purpose (§4.1). For an ATM-only test book `BE_daily` equals `σ_ATM/√365` to within ε.
 
 **REQ-040 (M) — Spot ladder with sticky toggle.**
 G: a book and a pair. W: the user sets range and `sticky` ∈ {strike, delta, none}.
@@ -355,8 +429,17 @@ T: `hedge_bands` renders the upper/lower spot triggers, current delta vs. band, 
 next trigger in pips and %, the size that would be traded, and the estimated cost from
 `HedgeRule.cost_bp`; `hedge_suggestion` returns a `HedgeAction` shown as a one-line instruction
 ("SELL EUR 4.2mm at 1.0871 — delta 4.2mm vs band 2.5mm — est. cost USD 217").
-**[CONTRACT-GAP-3]** `hedge_bands(book, mkt, pair, *, gamma_budget)` takes no cost/rule argument;
-requesting it accept an optional `rule: HedgeRule`.
+**[CG-3 APPROVED — arch AMENDMENT v1.1]**:
+`hedge_bands(book, mkt, pair, *, gamma_budget=None, rule: HedgeRule | None = None)`; the cost-aware
+band maths lives in the library, never in `app/`.
+**Defaults (settled, §10/Q-2):** `mode="band"`, band expressed as **% of the pair's gross option
+notional, default 15%**, with a floor at the pair's minimum sensible clip (EUR 1mm / USD 1mm or
+equivalent), and **per-pair** transaction costs rather than one global `cost_bp` (0.2bp is right for
+EURUSD, ~2× too tight for AUD/NZD/CAD and 10–25× too tight for USDSEK/USDNOK). The trader's band in
+mm and pips per pair remains **[AWAITING USER]** (§10/Q-2). The `types.HedgeRule` defaults
+themselves are a contract matter (trader CR-1) and are not changed by this document.
+**Gate (REQ-068(c)):** no hedge instruction is issued off an `INDICATIVE` surface; the panel greys
+with the reason and names the acknowledgement that would re-enable it.
 
 **REQ-044 (M) — Expiry ladder and cut clock.**
 G: options with mixed expiries and cuts. W: the page loads.
@@ -364,20 +447,203 @@ T: a table lists each expiry with cut, the exact cut instant in the user's timez
 own timezone, a live countdown, notional and `Γ₁` expiring, and θ released after that expiry;
 `conventions.expiry_datetime` is the single source of the instant.
 
-**REQ-045 (M) — Pin risk panel.**
-G: options with ≤ 3 business days to expiry. W: the page loads.
-T: `pin_risk` renders per strike: distance in pips and %, notional at that strike, `Γ₁` at the cut,
-the **delta discontinuity inherited at expiry** (`Σ direction·cp·notional_base` for strikes crossed),
-and P(finish within ±k pips of the strike) for k ∈ {10, 25, 50} (JPY-scaled); strikes within 0.5
-sigma-days of spot are highlighted red.
+**REQ-045 (M) — Pin risk panel. Three deltas per strike, never one number.**
+G: options with ≤ 3 business days to the cut (the panel arms at T-3bd; §10/Q-9). W: the page loads.
+T: `pin_risk(book, mkt, pair)` returns one row per **(pair, strike, cut)** carrying, in this order:
+distance in pips and %, distance in **sigma-days** (`sigma_day_move`, √252 basis, §0), notional at
+that strike, `Γ₁` at the cut, then the **three separately labelled delta numbers**
+`delta_if_above`, `delta_if_below` and `delta_now`, then the two derived numbers `jump_at_strike`
+and the pair `hedge_if_above` / `hedge_if_below`, all defined normatively below; then
+P(finish within ±k pips of the strike) for k ∈ {10, 25, 50} (JPY-scaled). Strikes within 0.5
+sigma-days of spot are highlighted red. **No column, tooltip, label or return field may be called
+"the delta discontinuity"**, and no single number may stand in for the three: the panel fails
+review if it prints one delta at a strike. Escalation (§10/Q-9): the panel promotes itself to a
+page-level banner inside 24h of the cut and to a header line inside 2h; the header carries a live
+countdown to the next NY10 and the next TKY15 whenever the book holds a position at that cut.
+
+**Normative derivation for REQ-045 — pin-risk deltas** (binding on `fxgamma/portfolio/zones.py`,
+which is being implemented concurrently; if the code and this block disagree, this block wins and
+the difference is a defect).
+
+*Setup.* Fix one strike `K` at one cut. Let `O(K)` be the options at that strike and cut. Option
+`i` has direction `dᵢ ∈ {+1,−1}` (long/short), `cpᵢ ∈ {+1,−1}` (call/put on the **base** ccy) and
+base notional `Nᵢ > 0`. All deltas below are in **base ccy**, signed **`+` = long base** (the
+`Greeks.delta_base` convention of arch §3: the base-ccy amount you would sell to be flat).
+
+*Step 1 — what you inherit.* A European option is exercised iff it is ITM at the cut: a call iff
+`S_T > K`, a put iff `S_T < K`. Exercising a **bought call** delivers `+N` of base (you buy the
+base); exercising a **bought put** delivers `−N` (you sell it). So the spot position inherited from
+option `i` is a step function of the fixing:
+
+```
+inherit_i(S_T) = dᵢ · cpᵢ · Nᵢ · 1{i is ITM at S_T}
+```
+
+Above `K` only the calls are ITM; below `K` only the puts are. Therefore
+
+```
+delta_if_above(K) =  Σ over calls at K   of  dᵢ·Nᵢ        (puts contribute exactly 0)
+delta_if_below(K) = −Σ over puts  at K   of  dᵢ·Nᵢ        (calls contribute exactly 0)
+```
+
+*Step 2 — the discontinuity is the difference of those two, and the `cp` cancels.*
+
+```
+jump_at_strike(K) = delta_if_above(K) − delta_if_below(K)
+                  = Σ over ALL options at K of dᵢ·Nᵢ      <- independent of cpᵢ
+```
+
+Crossing `K` upward, a long call goes `0 → +N` (gain `+N`) and a long put goes `−N → 0` (also gain
+`+N`). Both are `+dᵢ·Nᵢ`. **This is why the correct discontinuity carries no `cp` factor.** The
+superseded text used `Σ direction·cp·notional_base` — which is the *inherited-if-ITM* delta of
+Step 1, a different quantity, and which returns the **wrong sign for every put** when read as a
+discontinuity.
+
+*Step 3 — the delta you have right now.* Let `δᵢ(S,T,σ)` be the **plain spot delta per unit of base
+notional**, sign included: `e^{−r_f T}·N(d₁)` for a call, `−e^{−r_f T}·N(−d₁)` for a put. Then
+
+```
+delta_now(K) = Σ over options at K of dᵢ·Nᵢ·δᵢ
+```
+
+As `T → 0`, `δᵢ → cpᵢ·1{ITM}` away from the strike and `→ ±0.5` exactly at it, so `delta_now` is
+always bracketed by `delta_if_below ≤ delta_now ≤ delta_if_above` (for a book long at that strike).
+`delta_now` is what you are **hedged to**; it is not what you inherit.
+
+*Step 4 — the two numbers that are actually actionable at 09:55 NY.*
+
+```
+hedge_if_above(K) = delta_if_above(K) − delta_now(K)      (+ ⇒ you must SELL that much base)
+hedge_if_below(K) = delta_if_below(K) − delta_now(K)      (− ⇒ you must BUY  that much base)
+hedge_if_above − hedge_if_below = jump_at_strike          (invariant; QA asserts it)
+```
+
+*Convention, binding.* All five quantities use the **plain (unadjusted) spot delta**, never the
+premium-adjusted one, even on `spot_pa` pairs. Premium adjustment nets the option's *current
+premium* out of the quoted delta; it is a quoting convention, whereas the inherited spot position is
+a delivery fact and carries no premium term (and at the cut the premium has collapsed to intrinsic
+anyway). The pa delta may be displayed alongside, explicitly labelled per REQ-017, but must not
+enter `delta_now`, the step or the hedge numbers.
+
+**Worked example A — long call (EURUSD).** One long EURUSD call, `K = 1.0900`, NY10 cut,
+`N = EUR 10mm`, `d = +1`, `cp = +1`. Spot `S = 1.0895` (5 pips **below** the strike), 1 hour to the
+cut so `T = 1/8760 = 1.14155e-4` yr, `σ = 7.00%`, `r_d = r_f = 0` (over one hour the discount
+factors differ from 1 by < 1e-5 and are immaterial to the illustration).
+
+| Quantity | Working | Value |
+|---|---|---|
+| `σ√T` | `0.0700 × 0.0106843` | `7.479e-4` |
+| `d₁` | `ln(1.0895/1.0900)/σ√T + 0.5·σ√T = −4.5882e-4/7.479e-4 + 3.74e-4` | `−0.6131` |
+| `δ` (call) | `N(−0.6131)` | `0.2699` |
+| `delta_now` | `+1 × 10mm × 0.2699` | **EUR +2.70mm** |
+| `delta_if_above` | `Σ calls d·N = +1 × 10mm` | **EUR +10.00mm** |
+| `delta_if_below` | no puts at this strike | **EUR 0.00mm** |
+| `jump_at_strike` | `10.00 − 0.00` (= `Σ d·N` = `+1×10mm`) | **EUR +10.00mm** |
+| `hedge_if_above` | `10.00 − 2.70` | **SELL EUR 7.30mm** |
+| `hedge_if_below` | `0.00 − 2.70` | **BUY EUR 2.70mm** |
+
+**Worked example B — long put (USDJPY). This is the case the superseded formula got backwards.**
+One long **USD put** on USDJPY, `K = 147.00`, NY10 cut, `N = USD 20mm` (base = USD, arch §2),
+`d = +1`, `cp = −1`. Spot `S = 147.05` (5 pips **above** the strike, pip = 0.01), 1 hour to the cut,
+`σ = 9.00%`, `r_d = r_f = 0`.
+
+| Quantity | Working | Value |
+|---|---|---|
+| `σ√T` | `0.0900 × 0.0106843` | `9.616e-4` |
+| `d₁` | `ln(147.05/147.00)/σ√T + 0.5·σ√T = 3.4008e-4/9.616e-4 + 4.81e-4` | `+0.3541` |
+| `δ` (put) | `−N(−0.3541)` | `−0.3616` |
+| `delta_now` | `+1 × 20mm × (−0.3616)` | **USD −7.23mm** (short USD) |
+| `delta_if_above` | no calls at this strike | **USD 0.00mm** |
+| `delta_if_below` | `−Σ puts d·N = −(+1 × 20mm)` | **USD −20.00mm** |
+| `jump_at_strike` | `0.00 − (−20.00)` (= `Σ d·N` = `+1×20mm`) | **USD +20.00mm** |
+| `hedge_if_above` | `0.00 − (−7.23)` | **BUY USD 7.23mm** |
+| `hedge_if_below` | `−20.00 − (−7.23)` | **SELL USD 12.77mm** |
+
+Note the sign: the jump is **`+20mm`, positive**, exactly as for the long call in example A — spot
+crossing a strike upward always *gains* `Σ d·N` of delta. The superseded formula
+`Σ direction·cp·notional_base` returns **`−20mm`** here, i.e. the correct magnitude with the wrong
+sign, so a trader hedging off it would trade **USD 40mm the wrong way** into the cut. That is the
+single most expensive error in the previous revision.
+
+**QA fixtures (REQ-045).** (i) Single long put, `N`, spot walked across `K`: assert
+`jump_at_strike = +N`, `delta_if_above = 0`, `delta_if_below = −N`, and `delta_now → −N` as
+`S → K⁻`, `→ 0` as `S → K⁺`. (ii) Single short call, `d = −1`: assert `jump_at_strike = −N`.
+(iii) A long straddle at one strike (`+1` call and `+1` put, same `N`): assert
+`delta_if_above = +N`, `delta_if_below = −N`, `jump_at_strike = +2N`. (iv) Invariant
+`hedge_if_above − hedge_if_below = jump_at_strike` on the demo book, to < 1e-9 relative.
+(v) Both worked examples above reproduce to the printed precision.
 
 **REQ-046 (M) — Decay path ("what if I do nothing").**
 G: a book. W: the user opens the decay panel.
-T: `time_decay` renders PV and cumulative θ day by day to the last expiry with spot and surface
-frozen; the path is drawn under three realized-vol assumptions (0, implied, current RV21) using the
-delta-hedged identity `0.5·Γ$·(σ_r² − σ_i²)·Δt`; weekends and holidays use the decay weights of
-§4.6 and the weighting scheme in force is named on the figure. **[CONTRACT-GAP-4]** `time_decay`
-exposes no calendar/weighting argument.
+T: `time_decay(book, mkt, days=range(0,31), *, weights=None, calendar="calendar")`
+(**[CG-4 APPROVED — arch AMENDMENT v1.1]**, calendar time is the default and business/event
+weighting is opt-in and badged) renders PV and cumulative θ day by day to the last expiry with spot
+and surface frozen; the path is drawn under three realized-vol assumptions (`σ_r = 0`,
+`σ_r = σ_i`, `σ_r = RV21`) using the **delta-hedged carry identity below** —
+`dhedge_pnl = 50·Γ₁·S·(σ_r² − σ_i²)·Δt_years`, **not** `0.5·Γ$·(…)·Δt`, which is out by a factor of
+100; weekends and holidays use the decay weights of §4.6 and the weighting scheme in force is named
+on the figure. The identity is computed by the single §0 helper and never restated in `app/`.
+
+**Normative derivation for REQ-046 / REQ-064 — the delta-hedged carry identity.**
+
+*Definitions (§0).* `Γ = ∂delta_base/∂S`; `Γ₁ = Γ·0.01·S` (base ccy, **per 1% move**);
+`Γ$ = Γ₁·S` (quote ccy, **per 1% move**); `Γ_S² = Γ·S²` (quote ccy, cash gamma).
+
+*The scaling that was missed.* From `Γ₁ = Γ·0.01·S`:
+
+```
+Γ = Γ₁ / (0.01·S)        ⇒        Γ·S² = Γ₁·S / 0.01 = 100·Γ₁·S = 100·Γ$
+```
+
+*The identity.* The P&L of a continuously delta-hedged option book over `Δt`, spot and surface
+otherwise frozen, with spot realizing `σ_r` against a book marked at `σ_i`, is the standard
+`0.5·Γ·S²·(σ_r² − σ_i²)·Δt`. Substituting `Γ·S² = 100·Γ$`:
+
+```
+dhedge_pnl = 0.5 · Γ_S² · (σ_r² − σ_i²) · Δt_years
+           = 50  · Γ$   · (σ_r² − σ_i²) · Δt_years          <- the form to implement
+           = 50  · Γ₁·S · (σ_r² − σ_i²) · Δt_years
+```
+
+The published constant was `0.5` against `Γ$`; the correct constant against `Γ$` is **50**. The
+document's definition of `Γ$` is the one that stands (it is used by §0, REQ-039 and §4.1); only the
+constant moves. **`Δt` is in YEARS** (this was also unstated): one calendar day is `1/365`, and
+where two marks are not a whole day apart the elapsed-wall-clock convention of REQ-051 applies —
+`Δt_years = (t₁ − t₀)/365 days`.
+
+*Consistency with §0 (one helper, not two).* Splitting the identity into its two halves:
+
+```
+gamma P&L over Δt at realized σ_r   =  50·Γ$·σ_r²·Δt_years
+gamma-theta bill over Δt at σ_i     =  50·Γ$·σ_i²·Δt_years   =  |θ_gamma| · (365·Δt_years)
+```
+
+Setting them equal and solving for the daily move reproduces `BE_daily = σ_i/√365` exactly, i.e.
+the §0 breakeven identity and this identity are the same equation and must share one implementation.
+
+**Worked example (developers: unit-test against these numbers).** EURUSD 1M ATM straddle, **long
+EUR 10mm per leg**, `S = K = 1.0850`, `T = 30/365 = 0.0821918` yr, `r_d = r_f = 0`, `σ_i = 7.05%`.
+
+| Quantity | Working | Value |
+|---|---|---|
+| `σ√T` | `0.0705 × 0.2866911` | `0.0202117` |
+| `d₁` (ATMF) | `0.5·σ√T` | `0.0101059` |
+| `n(d₁)` | standard normal pdf | `0.3989219` |
+| `Γ` (book, 2 legs) | `2 × 10mm × n(d₁)/(S·σ√T) = 2 × 10mm × 18.1909` | `EUR 363.82mm per 1.0 of spot` |
+| `Γ₁` | `Γ · 0.01 · S` | **`EUR 3.94743mm` per 1%** |
+| `Γ$` | `Γ₁ · S` | **`USD 4.28296mm` per 1%** |
+| `Γ_S²` | `Γ·S² = 100·Γ$` | **`USD 428.296mm`** |
+| `θ_gamma` | `−0.5·Γ_S²·σ_i² / 365` | **`−USD 2,916` per calendar day** |
+| `BE_daily` | `σ_i/√365 = 0.3690%` | **`40.0 pips`** |
+| **1 day at `σ_r` = 9.00%** | `50 × 4.28296e6 × (0.09² − 0.0705²) × (1/365)` | **`+USD 1,836`** |
+| same, superseded formula | `0.5 × 4.28296e6 × 0.00312975 × (1/365)` | `+USD 18.36` ← the 100× tell |
+
+**QA (REQ-046).** (a) At `σ_r = σ_i` the delta-hedged path is identically zero and the PV path
+equals the pure-theta path to ε — i.e. cumulative gamma P&L over `n` days equals `n·|θ_gamma|` to
+< 1e-6 relative. (b) `gamma_pnl(BE_daily) = |θ| ` to < 1e-6 relative (this ties §0, REQ-039 and
+REQ-046 to one helper). (c) The worked example above reproduces `Γ₁`, `Γ$`, `θ_gamma`, `BE_daily`
+and the `+USD 1,836` to the printed precision. (d) A regression test asserts the constant is `50`
+against `Γ$` and `0.5` against `Γ_S²`, so the factor-100 slip cannot return.
 
 **REQ-047 (S) — Worst case / stop-out.**
 G: a book and a user-set stop loss. W: the page loads.
@@ -408,13 +674,30 @@ decomposition, with the triangle identity printed.
 **REQ-051 (M) — Daily attribution waterfall.**
 G: two stamped snapshots t0, t1 and the hedges traded between them. W: the page loads.
 T: `daily_pnl` renders a waterfall with delta, gamma, theta, vega, vanna, volga, rates, carry,
-hedge and unexplained, summing exactly to `total` (to ε), in the reporting currency, with the two
-snapshot timestamps and the trading-day boundary (default 17:00 New York) stated.
+hedge and unexplained, summing exactly to `total` (to ε), in the reporting currency (converted per
+**[CG-1 RESOLVED]**, default USD, per-pair sub-totals in quote ccy and QA-asserted to sum to the
+aggregate), with the two snapshot timestamps and the trading-day boundary stated.
+**Settled defaults (§10/Q-1, market standard):** the official FX day rolls at
+**17:00 America/New_York** — the value-date roll, not London close and not midnight. The app stores
+**two** snapshots a day: `EOD` (17:00 NY, official, immutable) and `AM` (a user-triggered morning
+working mark). **Theta and carry are charged over the actual elapsed wall-clock between the two
+snapshot timestamps, never over an integer number of days**, and the elapsed period is printed on
+the waterfall ("mark to mark: 14h 12m"). A London morning mark is ~14 hours after the NY close, so
+charging a full calendar day of theta into it puts the theta bar ~40% out and pushes the error into
+`unexplained`, which then trips REQ-052 for the wrong reason and teaches the user to ignore the
+residual alarm. `Δt_years = elapsed/365 days` feeds the §0 helper unchanged.
+**[AWAITING USER]** whether the official cut is 17:00 NY or an internal firm cut, and whether the AM
+mark is persisted or scratch (§10/Q-1).
 
-**REQ-052 (M) — Unexplained is policed.**
-G: an attribution. W: `|unexplained| / (Σ|components|) > 5%`.
-T: the residual is highlighted red with the message "attribution does not fit — check marks or
-re-taylor", and a diagnostic panel lists the three positions contributing most to the residual.
+**REQ-052 (M) — Unexplained is policed, and always displayed.**
+G: an attribution. W: the page loads.
+T: `|unexplained| / (Σ|components|)` is shown as a number **on every attribution, every day**, not
+only when it breaches — a threshold that speaks only when it is already broken teaches nothing, and
+the trader's first trust check is watching the residual drift **before** it breaches (§10/Q-10).
+Reference bands printed next to it: **< 1% overnight on a clean vanilla book with a good mark**,
+**< 2–3% on a day with a large smile move**. When it exceeds the alarm threshold of **5%** the
+residual is highlighted red with the message "attribution does not fit — check marks or re-taylor",
+and a diagnostic panel lists the three positions contributing most to the residual.
 
 **REQ-053 (M) — Per-position attribution.**
 G: an attribution. W: the user expands the waterfall.
@@ -424,15 +707,23 @@ and totals reconciling to the aggregate waterfall.
 **REQ-054 (M) — Cumulative P&L and drawdown.**
 G: ≥ 2 stored daily marks. W: the page loads.
 T: a cumulative line by component plus a drawdown sub-panel; the series is rebuilt from stored
-snapshots (not recomputed against today's surface), so history is stable.
+snapshots and the marks in force at the time (not recomputed against today's surface), so history is
+stable. **Settled (§10/Q-10, check 1):** the stability is not an internal invariant but a
+**displayed reconciliation line** — "yesterday's published PV vs yesterday's PV recomputed now:
+0.00" — shown on the page every day. If yesterday's P&L can move overnight the user stops reading
+the page permanently, so the proof belongs on the screen, not only in the test suite.
 
 **REQ-055 (M) — Hedge log.**
 G: spot positions tagged `hedge`. W: the page loads.
 T: each hedge is listed with timestamp, pair, size, rate, the pre- and post-hedge delta, the spot at
 the moment of the hedge, estimated cost, and its realized contribution; the log totals reconcile to
-the `hedge` bar in the waterfall. **[CONTRACT-GAP-5]** `SpotPosition.trade_date` is a `date`, so
-two hedges on the same day cannot be ordered or timestamped; intraday hedge logging needs a
-datetime (side-table in `store.py` if the dataclass stays frozen).
+the `hedge` bar in the waterfall. **[CG-5 RESOLVED — arch AMENDMENT v1.1, already applied in
+`types.py`]**: `trade_time: datetime | None = None` (UTC) exists on **both** `SpotPosition` **and**
+`OptionPosition`, appended last so construction stays backward-compatible; no side-table is needed.
+The hedge log **orders by `trade_time`, falling back to `trade_date`** where it is absent, and rows
+lacking a time are marked as such rather than silently ordered by insertion. Because `trade_time` is
+now a field on both position types, REQ-034's field-by-field round-trip requires it in the CSV
+schema — see §3.5.
 
 **REQ-056 (S) — Gamma P&L vs. theta bill scoreboard.**
 G: an attribution history. W: the user selects a window.
@@ -448,7 +739,9 @@ dS and dσ used printed, so smile P&L is never buried inside "vega".
 **REQ-058 (C) — Mark-to-surface vs. mark-to-my-vol.**
 G: positions with mark-vol overrides (REQ-036). W: the page loads.
 T: a line shows the P&L difference between the two marks, so the trader sees exactly what their
-override is worth.
+override is worth; where the pair also has an `INDICATIVE` surface, a second line shows
+**mark-to-my-curve vs mark-to-ETF** (the basis of REQ-068(e) expressed in P&L), which is the number
+that says what the ETF proxy would have cost had it been believed.
 
 ### 2.7 Page 7 — Signals & Backtest (`/lab`)
 
@@ -483,8 +776,9 @@ documented defaults per pair; changing them re-runs and the delta in net P&L is 
 
 **REQ-064 (S) — Realized-vs-implied P&L decomposition of the backtest.**
 G: a delta-hedged straddle run. W: results render.
-T: P&L is decomposed into `Σ 0.5·Γ$·(σ_r² − σ_i²)·Δt` plus hedge slippage plus discretisation
-error, and the three sum to the simulated P&L within ε.
+T: P&L is decomposed into `Σ 50·Γ$·(σ_r² − σ_i²)·Δt_years` (the REQ-046 identity, same helper,
+same 50 — **not** `0.5·Γ$`, see §2.5) plus hedge slippage plus discretisation error, and the three
+sum to the simulated P&L within ε.
 
 **REQ-065 (S) — Regime and event conditioning.**
 G: a completed run. W: the user groups by regime tag (REQ-013) or by event/non-event days.
@@ -504,10 +798,72 @@ G: `--provider synthetic|live`. W: the user switches in the UI.
 T: the snapshot is rebuilt from the chosen provider, every page restamps, and a confirmation is
 required when switching *to* synthetic while a real book is loaded.
 
-**REQ-068 (M) — Manual overrides.**
-G: any pair/tenor/rate. W: the user enters an override value.
-T: the value is used everywhere downstream, is badged `user_override` with the user's note, is
-listed on a single "active overrides" panel, and can be cleared individually or all at once.
+**REQ-068 (M) — Manual mark grid: the primary pricing input.**
+*(Re-prioritised by arch AMENDMENT v1.2/T-1, binding. This is no longer "manual overrides", a
+buried fallback on page 8; it is the input the book is marked off. Trader review §1.4 and Q-3: with
+no free OTC vol surface, ETF-implied vol is never a mark, and a tool that cannot be marked to the
+desk's own curve will not be used to hedge. Build priority: this requirement precedes every other
+analytic that consumes a surface.)*
+
+G: the **top panel of page 8** (`/data`), mirrored on page 2 (`/surface`) so the trader can mark and
+inspect the smile without changing page. W: the user types or pastes a per-pair, per-tenor grid of
+**ATM / 25d RR / 25d BF** (10d RR/BF optional columns, blank = not supplied, never inferred) and
+presses **Mark**. T, all clauses machine-checkable:
+
+**(a) The grid and the 30-second budget.** Rows are `conventions.TENORS` (ON/1W/2W/1M/2M/3M, plus
+6M/1Y where the user trades them), columns are the three (or five) quotes, one grid per pair.
+Values accept `7.05` or `0.0705` per V-10 and are stored as decimals. Paste accepts a tab- or
+comma-separated block from a broker run, a chat window or a spreadsheet; `Tab`/`Enter` traverse
+cells; there is no modal dialog on the marking path. **Marking the whole G3 book (3 pairs × 6
+tenors × 3 quotes) must be completable in under 30 seconds**, asserted as a QA task (§6.1) with a
+scripted paste of three blocks, measured from first keystroke to `MARK` status on all three pairs.
+Per-cell validation: V-10 vol range; `|RR25| ≤ 3·ATM` (W); `BF25 ≥ 0` (W); ATM monotonic-in-tenor
+violations flagged (W, not blocked — kinks are real, §4.6). An invalid cell blocks only its own
+tenor, never the whole grid.
+
+**(b) Resolution order — manual wins, always.** The provider chain is
+**manual → live → cache → synthetic** (`ManualQuoteProvider`, `fxgamma/data/manual.py`, arch
+AMENDMENT v1.2). A manual mark is **never overwritten by a live pull**: not by Refresh (REQ-001),
+not by a provider toggle (REQ-067), not by a cache warm, not by a session restart. It is removed
+only by an explicit Clear (per cell / per pair / all), and Clear is confirmed. QA fixture: set a
+manual mark, force a successful live pull that returns a different vol, assert the priced book is
+unchanged and the badge still reads `user_override`.
+
+**(c) Surface status, and what it gates.** Every surface carries a two-tier status, badged on every
+number derived from it (REQ-002):
+- **`MARK`** — built from this grid via `SmileQuotes` → `build_surface` (arch §8), unchanged.
+- **`INDICATIVE`** — built from ETF chains, CBOE indices, CME settlements or the synthetic provider.
+`MARK` is required for the two irreversible outputs: **REQ-043 issues no hedge instruction** and
+**REQ-051 publishes no official mark** off an `INDICATIVE` surface — both are greyed with the reason
+stated, and are re-enabled only by marking the pair or by a once-per-session explicit
+acknowledgement that is recorded in the snapshot and printed on the output.
+
+**(d) ETF and CBOE vols are demoted, permanently.** ETF-implied and CBOE index vols are **z-score,
+cone, term-shape and richness inputs only** (REQ-009, REQ-010, REQ-011, REQ-018, REQ-019 and the
+Lab) and are **never the mark** for PV, delta, hedge size, P&L or attribution. Any screen that
+prices the book off an `INDICATIVE` surface says so in words, not only by colour (§5.7).
+
+**(e) The basis is its own series.** Where a pair/tenor has both a manual mark and a live
+(ETF/CBOE/CME) quote, both are retained and **`basis = indicative − mark`** is displayed in vol
+points per pair and per tenor, with its own history. This is the honest measure of how far the
+indicative path can be trusted, and it is what makes R-6 measurable rather than merely disclosed.
+
+**(f) The other overrides, and where they live.** The same mechanism carries **spot**, **rate /
+forward-point** and per-position mark-vol (REQ-036) overrides. The **spot override box lives on the
+Risk page** (page 5) with a single-key shortcut as well as on page 8 — with 15-minute-delayed free
+data (R-2) the first thing the user does is correct spot to a dealable price, and making that a
+page-8 round trip means it does not happen (trader review Q-10). Overriding spot restamps every
+downstream number in place and badges it.
+
+**(g) Provenance, staleness and audit.** Every manual value is badged `user_override` (blue, §5.2)
+with the user's optional note, the entry timestamp and the `mark_version`; all active overrides are
+listed on one "active overrides" panel with per-item and global Clear. A manual mark **ages**: past
+the trading-day boundary (§5.5), or more than 12 hours old, it is badged amber "stale mark" and the
+Mark panel prompts for a re-mark; it is never silently dropped or replaced by live.
+
+**(h) Marks are versioned with the snapshot.** Each `Mark` writes an immutable, timestamped grid
+version to SQLite (§5.6) and is stamped into the snapshot, so REQ-054 rebuilds history from the mark
+that was **in force at the time** and yesterday's P&L cannot move (trader review Q-10, check 1).
 
 **REQ-069 (M) — Cache control.**
 G: a populated cache. W: the user views the page.

@@ -45,7 +45,7 @@ import math
 from typing import Any, Final
 
 import numpy as np
-from scipy.special import erf, erfinv
+from scipy.special import erfc, erfcinv
 
 from ..types import Greeks
 
@@ -53,6 +53,7 @@ __all__ = [
     "gk_price", "gk_greeks", "gk_greeks_array", "implied_vol",
     "strike_from_delta", "delta_from_strike", "forward", "d1_d2",
     "no_arb_bounds", "DELTA_CONVENTIONS", "SQRT_2PI",
+    "pa_call_delta_peak", "max_attainable_delta",
 ]
 
 SQRT_2PI: Final[float] = math.sqrt(2.0 * math.pi)
@@ -83,13 +84,43 @@ def _norm_pdf(x: np.ndarray | float) -> np.ndarray | float:
 
 
 def _norm_cdf(x: np.ndarray | float) -> np.ndarray | float:
-    """Standard normal cdf via ``erf``; ~1e-16 accurate, vectorised."""
-    return 0.5 * (1.0 + erf(np.asarray(x, dtype=float) * _INV_SQRT2))
+    """Standard normal cdf, vectorised, **accurate in the lower tail**.
+
+    Computed as ``0.5 erfc(-x / sqrt(2))`` and *not* as ``0.5 (1 + erf(x/sqrt(2)))``.
+    The two are algebraically identical and differ catastrophically in floating
+    point: for ``x < -8`` the ``erf`` spelling loses the whole tail to the
+    cancellation ``1.0 + (-1.0)`` and returns **exactly 0.0** from about
+    ``x = -8.3`` down, where the true value is ``N(-8.3) = 5.2e-17`` and
+    ``N(-20) = 2.8e-89``.
+
+    That underflow is not cosmetic.  ``N(d2)`` is the whole content of the
+    premium-adjusted delta ``(K/S) e^{-rd T} N(d2)`` and of ``d/dK[K N(d2)]``,
+    so a spurious exact zero there turns a strictly-negative quantity into a tie
+    at 0.0 and lets a ``>=`` comparison pick the wrong branch -- which is exactly
+    how :func:`pa_call_delta_peak` used to return its bracket edge and make
+    every premium-adjusted call strike solve return ``nan``.  ``erfc`` stays
+    accurate to ~1e-300, so the wing quantities keep their sign down to where
+    the *inputs* themselves underflow (|x| ~ 37).
+
+    See also :func:`_norm_ppf`, which has the mirror-image problem.
+    """
+    return 0.5 * erfc(-np.asarray(x, dtype=float) * _INV_SQRT2)
 
 
 def _norm_ppf(p: np.ndarray | float) -> np.ndarray | float:
-    """Inverse standard normal cdf, machine accurate, via ``erfinv``."""
-    return math.sqrt(2.0) * erfinv(2.0 * np.asarray(p, dtype=float) - 1.0)
+    """Inverse standard normal cdf, vectorised, **accurate in the lower tail**.
+
+    ``-sqrt(2) erfcinv(2 p)`` rather than ``sqrt(2) erfinv(2 p - 1)``: the latter
+    forms ``2p - 1``, which rounds to exactly ``-1.0`` for ``p <= 1e-17`` and so
+    returns ``-inf`` -- silently sending :func:`strike_from_delta` to ``K = inf``
+    for any delta below ~1e-17 instead of a finite deep-wing strike.  ``erfcinv``
+    keeps ``p`` as-is and stays accurate to ``p ~ 1e-300``.
+
+    The *upper* tail (``p -> 1``) still loses precision the same way, but every
+    caller here passes a delta-like target well below 1, so the accurate branch
+    is the one that matters.
+    """
+    return -math.sqrt(2.0) * erfcinv(2.0 * np.asarray(p, dtype=float))
 
 
 def _scalarise(x: Any, *inputs: Any) -> Any:
@@ -472,18 +503,19 @@ def delta_from_strike(K: Any, S: Any, T: Any, rd: Any, rf: Any, sigma: Any, cp: 
     d1, d2, _ = d1_d2(S_, K_, T_, rd_, rf_, sg_)
     Tpos = np.maximum(T_, 0.0)
     dfd, dff = np.exp(-Tpos * rd_), np.exp(-Tpos * rf_)
+    Sg = np.maximum(S_, 1e-300)          # matches gk_greeks_array; S <= 0 is caller error
     if conv == "spot":
         out = cp_ * dff * _norm_cdf(cp_ * d1)
     elif conv == "fwd":
         out = cp_ * _norm_cdf(cp_ * d1)
     elif conv == "spot_pa":
-        out = cp_ * (K_ / S_) * dfd * _norm_cdf(cp_ * d2)
+        out = cp_ * (K_ / Sg) * dfd * _norm_cdf(cp_ * d2)
     else:  # fwd_pa
-        out = cp_ * (K_ / S_) * (dfd / dff) * _norm_cdf(cp_ * d2)
+        out = cp_ * (K_ / Sg) * (dfd / dff) * _norm_cdf(cp_ * d2)
     return _scalarise(out, S_, K_, T_, rd_, rf_, sg_, cp_)
 
 
-def _pa_call_delta_peak(S: float, T: float, rd: float, rf: float, sigma: float) -> float:
+def pa_call_delta_peak(S: float, T: float, rd: float, rf: float, sigma: float) -> float:
     """Strike at which the premium-adjusted **call** delta is maximal.
 
     ``Delta_pa_call(K) = (K/S) e^{-rd T} N(d2(K))`` tends to 0 at *both* ends of the
@@ -509,10 +541,16 @@ def _pa_call_delta_peak(S: float, T: float, rd: float, rf: float, sigma: float) 
         return math.exp(lo)
     if g(hi) > 0.0:          # genuinely still increasing at the right edge
         return math.exp(hi)
-    # NB: strict `>`.  Far out of the money both N(d2) and phi(d2) underflow to
-    # exactly 0.0, so g(hi) == 0.0 there; treating that tie as "still increasing"
-    # would return the right-hand bracket edge as the peak and poison the Brent
-    # bracket below, making every premium-adjusted call delta unsolvable (nan).
+    # NB: strict `>`, and it must stay strict.  Beyond |d2| ~ 37 both N(d2) and
+    # phi(d2) underflow to exactly 0.0, so g(hi) == 0.0 there.  Reading that tie
+    # as "still increasing" returns the right-hand bracket edge as the peak and
+    # poisons the Brent bracket below, making every premium-adjusted call delta
+    # unsolvable (nan) -- which took out the USDJPY/USDCHF/USDCAD/USDSEK/USDNOK
+    # surfaces wholesale.  Since _norm_cdf now goes through erfc, N(d2) keeps its
+    # sign down to ~1e-300 instead of dying at d2 = -8.3, so g is genuinely
+    # negative (not tied) over the whole useful range and the tie is confined to
+    # true double-underflow.  Both defences are needed: the accurate tail and the
+    # strict comparison.
     for _ in range(200):
         mid = 0.5 * (lo + hi)
         if g(mid) > 0.0:     # still increasing -> peak is to the right
@@ -520,6 +558,32 @@ def _pa_call_delta_peak(S: float, T: float, rd: float, rf: float, sigma: float) 
         else:
             hi = mid
     return math.exp(0.5 * (lo + hi))
+
+
+def max_attainable_delta(S: float, T: float, rd: float, rf: float, sigma: float,
+                         cp: int = 1, convention: str = "spot_pa") -> float:
+    """Largest ``|delta|`` any strike can produce in ``convention`` for this ``cp``.
+
+    For every convention except the premium-adjusted **call** the delta map is
+    monotone and the supremum is the trivial one (``e^{-rf T}`` for ``spot``,
+    ``1`` for ``fwd``, ``+inf`` in strike for a ``_pa`` put), so this is only
+    interesting -- and only ever binding -- for a premium-adjusted call, where the
+    attainable maximum is reached at :func:`pa_call_delta_peak` and is frequently
+    **below the 25 delta a broker is quoting** at long tenors / high vols.
+
+    :func:`strike_from_delta` returns ``nan`` above this value rather than a wrong
+    root.  Surfaces should call this before asking for a wing strike; the app must
+    show "unattainable" rather than an empty cell.
+    """
+    conv = str(convention).lower()
+    if conv not in DELTA_CONVENTIONS:
+        raise ValueError(f"convention must be one of {DELTA_CONVENTIONS}, got {convention!r}")
+    if int(np.sign(cp)) < 0 or not conv.endswith("_pa"):
+        return float(math.exp(-rf * max(T, 0.0))) if conv == "spot" else float("inf")
+    if S <= 0 or sigma <= 0 or T <= T_MIN:
+        return float("nan")
+    k_peak = pa_call_delta_peak(S, T, rd, rf, sigma)
+    return abs(float(delta_from_strike(k_peak, S, T, rd, rf, sigma, +1, conv)))
 
 
 def strike_from_delta(delta: float, S: float, T: float, rd: float, rf: float, sigma: float,
@@ -539,7 +603,7 @@ def strike_from_delta(delta: float, S: float, T: float, rd: float, rf: float, si
     ----------------------------------------------------------------
     ``|delta| = (K/S) e^{-rd T} N(cp d2)`` is *implicit* in K.  For **puts** the map is
     strictly monotone and Brent on ``[K_lo, K_hi]`` is unique.  For **calls** it is
-    unimodal with an interior maximum at ``K_peak`` (see :func:`_pa_call_delta_peak`);
+    unimodal with an interior maximum at ``K_peak`` (see :func:`pa_call_delta_peak`);
     we take the market-standard root on ``[K_peak, K_hi]``.  If the requested delta
     exceeds the attainable maximum the function returns ``nan`` rather than a wrong root.
 
@@ -572,7 +636,7 @@ def strike_from_delta(delta: float, S: float, T: float, rd: float, rf: float, si
     k_lo = F * math.exp(-12.0 * sqT - 0.5 * sqT * sqT)
     k_hi = F * math.exp(+12.0 * sqT + 0.5 * sqT * sqT)
     if cp > 0:
-        k_peak = _pa_call_delta_peak(S, T, rd, rf, sigma)
+        k_peak = pa_call_delta_peak(S, T, rd, rf, sigma)
         peak_val = abs(float(delta_from_strike(k_peak, S, T, rd, rf, sigma, cp, conv)))
         if peak_val < dl:
             return float("nan")          # delta unattainable on the pa call branch

@@ -1,0 +1,15 @@
+HAND-BUILT SAMPLE - NOT A RECORDED CME BULLETIN.
+cmegroup.com is blocked from the build sandbox; this file only pins the shape
+parse_stlcur() expects (product section, month header, then strike/side rows).
+Replace with the real /ftp/pub/settle/stlcur body once verify_live_sources.py --cme runs.
+
+EURO FX OPTIONS
+SEP26
+ 1.1550 C  .0155  .0158  .0157  6421
+ 1.1600 C  .0119  .0123  .0121  8431
+ 1.1600 P  .0096  .0100  .0098  7102
+ 1.1700 C  .0074  .0078  .0076  12860
+ 1.1700 P  .0151  .0155  .0153  5940
+OCT26
+ 1.1650 C  .0140  .0144  .0142  3275
+ 1.1650 P  .0129  .0133  .0131  3010

@@ -46,11 +46,14 @@ implied-vol inversion.
 Known failure modes (do not skip this)
 --------------------------------------
 1. **Far wings.**  The quadratic-in-log-strike term ``D1`` keeps growing outside
-   ``[K1, K3]``, so beyond roughly 5-delta the vol explodes and the implied
-   density goes negative.  We clamp: outside ``[K1, K3]`` the smile is continued
-   with a damped linear-in-log-strike wing (see ``wing_damping``) and the vol is
-   floored/capped.  Always run :func:`~fxgamma.models.smile.risk_neutral_density`
-   before trusting a wing price.
+   ``[K1, K3]``, so beyond roughly 5-delta the raw VV vol explodes and the implied
+   density goes negative.  We therefore do **not** evaluate VV outside its pillars
+   at all: past the 25d strikes the smile switches to the C1, Lee-bounded
+   total-variance wing described in :class:`VannaVolgaSmile` (10d-anchored
+   quadratic, then an exponentially relaxing tail).  That removes the explosion
+   and the ``max(w, floor)`` kink, but it is an *extrapolation rule*, not an
+   arbitrage-free model: always run
+   :func:`~fxgamma.models.smile.risk_neutral_density` before trusting a wing price.
 2. **Very short tenors (< ~1W).**  ``d1 d2`` is large and the second-order term
    dominates; the radicand can go negative.  We fall back to first order there.
 3. **Long tenors (> ~2Y).**  VV systematically over-prices convexity because the
@@ -129,10 +132,25 @@ def vv_vol(K: Any, S: float, T: float, rd: float, rf: float,
 
     p = d1K * d2K
     first = s2 + D1
+    # Stable rearrangement of Castagna-Mercurio eq. (14).  Written literally as
+    #     s2 + (-s2 + sqrt(s2^2 + p (2 s2 D1 + D2))) / p
+    # the numerator is a difference of two nearly equal positive numbers whenever
+    # |p| is small -- i.e. right next to the two strikes where d1 = 0 or d2 = 0,
+    # which in FX sit within a few tenths of a percent of the ATM.  There it loses
+    # most of its significant digits, and the old guard `|p| > 1e-12` papered over
+    # that by *switching branch* to the first-order value, putting a small but real
+    # discontinuity in the smile a hair away from the money.
+    #
+    # Multiplying through by the conjugate removes the cancellation and the
+    # division by p together:
+    #     (-s2 + sqrt(rad)) / p = (rad - s2^2) / (p (s2 + sqrt(rad)))
+    #                           = (2 s2 D1 + D2) / (s2 + sqrt(rad))
+    # which is exact and continuous at p = 0 (where it collapses to the correct
+    # limit D1 + D2/(2 s2)).  No branch on p is needed at all now.
     with np.errstate(invalid="ignore", divide="ignore"):
         rad = s2 * s2 + p * (2.0 * s2 * D1 + D2)
-        second = s2 + (-s2 + np.sqrt(np.maximum(rad, 0.0))) / p
-    out = np.where((np.abs(p) > 1e-12) & (rad > 0.0), second, first)
+        second = s2 + (2.0 * s2 * D1 + D2) / (s2 + np.sqrt(np.maximum(rad, 0.0)))
+    out = np.where(np.isfinite(second) & (rad > 0.0), second, first)
     out = np.clip(out, _VOL_FLOOR, _VOL_CAP)
     return out if np.ndim(K) else float(out)
 
@@ -245,21 +263,46 @@ class VannaVolgaSmile:
 
     Built by :meth:`from_quotes`.
 
-    Shape
-    -----
-    * **Core**, between the 25d put and 25d call strikes: the vanna-volga vol
-      (second-order formula, or the exact replication price inverted).
-    * **Wings**, outside them: continued in **total variance** ``w = sigma^2 T`` so
-      that the join is ``C^1`` (value *and* slope match).  A slope discontinuity in
-      ``w`` puts a Dirac in ``w''`` and therefore a spike -- usually negative -- in
-      the Breeden-Litzenberger density, which is exactly the artefact a naive
-      "damped wing" produces.  When 10d quotes are supplied the wing is the unique
-      quadratic in ``k`` that matches value+slope at the 25d strike **and passes
-      through the 10d quote**, so all five quotes reprice exactly; beyond the 10d
-      strike it becomes linear in ``w``.
-    * Wing slopes are capped at ``|dw/dk| <= lee_cap`` (default 2.0), which is
-      **Lee's moment formula** bound -- the asymptotic limit beyond which the
-      implied density has no finite moments and butterfly arbitrage is guaranteed.
+    Shape (three regions per side, all joined ``C^1`` in total variance)
+    --------------------------------------------------------------------
+    Everything below is done on ``w(k) = sigma^2 T`` against forward log-moneyness
+    ``k = ln(K/F)``, because that is the variable in which "no arbitrage" is
+    expressible (Lee's bound, Gatheral's ``g(k)``) and in which the density is a
+    smooth functional.
+
+    1. **Core**, ``k1 <= k <= k3`` (25d put to 25d call): the vanna-volga vol --
+       the second-order formula, or the exact replication price inverted.
+    2. **Anchor region**, ``k3 < k <= kR`` (and mirrored on the left): the unique
+       quadratic in ``k`` matching *value and slope* at ``k3`` and *passing through
+       the 10d quote* at ``kR``.  All five broker quotes therefore reprice exactly.
+       Absent 10d quotes this region is empty and ``kR = k3``.
+    3. **Tail**, ``k > kR``: with ``u = k - kR`` and ``q`` the anchor region's
+       slope arriving at ``kR``,
+
+           w(u) = w(kR) + beta u + (q - beta) lam (1 - e^{-u/lam}),
+           beta = clip(q, 0, lee_cap).
+
+       This matches value *and slope* at ``kR`` with **no clipping at the join**,
+       relaxes monotonically to an asymptotic slope inside **Lee's moment bound**,
+       keeps ``w'' `` bounded and continuous, and is bounded below by
+       ``w(kR) + min(0,q) lam > 0``.  See
+       :func:`~fxgamma.models.smile.fit_wing` for the derivation and for why the
+       obvious alternatives (raw linear continuation; clipping the slope at the
+       join) both put a Dirac in ``w''`` and hence a spike in the
+       Breeden-Litzenberger density.
+
+    What this buys, concretely: the previous "damped wing" clipped ``dw/dk`` to
+    ``+/- lee_cap`` at the join and let a *negative* right-wing slope run to
+    ``w = 0``, where a ``max(w, 1e-12)`` floor took over.  On a 3M USDJPY smile
+    with atm 12 / rr25 -5 / bf25 0.4 / rr10 -9 / bf10 1.2 that floor engaged at
+    ``K = 172`` and every strike above it priced at a 0.01% vol.  It now flattens
+    to a constant total variance instead, and the density is smooth across both
+    joins.
+
+    ``lam`` (the relaxation length) is a pure shape parameter -- it does not affect
+    C1-ness, the Lee bound or positivity -- and is set to
+    ``max(2 |k_join|, 0.10)``, i.e. the tail flattens over roughly the distance
+    from the money to the join again, floored at 10% log-moneyness.
 
     Attributes
     ----------
@@ -282,7 +325,13 @@ class VannaVolgaSmile:
     delta: float = 0.25
     delta_convention: str = "spot"
     lee_cap: float = 2.0
-    #: (k1, k3, w1, w3, w1p, w3p, cL, cR, kL, kR, wLp, wRp) -- wing coefficients
+    #: Flat wing coefficients, laid out as
+    #: ``(k1, k3, kL, kR, w1, w3, p1, p3, cL, cR,
+    #:    wLj, qL, betaL, lamL, wRj, qR, betaR, lamR)``.
+    #: ``p1``/``p3`` are ``dw/dk`` at the 25d joins (central-differenced off the
+    #: core), ``cL``/``cR`` the anchor-region quadratic coefficients, and the last
+    #: eight the two :func:`~fxgamma.models.smile.fit_wing` tails (``q`` is the
+    #: *outward* slope, so ``qL = -dw/dk`` at ``kL``).  Plain floats -> picklable.
     _wing: tuple[float, ...] = field(default=(), repr=False)
     #: (l1, l2, l3, dn1, dn2, dn3, s1, s2, s3, A1, A3, c0, sqT) -- VV scalar fast path
     _fast: tuple[float, ...] = field(default=(), repr=False)
@@ -370,30 +419,72 @@ class VannaVolgaSmile:
 
     def _build_wing(self, k1: float, k3: float, kL: float, wL: float,
                     kR: float, wR: float) -> tuple[float, ...]:
-        """Precompute the C1 wing coefficients (see the class docstring)."""
+        """Precompute the C1, Lee-bounded wing coefficients (see the class docstring).
+
+        ``kL``/``kR`` are the 10-delta anchors in log-moneyness (``nan`` when no 10d
+        quotes were supplied) and ``wL``/``wR`` their total variances.
+        """
         T = self.T
-        eps = 1e-5
-        def core_sigma(k: float) -> float:
-            return float(self._core_vol(np.array([self.forward * math.exp(k)]))[0])
-
-        s_1, s_3 = core_sigma(k1), core_sigma(k3)
-        w1, w3 = s_1 * s_1 * T, s_3 * s_3 * T
-        w1p = ((core_sigma(k1 + eps) ** 2 - core_sigma(k1) ** 2) / eps) * T
-        w3p = ((core_sigma(k3) ** 2 - core_sigma(k3 - eps) ** 2) / eps) * T
         cap = float(self.lee_cap)
+        F = self.forward
 
-        if np.isfinite(kL):
-            cL = (wL - w1 - w1p * (kL - k1)) / (kL - k1) ** 2
-            wLp = float(np.clip(w1p + 2.0 * cL * (kL - k1), -cap, cap))
-        else:
-            cL, wLp, kL, wL = 0.0, float(np.clip(w1p, -cap, cap)), k1, w1
-        if np.isfinite(kR):
-            cR = (wR - w3 - w3p * (kR - k3)) / (kR - k3) ** 2
-            wRp = float(np.clip(w3p + 2.0 * cR * (kR - k3), -cap, cap))
-        else:
-            cR, wRp, kR, wR = 0.0, float(np.clip(w3p, -cap, cap)), k3, w3
-        return (k1, k3, w1, w3, float(np.clip(w1p, -cap, cap)), float(np.clip(w3p, -cap, cap)),
-                cL, cR, kL, kR, wLp, wRp, wL, wR)
+        def core_w(k: float) -> float:
+            v = float(self._core_vol(np.array([F * math.exp(k)]))[0])
+            return v * v * T
+
+        w1, w3 = core_w(k1), core_w(k3)
+        # Central differences: a one-sided stencil is only O(h) accurate and an
+        # O(1e-5) error in the join slope is a visible kink in the density.  The VV
+        # core is an analytic formula on both sides of its own pillars, so the
+        # central stencil is legitimate here.
+        p1 = smile.wing_slope(core_w, k1)
+        p3 = smile.wing_slope(core_w, k3)
+
+        cR, kR_, wR_, qR = self._anchor(k3, w3, p3, kR, wR, +1)
+        cL, kL_, wL_, qL = self._anchor(k1, w1, p1, kL, wL, -1)
+
+        lamR = max(2.0 * abs(kR_), 0.10)
+        lamL = max(2.0 * abs(kL_), 0.10)
+        wRj, qRo, betaR, lamR = smile.fit_wing(kR_, wR_, qR, lee_cap=cap, lam=lamR)
+        wLj, qLo, betaL, lamL = smile.fit_wing(kL_, wL_, qL, lee_cap=cap, lam=lamL)
+        return (k1, k3, kL_, kR_, w1, w3, p1, p3, cL, cR,
+                wLj, qLo, betaL, lamL, wRj, qRo, betaR, lamR)
+
+    @staticmethod
+    def _anchor(kj: float, wj: float, pj: float, ka: float, wa: float,
+                side: int) -> tuple[float, float, float, float]:
+        """Fit the 10d anchor quadratic on one side.
+
+        Returns ``(c, k_anchor, w_anchor, q_out)`` where ``c`` is the quadratic's
+        curvature, ``k_anchor``/``w_anchor`` the outer end of the anchor region and
+        ``q_out`` the slope there measured **outward** (``+dw/dk`` on the right,
+        ``-dw/dk`` on the left).  With no usable 10d quote the anchor region is
+        empty: ``c = 0`` and the tail starts straight at the 25d join.
+
+        A quadratic pinned by value+slope at one end and value at the other can dip
+        between them when the arriving slope points inward hard enough.  We refuse
+        to let it fall below 5% of the smaller endpoint (which would make the smile
+        non-sensical and the density lumpy); if it would, the curvature is raised to
+        exactly touch that floor and the 10d quote is then *not* repriced exactly.
+        That trade is deliberate and rare -- it only fires on a 10d quote that is
+        inconsistent with the 25d smile it is attached to.
+        """
+        if not (np.isfinite(ka) and np.isfinite(wa)) or abs(ka - kj) < 1e-12:
+            return 0.0, kj, wj, float(side) * pj
+        dk = ka - kj
+        c = (wa - wj - pj * dk) / (dk * dk)
+        floor = 0.05 * min(wj, wa)
+        # vertex of w(k) = wj + pj (k-kj) + c (k-kj)^2 lies inside the interval only
+        # when c > 0 and -pj/(2c) is between 0 and dk (in the interval's direction)
+        if c > 0.0:
+            k_star = -pj / (2.0 * c)
+            if 0.0 < k_star / dk < 1.0:
+                w_min = wj - pj * pj / (4.0 * c)
+                if w_min < floor and wj > floor:
+                    c = pj * pj / (4.0 * (wj - floor))
+        q_out = float(side) * (pj + 2.0 * c * dk)
+        w_out = wj + pj * dk + c * dk * dk
+        return float(c), float(ka), float(max(w_out, 1e-14)), float(q_out)
 
     # -- evaluation ------------------------------------------------------ #
     @property
@@ -423,7 +514,8 @@ class VannaVolgaSmile:
             return self._vol_scalar(float(K))
         Karr = np.asarray(K, float)
         k = np.log(np.maximum(Karr, 1e-300) / self.forward)
-        (k1, k3, w1, w3, w1p, w3p, cL, cR, kL, kR, wLp, wRp, wL, wR) = self._wing
+        (k1, k3, kL, kR, w1, w3, p1, p3, cL, cR,
+         wLj, qL, betaL, lamL, wRj, qR, betaR, lamR) = self._wing
         out = np.empty(np.shape(k), float)
         mid = (k >= k1) & (k <= k3)
         if np.any(mid):
@@ -432,16 +524,16 @@ class VannaVolgaSmile:
         if np.any(left):
             kk = k[left]
             w = np.where(kk >= kL,
-                         w1 + w1p * (kk - k1) + cL * (kk - k1) ** 2,
-                         wL + wLp * (kk - kL))
-            out[left] = np.sqrt(np.maximum(w, 1e-12) / max(self.T, gk.T_MIN))
+                         w1 + p1 * (kk - k1) + cL * (kk - k1) ** 2,
+                         smile.eval_wing(kL - kk, (wLj, qL, betaL, lamL)))
+            out[left] = np.sqrt(np.maximum(w, 1e-14) / max(self.T, gk.T_MIN))
         right = k > k3
         if np.any(right):
             kk = k[right]
             w = np.where(kk <= kR,
-                         w3 + w3p * (kk - k3) + cR * (kk - k3) ** 2,
-                         wR + wRp * (kk - kR))
-            out[right] = np.sqrt(np.maximum(w, 1e-12) / max(self.T, gk.T_MIN))
+                         w3 + p3 * (kk - k3) + cR * (kk - k3) ** 2,
+                         smile.eval_wing(kk - kR, (wRj, qR, betaR, lamR)))
+            out[right] = np.sqrt(np.maximum(w, 1e-14) / max(self.T, gk.T_MIN))
         out = np.clip(out, _VOL_FLOOR, _VOL_CAP)
         return out if np.ndim(K) else float(out)
 
@@ -451,15 +543,18 @@ class VannaVolgaSmile:
         Numerically identical to the vectorised path (asserted in validation).
         """
         (l1, l2, l3, dn1, dn2, dn3, s1, s2, s3, A1, A3, c0, sqT) = self._fast
-        (k1, k3, w1, w3, w1p, w3p, cL, cR, kL, kR, wLp, wRp, wL, wR) = self._wing
+        (k1, k3, kL, kR, w1, w3, p1, p3, cL, cR,
+         wLj, qL, betaL, lamL, wRj, qR, betaR, lamR) = self._wing
         lnF = math.log(self.forward)
         k = math.log(K) - lnF
         if k < k1:
-            w = (w1 + w1p * (k - k1) + cL * (k - k1) ** 2) if k >= kL else (wL + wLp * (k - kL))
-            return min(max(math.sqrt(max(w, 1e-12) / max(self.T, gk.T_MIN)), _VOL_FLOOR), _VOL_CAP)
+            w = (w1 + p1 * (k - k1) + cL * (k - k1) ** 2) if k >= kL else \
+                smile._eval_wing_scalar(kL - k, (wLj, qL, betaL, lamL))
+            return min(max(math.sqrt(max(w, 1e-14) / max(self.T, gk.T_MIN)), _VOL_FLOOR), _VOL_CAP)
         if k > k3:
-            w = (w3 + w3p * (k - k3) + cR * (k - k3) ** 2) if k <= kR else (wR + wRp * (k - kR))
-            return min(max(math.sqrt(max(w, 1e-12) / max(self.T, gk.T_MIN)), _VOL_FLOOR), _VOL_CAP)
+            w = (w3 + p3 * (k - k3) + cR * (k - k3) ** 2) if k <= kR else \
+                smile._eval_wing_scalar(k - kR, (wRj, qR, betaR, lamR))
+            return min(max(math.sqrt(max(w, 1e-14) / max(self.T, gk.T_MIN)), _VOL_FLOOR), _VOL_CAP)
         lk = math.log(K)
         y1 = (l2 - lk) * (l3 - lk) / dn1
         y2 = (lk - l1) * (l3 - lk) / dn2
@@ -469,8 +564,10 @@ class VannaVolgaSmile:
         d1 = (c0 - lk) / sqT + 0.5 * sqT
         d2 = d1 - sqT
         pp = d1 * d2
-        rad = s2 * s2 + pp * (2.0 * s2 * D1 + D2)
-        sig = s2 + (-s2 + math.sqrt(rad)) / pp if (abs(pp) > 1e-12 and rad > 0.0) else s2 + D1
+        num = 2.0 * s2 * D1 + D2
+        rad = s2 * s2 + pp * num
+        # same conjugate rearrangement as vv_vol -- see the comment there
+        sig = s2 + num / (s2 + math.sqrt(rad)) if rad > 0.0 else s2 + D1
         return min(max(sig, _VOL_FLOOR), _VOL_CAP)
 
     def _exact_vol(self, K: np.ndarray) -> np.ndarray:

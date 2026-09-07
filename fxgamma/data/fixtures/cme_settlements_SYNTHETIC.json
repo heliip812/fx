@@ -1,0 +1,14 @@
+{
+  "_README": "HAND-BUILT, NOT A RECORDED RESPONSE. cmegroup.com is blocked from the build sandbox, so no genuine CmeWS payload could be captured. This file exercises parse_settlements_json() against the shape the adapter *believes* CME returns (see fxgamma/data/cme_options.py). If scripts/verify_live_sources.py --cme succeeds on a networked machine, replace this file with the real body and drop the _SYNTHETIC suffix.",
+  "tradeDate": "09/04/2026",
+  "productId": 0,
+  "settlements": [
+    {"month": "SEP26", "strike": "1.1600", "optionType": "Call", "settle": "0.0121", "volume": "1,204", "openInterest": "8,431"},
+    {"month": "SEP26", "strike": "1.1600", "optionType": "Put",  "settle": "0.0098", "volume": "980",   "openInterest": "7,102"},
+    {"month": "SEP26", "strike": "1.1700", "optionType": "Call", "settle": "0.0076", "volume": "2,110", "openInterest": "12,860"},
+    {"month": "SEP26", "strike": "1.1700", "optionType": "Put",  "settle": "0.0153", "volume": "760",   "openInterest": "5,940"},
+    {"month": "OCT26", "strike": "1.1650", "optionType": "Call", "settle": "0.0142", "volume": "410",   "openInterest": "3,275"},
+    {"month": "OCT26", "strike": "1.1650", "optionType": "Put",  "settle": "0.0131", "volume": "395",   "openInterest": "3,010"},
+    {"month": "OCT26", "strike": "TOTAL",  "optionType": "",     "settle": "-",      "volume": "5,859", "openInterest": "40,618"}
+  ]
+}

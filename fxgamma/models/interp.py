@@ -117,7 +117,8 @@ def fit_svi_slice(k: np.ndarray, w: np.ndarray, T: float, *,
                   weights: np.ndarray | None = None,
                   arb_penalty: float = 1e4,
                   k_scan: np.ndarray | None = None,
-                  w_floor: np.ndarray | None = None) -> tuple[SVIParams, float]:
+                  w_floor: np.ndarray | None = None,
+                  lee_cap: float = smile.LEE_CAP) -> tuple[SVIParams, float]:
     """Raw-SVI fit of total variance ``w`` against log-moneyness ``k``.
 
     Uses the **quasi-explicit** two-stage scheme of Zeliade Systems (2009), which is
@@ -194,7 +195,10 @@ def fit_svi_slice(k: np.ndarray, w: np.ndarray, T: float, *,
     x, _ = inner(m, sig)
     a, d, c = float(x[0]), float(x[1]), float(x[2])
     b = c / sig if sig > 0 else 0.0
-    rho = float(np.clip(d / c, -0.999, 0.999)) if c > 1e-14 else 0.0
+    # relative, not absolute: c = b*sigma lives in *total variance* units, which
+    # for an overnight slice at 1 vol is ~1e-6.  A fixed 1e-14 threshold is a
+    # scale-blind tie that would silently zero the skew on short tenors.
+    rho = float(np.clip(d / c, -0.999, 0.999)) if c > 1e-12 * max(w_max, 1e-30) else 0.0
     p = SVIParams(a, b, rho, m, sig)
 
     # ---- polish with the arbitrage penalties --------------------------- #
@@ -210,8 +214,16 @@ def fit_svi_slice(k: np.ndarray, w: np.ndarray, T: float, *,
         if w_floor is not None:
             parts.append(arb_penalty * np.minimum(svi_w(k_scan, q) - w_floor, 0.0))
         parts.append(np.array([
+            # w(k) > 0 everywhere: the minimum of raw SVI is a + b s sqrt(1 - rho^2)
             arb_penalty * min(0.0, q.a + q.b * q.s * math.sqrt(max(1.0 - q.rho ** 2, 0.0))),
-            arb_penalty * min(0.0, 4.0 - q.b * (1.0 + abs(q.rho))),
+            # Lee's moment bound on BOTH asymptotic slopes.  Raw SVI has
+            # w'(+inf) = b(1 + rho) and |w'(-inf)| = b(1 - rho), so the binding
+            # constraint is b(1 + |rho|) <= lee_cap.  The Zeliade linear-solve box
+            # (0 <= c <= 4 sigma) only enforces the much weaker b(1 + |rho|) <= 4,
+            # i.e. twice Lee's bound in total-variance units -- enough slack for a
+            # fit to look clean on the quoted strikes and be arbitrageable in the
+            # extrapolated wings.
+            arb_penalty * min(0.0, float(lee_cap) - q.b * (1.0 + abs(q.rho))),
         ]))
         return np.concatenate(parts)
 
@@ -241,6 +253,20 @@ class VolSlice:
 
     ``kind`` is ``"svi"`` (5-parameter fit) or ``"pchip"`` (monotone cubic through
     the quoted points, used when a slice has fewer than 5 usable quotes).
+
+    Wings
+    -----
+    A **PCHIP** slice is only defined between its outermost knots.  Continuing it
+    with the raw end slope -- which is what ``pchip_eval(extrap="linear")`` does --
+    is unsafe in exactly the way described in
+    :func:`~fxgamma.models.smile.fit_wing`: the end slope is whatever the last two
+    listed quotes happened to imply, it is not sign-constrained, and a listed chain
+    routinely produces a *falling* right wing from two stale far-OTM quotes.  Total
+    variance then runs to the ``_MIN_W`` floor, and the floor join is a slope
+    discontinuity -- a Dirac in ``w''`` and a spike in the implied density.
+    ``wing_l`` / ``wing_r`` replace that with the shared C1, Lee-bounded tail.
+    They are ``()`` for SVI slices, whose wings are already linear in ``k`` with
+    asymptotic slopes ``b(1 +/- rho)`` bounded by the fit's Lee penalty.
     """
     T: float
     F: float
@@ -251,14 +277,22 @@ class VolSlice:
     slopes: np.ndarray | None = None
     n_quotes: int = 0
     rmse_vol: float = 0.0
+    wing_l: tuple[float, ...] = ()
+    wing_r: tuple[float, ...] = ()
+    n_calendar_clipped: int = 0
+    max_calendar_clip: float = 0.0
 
     def w(self, k: Any) -> Any:
-        """Total variance at log-moneyness ``k = ln(K/F)``, floored at 0."""
+        """Total variance at log-moneyness ``k = ln(K/F)``, floored at ``_MIN_W``."""
         if self.kind == "svi" and self.svi is not None:
-            out = svi_w(k, self.svi)
-        else:
-            out = smile.pchip_eval(k, self.knots_k, self.knots_w, self.slopes,
-                                   extrap="linear")
+            return np.maximum(svi_w(k, self.svi), _MIN_W)
+        out = smile.pchip_eval(k, self.knots_k, self.knots_w, self.slopes,
+                               extrap="linear")
+        if self.wing_l and self.wing_r:
+            kk = np.asarray(k, float)
+            kl, kr = float(self.knots_k[0]), float(self.knots_k[-1])
+            out = np.where(kk < kl, smile.eval_wing(kl - kk, self.wing_l), out)
+            out = np.where(kk > kr, smile.eval_wing(kk - kr, self.wing_r), out)
         return np.maximum(out, _MIN_W)
 
     def vol(self, k: Any) -> Any:
@@ -380,8 +414,13 @@ class InterpolatedSurface(smile.SmileSurfaceMixin):
             order = np.argsort(k)
             k, w, ws = k[order], w[order], wt[sel][order]
 
+            n_clip, max_clip = 0, 0.0
             if enforce_calendar and prev is not None:
-                w = np.maximum(w, np.asarray(prev.w(k), float) + 1e-14)
+                floor_here = np.asarray(prev.w(k), float) + 1e-14
+                bad = w < floor_here
+                n_clip = int(bad.sum())
+                max_clip = float(np.max(floor_here - w)) if n_clip else 0.0
+                w = np.maximum(w, floor_here)
 
             if k.size >= min_svi_points:
                 scan = np.linspace(-1.5 * max(float(np.max(np.abs(k))) * 2.0, 0.10),
@@ -393,11 +432,19 @@ class InterpolatedSurface(smile.SmileSurfaceMixin):
                                      k_scan=scan, w_floor=floor)
                 rmse_vol = float(np.sqrt(np.mean(
                     (np.sqrt(np.maximum(svi_w(k, p), _MIN_W) / t) - np.sqrt(w / t)) ** 2)))
-                sl = VolSlice(float(t), F, "svi", p, None, None, None, int(k.size), rmse_vol)
+                sl = VolSlice(float(t), F, "svi", p, None, None, None, int(k.size),
+                              rmse_vol, (), (), n_clip, max_clip)
             else:
                 kk, ww = _dedupe(k, w)
-                sl = VolSlice(float(t), F, "pchip", None, kk, ww,
-                              smile.pchip_slopes(kk, ww), int(k.size), 0.0)
+                ms = smile.pchip_slopes(kk, ww)
+                # C1, Lee-bounded tails instead of raw linear extrapolation of the
+                # end slopes -- see VolSlice's docstring.
+                wl = smile.fit_wing(float(kk[0]), float(ww[0]), -float(ms[0]),
+                                    lam=max(2.0 * abs(float(kk[0])), 0.10))
+                wr = smile.fit_wing(float(kk[-1]), float(ww[-1]), float(ms[-1]),
+                                    lam=max(2.0 * abs(float(kk[-1])), 0.10))
+                sl = VolSlice(float(t), F, "pchip", None, kk, ww, ms, int(k.size), 0.0,
+                              wl, wr, n_clip, max_clip)
             built.append(sl)
             prev = sl
 
@@ -465,7 +512,13 @@ class InterpolatedSurface(smile.SmileSurfaceMixin):
                 bfly.append({"T": s.T, "n_bad": int(bad.sum()), "min_g": float(np.min(g)),
                              "k_at_min": float(kk[int(np.argmin(g))]), "kind": s.kind})
             fits.append({"T": s.T, "kind": s.kind, "n_quotes": s.n_quotes,
-                         "rmse_vol": s.rmse_vol})
+                         "rmse_vol": s.rmse_vol,
+                         # how much market data enforce_calendar had to move.  This
+                         # is an input adjustment, not a fit residual, and it was
+                         # previously invisible -- provenance policy (contract s7)
+                         # says a number we changed must say so.
+                         "n_calendar_clipped": s.n_calendar_clipped,
+                         "max_calendar_clip_w": s.max_calendar_clip})
             if i:
                 prev = self.slices[i - 1]
                 dw = np.asarray(s.w(kk), float) - np.asarray(prev.w(kk), float)

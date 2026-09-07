@@ -81,8 +81,13 @@ frozen — changes require PM sign-off.
 ## 7. Credit gamma (v2 note)
 
 The user also asked about credit. Public credit data is far thinner than FX: no free CDS index
-option vol surface exists. The credit analogue is deliberately deferred to v2 and scoped as:
-CDX/iTraxx **payer/receiver swaption** convexity proxied via **HYG/LQD/JNK listed ETF option
-chains** (free, listed, real implied vols), mapped to spread space via option-adjusted duration.
-The same pricing/Greeks/portfolio engine is reused — only the underlying transform differs. The
-architecture keeps `Underlying` abstract for this reason.
+option vol surface exists. Credit is deferred to v2 and designed in `docs/07_credit_gamma.md`.
+
+**Correction to an earlier draft of this section (PM, recording my own error).** This charter
+previously claimed the architecture "keeps `Underlying` abstract for this reason". That was false —
+there is no `Underlying` type in `fxgamma/types.py` and never was. The types happen to be
+numerically generic, which is not the same as being designed for it. Flagged by the credit analyst.
+
+It also proposed proxying CDX/iTraxx spread vol through HYG/LQD/JNK option chains. The credit
+analyst's verdict is that this does not survive contact with the numbers, and the PM accepts it:
+see AMENDMENT v1.3 in `docs/01_architecture.md`.

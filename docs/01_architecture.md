@@ -274,3 +274,43 @@ worked numeric example each.
 
 **Scope note:** T-1 does not widen v1. It re-prioritises an existing requirement (REQ-068) from a
 buried override to the primary path, and adds one small provider plus one UI panel.
+
+---
+
+# AMENDMENT v1.3 — PM ruling on the credit extension (binding for v2)
+
+Source: `docs/07_credit_gamma.md`. The PM independently verified the two load-bearing claims
+before accepting: Garman-Kohlhagen with `rd=rf=0` reproduces undiscounted Black-76 on a forward
+**exactly** (0.00e+00 difference), so the existing pricer is reusable for credit index options once
+multiplied by the risky annuity; and the spread-inversion amplification `1/(OASD·s)` is ~9.5x for
+HYG, ~9.2x for JNK and ~13.4x for LQD.
+
+**C-1 — "CDX gamma analytics from free data" is REJECTED.** A 1-point error in HYG implied vol
+becomes a ~9.5-point error in implied *spread* vol, before rates contamination (LQD is largely a
+rates instrument by variance), the unobservable spread-rate correlation, duration mismatch and the
+cash-CDS basis. Free data cannot mark a CDX book. We will not ship an analytic that implies it can.
+
+**C-2 — "Credit ETF Gamma" is ACCEPTED as the v2 product.** HYG/LQD/JNK options are themselves
+listed, liquid and free-data-complete. A gamma book *in those options* is the instrument, not a
+proxy, and gets full FX-grade fidelity: surface, skew, chain-OI gamma map, IV-RV, attribution.
+This is an honest product; the CDX proxy was not.
+
+**C-3 — a manual-mark CDX pricer is ACCEPTED** (annuity numeraire, front-end protection, full
+Greeks), on the same precedent as amendment v1.2 T-1: the user supplies the mark, the tool does the
+maths. ~1 day.
+
+**C-4 — iTraxx / Europe is CUT.** No free EU credit-ETF option market exists to support it.
+
+**C-5 — CG-7 key grammar is extended (additive):** `spread.<INDEX>` and `oasd.<ETF>` join the
+frozen provenance keys. No existing key changes.
+
+**C-6 — CROSS-CUTTING, AND IT BITES FX v1 TOO. Assigned to `data`, priority raised.**
+The credit analyst's underrated finding: Yahoo serves only *today's* option chain, so nothing built
+on it is backtestable until you have been recording it. This is not a credit-only problem — the FX
+side has exactly the same hole. FXE/FXB/FXY chains give us today's smile and no history, so
+**skew/RR/BF z-scores and vol cones built on ETF chains have no back-history on day one**. CBOE
+EVZ via FRED partly covers EURUSD ATM history; it covers no skew and no other pair.
+Required: a daily chain **snapshotter** that appends each day's pulled chain to the parquet cache,
+shipped in v1 so history starts accumulating from the user's first run, plus honest UI copy stating
+how many days of history exist before a z-score is meaningful. A z-score computed on 11 days of
+self-collected history must say so.

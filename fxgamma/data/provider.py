@@ -1,7 +1,11 @@
 """Provider factory and the live -> cache -> (synthetic) fallback chain.
 
 Contract section 7 is the design driver: **never silently substitute synthetic data for live
-data.**  So:
+data.**  Amendment v1.2 (T-1) adds the second driver: **the desk's own mark always wins.**  So:
+
+* :class:`~fxgamma.data.manual.ManualQuoteProvider` is the *first* link of every chain.  A
+  pair the user has marked is priced off that grid and a live pull can never overwrite it
+  (the marks live in their own file; nothing else writes it).
 
 * :class:`LiveProvider` fans out over the real adapters with a per-source fallback chain
   (Yahoo -> Stooq -> ECB for spot; CME -> ETF chain for open interest) and records, per field,
@@ -16,10 +20,11 @@ data.**  So:
 Provider names accepted by :func:`get_provider`:
 
     ``synthetic``  deterministic offline market (default in this sandbox and in CI)
+    ``manual``     the user's own vol marks only (``data/manual/marks.json``); nothing else
     ``live``       real endpoints only; raises rather than inventing anything
     ``cache``      on-disk replay only, no network
-    ``chain``      live -> cache             (production default; fails loudly if both are dry)
-    ``auto``       live -> cache -> synthetic (explicitly badged; for demos)
+    ``chain``      manual -> live -> cache             (production default; v1.2 T-1 order)
+    ``auto``       manual -> live -> cache -> synthetic (explicitly badged; for demos)
 """
 from __future__ import annotations
 
@@ -34,6 +39,7 @@ from ..conventions import PAIRS, pair_spec
 from ..types import Provenance
 from . import cme_options, events as events_mod, rates_fred, spot_ecb, spot_stooq
 from . import spot_yahoo, vol_etf_options
+from .manual import ManualQuoteProvider, ManualQuoteStore
 from .base import (MarketDataProvider, SmileQuotes, SourceStatus, empty_oi_frame,
                    empty_spot_frame, utcnow)
 from .cache import Cache, get_cache
@@ -41,7 +47,8 @@ from .synthetic import SyntheticProvider
 
 log = logging.getLogger(__name__)
 
-__all__ = ["LiveProvider", "CacheProvider", "ChainProvider", "get_provider", "PROVIDERS"]
+__all__ = ["LiveProvider", "CacheProvider", "ChainProvider", "ManualQuoteProvider",
+           "ManualQuoteStore", "get_provider", "PROVIDERS"]
 
 
 class _Badged(MarketDataProvider):
@@ -324,6 +331,12 @@ class CacheProvider(_Badged):
 class ChainProvider(_Badged):
     """Try each provider in order; badge with whoever actually answered.
 
+    **Resolution order (amendment v1.2, T-1): manual -> live -> cache -> synthetic.**
+    Any :class:`~fxgamma.data.manual.ManualQuoteProvider` in ``providers`` is hoisted to the
+    front regardless of the order it was passed in, so the desk's own mark always wins and a
+    live pull can never overwrite it.  A pair with no manual mark falls straight through to
+    live, so marking is per pair and never all-or-nothing.
+
     ``allow_synthetic`` must be set explicitly for a :class:`SyntheticProvider` to be reached
     (contract section 7).  A synthetic answer is always badged ``kind='synthetic'`` and never
     inherits a live source name.
@@ -343,8 +356,27 @@ class ChainProvider(_Badged):
             real.append(p)
         if not real:
             raise ValueError("ChainProvider needs at least one provider")
-        self.providers = list(real)
+        # T-1: manual first, always. Order within each tier is preserved.
+        manual = [p for p in real if isinstance(p, ManualQuoteProvider)]
+        rest = [p for p in real if not isinstance(p, ManualQuoteProvider)]
+        if manual and rest and not isinstance(real[0], ManualQuoteProvider):
+            log.info("ChainProvider: hoisting %r to the front (v1.2 T-1)", manual[0])
+        self.providers = manual + rest
         self.allow_synthetic = allow_synthetic
+
+    # ------------------------------------------------------------------ marks
+    @property
+    def manual(self) -> ManualQuoteProvider | None:
+        """The manual provider in this chain, if any (the Data page edits it directly)."""
+        for p in self.providers:
+            if isinstance(p, ManualQuoteProvider):
+                return p
+        return None
+
+    def marked_pairs(self) -> list[str]:
+        """Pairs currently priced off the desk's own curve rather than off a live source."""
+        m = self.manual
+        return m.store.pairs() if m is not None else []
 
     def _adopt(self, prov: MarketDataProvider, field: str) -> None:
         self._prov[field] = prov.provenance(field)
@@ -422,14 +454,22 @@ class ChainProvider(_Badged):
 
 
 # ======================================================================== factory
-PROVIDERS = ("synthetic", "live", "cache", "chain", "auto")
+PROVIDERS = ("synthetic", "manual", "live", "cache", "chain", "auto")
 
 
 def get_provider(name: str | None = None, *, seed: int | None = None,
                  cache: Cache | None = None, refresh: bool = False,
                  allow_synthetic: bool | None = None,
-                 asof: datetime | None = None) -> MarketDataProvider:
-    """Build a provider by name. ``None`` -> ``$FXGAMMA_PROVIDER`` -> ``"synthetic"``."""
+                 asof: datetime | None = None,
+                 manual: ManualQuoteProvider | ManualQuoteStore | bool | None = None,
+                 marks_path: str | None = None) -> MarketDataProvider:
+    """Build a provider by name. ``None`` -> ``$FXGAMMA_PROVIDER`` -> ``"synthetic"``.
+
+    ``manual`` controls the T-1 manual tier of ``chain``/``auto``: ``None`` (default) attaches
+    a :class:`~fxgamma.data.manual.ManualQuoteProvider` on the repo's marks file, ``False``
+    disables it, and an explicit provider/store instance is used as given (the Dash app passes
+    the one it is editing so the UI and the pricer share a single object).
+    """
     name = (name or os.environ.get("FXGAMMA_PROVIDER") or "synthetic").strip().lower()
     if cache is None:
         cache = get_cache(refresh=refresh) if refresh else get_cache()
@@ -437,16 +477,33 @@ def get_provider(name: str | None = None, *, seed: int | None = None,
         allow_synthetic = os.environ.get("FXGAMMA_ALLOW_SYNTHETIC", "").lower() in \
             ("1", "true", "yes")
 
+    def _manual() -> ManualQuoteProvider | None:
+        if manual is False:
+            return None
+        if isinstance(manual, ManualQuoteProvider):
+            return manual
+        if isinstance(manual, ManualQuoteStore):
+            return ManualQuoteProvider(manual)
+        return ManualQuoteProvider(path=marks_path)
+
     if name == "synthetic":
         kw = {"asof": asof} if asof else {}
         return SyntheticProvider(seed=seed if seed is not None
                                  else SyntheticProvider.DEFAULT_SEED, **kw)
+    if name == "manual":
+        mp = _manual()
+        if mp is None:
+            raise ValueError("provider 'manual' requested with manual=False")
+        return mp
     if name == "live":
         return LiveProvider(cache)
     if name == "cache":
         return CacheProvider(cache)
     if name in ("chain", "auto"):
         chain: list[MarketDataProvider] = [LiveProvider(cache), CacheProvider(cache)]
+        mp = _manual()
+        if mp is not None:                        # v1.2 T-1: the desk's mark wins
+            chain.insert(0, mp)
         if name == "auto" or allow_synthetic:
             chain.append(SyntheticProvider(seed=seed if seed is not None
                                            else SyntheticProvider.DEFAULT_SEED))

@@ -32,7 +32,17 @@ __all__ = [
     "risk_neutral_density", "DensityReport", "StrangleConvention",
     "total_variance", "vol_from_total_variance", "atm_convention_for",
     "pchip_slopes", "pchip_eval", "SmileSurfaceMixin",
+    "LEE_CAP", "fit_wing", "eval_wing", "wing_slope",
 ]
+
+#: Lee's (2004) moment-formula bound on the asymptotic slope of **total variance**
+#: in log-moneyness: ``limsup_{k->+inf} w(k)/k <= 2`` and
+#: ``limsup_{k->-inf} w(k)/|k| <= 2``.  A wing steeper than this in the limit has
+#: an implied density with no finite moments and is guaranteed to admit butterfly
+#: arbitrage far enough out.  Every extrapolated wing in this package is capped
+#: here.  Reference: Lee, R. (2004), "The Moment Formula for Implied Volatility at
+#: Extreme Strikes", *Mathematical Finance* 14(3), 469-480.
+LEE_CAP: Final[float] = 2.0
 
 #: ATM strike conventions.  FX **defaults to ``"dns"``** (delta-neutral straddle) for
 #: G10 out to ~2Y; ``"fwd"`` (ATM-forward) is the equity/rates habit and is offered
@@ -192,13 +202,16 @@ class DensityReport:
     n_negative: int
     ok: bool
     note: str = ""
+    peak_density: float = 0.0
+    rel_min_density: float = 0.0    # min_density / peak_density -- the scale-free number
 
 
 def risk_neutral_density(vol_fn: Callable[[np.ndarray], np.ndarray],
                          S: float, T: float, rd: float, rf: float,
                          strikes: np.ndarray | None = None, *,
                          n: int = 801, n_std: float = 6.0,
-                         atol: float = -1e-8) -> DensityReport:
+                         rtol: float = -1e-6,
+                         atol: float | None = None) -> DensityReport:
     """Breeden-Litzenberger risk-neutral density implied by a smile.
 
     ``q(K) = e^{rd T} d^2 C / dK^2`` where ``C(K)`` is the undiscounted-notional call
@@ -213,8 +226,16 @@ def risk_neutral_density(vol_fn: Callable[[np.ndarray], np.ndarray],
         bound method; anything numpy-broadcastable works.
     strikes : optional explicit grid.  If ``None`` a ``n``-point log grid spanning
         ``n_std`` ATM standard deviations is built.
-    atol : tolerance for the positivity test; slightly negative to absorb the
-        O(h^2) truncation error of the finite difference.
+    rtol : negativity tolerance **relative to the peak density**, which is the only
+        scale-free way to state it.  The density of ``S_T`` has units of 1/spot, so
+        an absolute threshold means completely different things across pairs: a
+        1-vol 1M EURUSD density peaks near 8.6 per USD while the same smile on
+        USDJPY peaks near 0.027 per JPY, a factor of ~320.  A fixed ``atol =
+        -1e-8`` therefore called USDJPY clean at 320x the relative violation it
+        rejected on EURUSD.  ``rtol`` is applied as ``q < rtol * peak``.
+    atol : optional absolute override, for callers that really do want a fixed
+        threshold (or a stricter one than the relative default).  When given it is
+        used instead of ``rtol * peak``.
 
     Returns
     -------
@@ -248,12 +269,131 @@ def risk_neutral_density(vol_fn: Callable[[np.ndarray], np.ndarray],
 
     integral = float(np.trapezoid(q, Kc)) if hasattr(np, "trapezoid") else float(np.trapz(q, Kc))
     mn = float(np.nanmin(q)) if q.size else 0.0
-    nneg = int(np.sum(q < atol))
+    peak = float(np.nanmax(q)) if q.size else 0.0
+    thr = float(atol) if atol is not None else float(rtol) * max(peak, 1e-300)
+    nneg = int(np.sum(q < thr))
     ok = bool(nneg == 0 and 0.95 <= integral <= 1.02 and np.all(np.isfinite(q)))
+    rel = mn / peak if peak > 0.0 else 0.0
     note = "" if ok else (
-        f"{nneg} negative density point(s); integral={integral:.6f}"
+        f"{nneg} density point(s) below {thr:.3e}; min/peak={rel:.3e}; "
+        f"integral={integral:.6f}"
     )
-    return DensityReport(Kc, q, integral, mn, nneg, ok, note)
+    return DensityReport(Kc, q, integral, mn, nneg, ok, note, peak, float(rel))
+
+
+# --------------------------------------------------------------------------- #
+# C1, Lee-bounded wing extrapolation  (shared by vanna_volga and interp)
+# --------------------------------------------------------------------------- #
+#
+# The problem this solves
+# -----------------------
+# Every smile in this package is quoted on a finite set of pillars (25d/ATM/25d,
+# plus 10d when available; or a listed chain's strike ladder) and has to be
+# continued outside them.  The obvious continuations all fail, and they fail in
+# ways that show up as *density spikes*, not as obviously wrong vols:
+#
+# * **Straight linear-in-w extrapolation with the boundary slope.**  If that slope
+#   points the wrong way -- and for a 10d-anchored right wing it often does, e.g.
+#   whenever the 10d call vol prints below the C1 continuation of the 25d point --
+#   total variance runs to zero and then hits whatever floor the evaluator uses.
+#   The floor join is a slope discontinuity: ``w'`` jumps, ``w''`` contains a
+#   Dirac, and Breeden-Litzenberger puts a delta function in the density there.
+#   Downstream, every strike beyond the crossing prices at the floor vol, so a
+#   3M 172-strike USDJPY call quietly becomes worthless.
+# * **Clipping the slope at Lee's bound at the join.**  Capping ``w'`` *at* the
+#   join to satisfy Lee breaks C1 exactly where the two pieces meet -- the same
+#   Dirac, just moved inward to a strike people actually trade.
+#
+# The fix: relax the slope instead of clipping it
+# -----------------------------------------------
+# Let ``u >= 0`` be the outward distance in log-moneyness from the join and
+# ``q = dw/du`` the *outward* slope the inner curve arrives with (so for a right
+# wing ``q = +w'(k_join)``, for a left wing ``q = -w'(k_join)``).  Set the
+# asymptotic slope to ``beta = clip(q, 0, lee_cap)`` and use
+#
+#     w(u) = w_join + beta u + (q - beta) lam (1 - e^{-u/lam})
+#
+# which gives, exactly and unconditionally:
+#
+#   * ``w(0) = w_join``                              -- continuous,
+#   * ``w'(0) = beta + (q - beta) = q``              -- **C1 at the join**, with no
+#     clipping applied there, so the market-quoted boundary slope is honoured,
+#   * ``w'(u) = beta + (q - beta) e^{-u/lam} -> beta`` monotonically -- the
+#     asymptotic slope obeys **Lee's bound** and never has the wrong sign,
+#   * ``w''(u) = -((q - beta)/lam) e^{-u/lam}`` -- bounded and *continuous* on the
+#     wing, so no Dirac and no density spike,
+#   * ``w(u) >= w_join + min(0, q) lam > 0`` -- positivity, enforced by shrinking
+#     ``lam`` (below), so the ``max(w, floor)`` guard never engages and the floor
+#     kink cannot happen.
+#
+# ``lam`` is a pure shape parameter -- the distance over which the slope relaxes
+# from the quoted one to the asymptote.  It changes none of the guarantees above.
+#
+# What this is *not*: it is not an arbitrage-free extrapolation.  Lee's bound is
+# necessary, not sufficient.  Always run :func:`risk_neutral_density`.
+
+
+def wing_slope(w_fn: Callable[[float], float], k0: float, *, h: float = 1e-5) -> float:
+    """Central difference ``dw/dk`` at ``k0``.
+
+    Central rather than one-sided: the one-sided version is ``O(h)`` accurate, and
+    an ``O(1e-5)`` error in the join slope is a *visible* kink in the density.
+    Every smile core in this package is defined (as a formula) on both sides of
+    its own pillars, so the central stencil is always legitimate.
+    """
+    return float((w_fn(k0 + h) - w_fn(k0 - h)) / (2.0 * h))
+
+
+def fit_wing(k_join: float, w_join: float, q_out: float, *,
+             lee_cap: float = LEE_CAP, lam: float = 0.25,
+             keep: float = 0.75) -> tuple[float, float, float, float]:
+    """Coefficients ``(w_join, q_out, beta, lam)`` of a C1 Lee-bounded wing.
+
+    Parameters
+    ----------
+    k_join : log-moneyness of the join (kept by the caller; not used here beyond
+        documentation of intent).
+    w_join : total variance at the join.  Must be > 0.
+    q_out : the inner curve's slope **measured outward** -- ``+dw/dk`` for a right
+        wing, ``-dw/dk`` for a left wing.  Passed through untouched so the join
+        stays C1.
+    lee_cap : asymptotic-slope cap (see :data:`LEE_CAP`).
+    lam : nominal relaxation length in log-moneyness.  Shrunk if positivity needs
+        it; never grown.
+    keep : the wing is not allowed to give up more than ``keep`` of ``w_join`` to
+        a falling slope, which is what bounds ``lam`` from above when ``q_out < 0``.
+
+    Returns
+    -------
+    (w_join, q_out, beta, lam) -- feed straight to :func:`eval_wing`.
+    """
+    w0 = max(float(w_join), 1e-14)
+    q = float(q_out)
+    if not math.isfinite(q):
+        q = 0.0
+    beta = float(min(max(q, 0.0), float(lee_cap)))
+    lam_ = max(float(lam), 1e-6)
+    if q < 0.0:
+        # w(inf) = w0 + q*lam ; keep at least (1 - keep) * w0
+        lam_ = min(lam_, float(keep) * w0 / (-q))
+    return (w0, q, beta, max(lam_, 1e-9))
+
+
+def eval_wing(u: Any, coef: tuple[float, float, float, float]) -> Any:
+    """Total variance on the wing at outward distance ``u >= 0``.  Vectorised.
+
+    ``w(u) = w_join + beta u + (q - beta) lam (1 - exp(-u/lam))``.
+    """
+    w0, q, beta, lam = coef
+    uu = np.maximum(np.asarray(u, float), 0.0)
+    return w0 + beta * uu + (q - beta) * lam * (-np.expm1(-uu / lam))
+
+
+def _eval_wing_scalar(u: float, coef: tuple[float, float, float, float]) -> float:
+    """Pure-python :func:`eval_wing` for the scalar fast paths."""
+    w0, q, beta, lam = coef
+    uu = u if u > 0.0 else 0.0
+    return w0 + beta * uu - (q - beta) * lam * math.expm1(-uu / lam)
 
 
 # --------------------------------------------------------------------------- #
