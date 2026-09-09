@@ -504,11 +504,18 @@ def hedge_bands(book: Book, mkt: MarketSnapshot, pair: str, *,
             prev_S, prev_d = cur_S, cur_d
         return float("nan")
 
-    # Whalley-Wilmott indicative width
+    # Whalley-Wilmott indicative width.
+    # The constant is POLICY dependent and this was wrong: 3/2 is the hedge-to-EDGE
+    # constant, but everything in this repo hedges to TARGET, whose constant is 6 --
+    # a band 4**(1/3) = 1.587x wider. Taken from bandopt.POLICY_CONST rather than
+    # restated here, because a duplicated formula is exactly how band_pct and
+    # COMPONENTS drifted before. See docs/09_hedging_theory.md.
     ww = float("nan")
     if gamma != 0.0 and risk_aversion > 0:
+        from .bandopt import POLICY_CONST
         Tref = min([float(t) for t in live["T"] if float(t) > 0], default=1.0 / 12.0)
-        ww = (1.5 * lam * math.exp(-rd * Tref) * S0 * gamma ** 2 / risk_aversion) ** (1.0 / 3.0)
+        ww = (POLICY_CONST["center"] * lam * math.exp(-rd * Tref)
+              * S0 * gamma ** 2 / risk_aversion) ** (1.0 / 3.0)
 
     out = []
     for side, sgn in (("lower", -1), ("upper", +1)):

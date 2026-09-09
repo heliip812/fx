@@ -798,6 +798,8 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
                      snap_inside_pips: float = 1.0,
                      assume_flat_at_close: bool = True,
                      kappa: float = 1.0,
+                     persistence: float = 0.0, hurst: float | None = None,
+                     up_mult: float = 1.0, down_mult: float = 1.0,
                      report_ccy: str = "USD",
                      marks: Mapping[str, float] | None = None,
                      band: BandResult | None = None) -> list[LadderRung]:
@@ -817,6 +819,15 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
     Which constraint actually bound is recorded in ``LadderRung.note`` on the first
     rung and in ``ladder_summary()["spacing_source"]``.
 
+    ``persistence`` / ``hurst`` / ``up_mult`` / ``down_mult``
+                         passed straight to
+                         :func:`fxgamma.portfolio.bandopt.optimal_band`, so the ladder
+                         can be **asymmetric**: rungs above spot are spaced on
+                         ``band_spot_up`` and rungs below on ``band_spot_down``, each
+                         independently clamped by the delta cap and the clip floor.
+                         Defaults are symmetric and Brownian. The state-dependent rule
+                         that sets those multipliers from the shape of the move in
+                         progress belongs in ``fxgamma/portfolio/ratchet.py``.
     ``kappa``            path-roughness multiplier on the expected number of fills.
                          Defaults to 1.0, the Brownian baseline, and stays there:
                          forecasting roughness from daily bars loses to that null on
@@ -888,15 +899,25 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
     h_floor = float(min_clip_base) / abs(bg.gamma) if min_clip_base > 0 else 0.0
     if band_pips is not None:
         h_opt = float(band_pips) * spec.pip
+        mult_up, mult_dn = float(up_mult), float(down_mult)
         src = f"caller-supplied {band_pips:,.1f} pips"
     else:
         band = band or optimal_band(book, mkt, pair, cost_bp=cbp,
                                     risk_aversion=risk_aversion,
                                     horizon_days=max(vf, 1e-6), method=method,
                                     report_ccy=report_ccy, marks=marks,
-                                    cost_tier=cost_tier)
+                                    cost_tier=cost_tier, persistence=persistence,
+                                    hurst=hurst, up_mult=up_mult, down_mult=down_mult)
         h_opt = band.band_spot
+        mult_up = band.band_spot_up / band.band_spot if band.band_spot else 1.0
+        mult_dn = band.band_spot_down / band.band_spot if band.band_spot else 1.0
         src = f"{band.method} optimum {band.band_pips:,.1f} pips"
+        if not band.is_symmetric:
+            src += (f" (asymmetric: up x{mult_up:.2f} / down x{mult_dn:.2f}"
+                    + (f", persistence phi={band.persistence:+.2f}"
+                       if band.persistence else "") + ")")
+        elif band.persistence:
+            src += f" (persistence phi={band.persistence:+.2f}, x{band.persistence_mult:.2f})"
     h = min(h_opt, h_cap)
     which = src if h == h_opt else (
         f"DELTA CAP {cap / 1e6:,.2f}mm ({h_cap / spec.pip:,.1f} pips) over {src}"
@@ -929,6 +950,10 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
     T_eff = max(vf, 1e-9) / TRADING_DAYS
     long_gamma = bg.gamma > 0
 
+    # asymmetric half-widths: the cap and the clip floor apply to each side
+    h_side = {+1: min(max(h * mult_up, h_floor), h_cap if h_cap < math.inf else math.inf),
+              -1: min(max(h * mult_dn, h_floor), h_cap if h_cap < math.inf else math.inf)}
+
     rungs: list[LadderRung] = []
     for sgn in (+1, -1):                            # above spot, then below
         prev_level = S
@@ -938,12 +963,13 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
         prev_delta = d0 if assume_flat_at_close else target
         cum_hedge = -(d0 - target) if assume_flat_at_close else 0.0
         for k in range(1, int(n_rungs) + 1):
-            level = S + sgn * k * h
+            level = S + sgn * k * h_side[sgn]
             anchor, adist = "", 0.0
             if snap and anchors is not None and len(anchors):
                 level, anchor, adist = _snap(
                     level, sgn, anchors, spec,
-                    snap_max_pips if snap_max_pips is not None else 0.5 * h / spec.pip,
+                    snap_max_pips if snap_max_pips is not None
+                    else 0.5 * h_side[sgn] / spec.pip,
                     snap_inside_pips)
             if level <= 0:
                 break

@@ -18,16 +18,22 @@ Everything numeric in this document was produced against `get_provider("syntheti
    changes the expected overnight P&L by exactly **minus their transaction cost**. What the
    orders buy is *conversion* (mark-to-market becomes cash you keep even if spot round-trips)
    and *variance reduction* (you do not wake up holding a delta you never chose). §7.
-3. **Overnight is usually negative carry.** You pay 58% of a day's theta for 30–45% of a day's
-   variance. On the shipped EURUSD profile the window needs realised vol **9% above implied**
-   to break even; over a weekend it needs **2.4× implied**. The `crossover_vol` number is the
-   go/no-go. §3.
+3. **Overnight is usually negative carry.** You pay 58% of a day's theta for 35–50% of a day's
+   variance. On the calibrated EURUSD profile the window carries **0.382** of a day's variance
+   against 0.583 of the clock — **1.53× the theta per day of variance** — and needs realised vol
+   **~3% above implied** to break even; over a weekend it needs **2.2× implied**. The
+   `crossover_vol` number is the go/no-go. §3.
 4. **The delta cap, not the band, is the decision worth money.** At the user's real (retail)
    cost the analytically optimal EURUSD band is ~180 pips — five overnight sigmas. It is
    unusable as an overnight ladder. The cap binds and it *should*. §6, §9.
 5. **Analytic vs empirical:** Zakamouline lands within **10–23%** of the backtester's argmax at
    interbank cost and **19–21%** at retail cost; Whalley–Wilmott is **23–51% too tight**
    everywhere, and most of that gap is one identified, correctable constant. §5.
+6. **Every band model here assumes independent increments**, so it answers the random-walk
+   case and nothing else. If spot trends, a wider band captures *more*; if it chops, *less*.
+   `optimal_band` is therefore asymmetric- and persistence-capable, but the persistence
+   response has to be clamped hard and the real answer is a state-dependent ratchet, not a
+   static multiplier. §4.6.
 
 ---
 
@@ -57,8 +63,9 @@ the USDJPY band out by a factor of ~28 in `h`. **`zones.hedge_bands` reads its o
 theta is paid on **365** calendar days. `bandopt` uses 252 throughout (which is also what the
 backtest engine steps on, so analytic and empirical are directly comparable). `overnight`
 uses 252-based session variance for distance and 365-based pro-rata calendar theta for the
-bill. Conflating them is not a rounding issue: it turns the weeknight crossover ratio from
-1.09 into 1.31.
+bill. Conflating them is not a rounding issue: on the calibrated EURUSD profile the correct
+weeknight crossover needs realised vol **+3%** over implied; running both legs on the same clock
+turns that into **+24%**, i.e. it would tell you to go flat every night.
 
 ---
 
@@ -146,30 +153,46 @@ this sandbox, so nothing here has been fitted to real data**. `SessionProfile.so
 tested against a known profile, and is a one-line swap when the user runs it on their own
 machine.
 
-EURUSD default (variance weight by UTC hour, average = 1.00):
+EURUSD default, after the day/night calibration of §3.2 (variance weight by UTC hour,
+average = 1.00):
 
 ```
 h   00   01   02   03   04   05   06   07   08   09   10   11
-   0.53 0.48 0.43 0.38 0.38 0.43 0.62 1.29 1.68 1.63 1.39 1.25
+   0.59 0.54 0.49 0.43 0.43 0.49 0.58 1.21 1.57 1.52 1.30 1.17
 h   12   13   14   15   16   17   18   19   20   21   22   23
-   1.72 2.11 2.20 1.96 1.53 1.05 0.77 0.62 0.53 0.38 0.29 0.34
+   1.61 1.97 2.06 1.84 1.73 1.19 0.86 0.70 0.59 0.43 0.32 0.38
 ```
 
-Peak/trough 7.67 (GBPUSD 8.04, USDJPY 6.14, AUDUSD 4.00).
+Peak/trough 6.37 (GBPUSD 6.68, USDJPY 5.11, AUDUSD 3.32).
 
 ### 3.2 What the overnight window is worth
 
 London close 17:00 → open 07:00, `asof` in BST so 16:00Z → 06:00Z:
 
-| pair | clock share (= **theta** share) | variance share `var_fraction` | theta paid per day of variance | weekend `var_fraction` (2.583 cal days) | weekend ratio |
-|---|---|---|---|---|---|
-| EURUSD | 0.583 | **0.3393** | **1.72×** | 0.3205 | 8.06× |
-| USDJPY | 0.583 | **0.4032** | **1.45×** | 0.3800 | 6.80× |
-| GBPUSD | 0.583 | **0.3089** | **1.89×** | 0.2921 | 8.84× |
-| AUDUSD | 0.583 | **0.4489** | **1.30×** | 0.4186 | 6.17× |
+| pair | clock share (= **theta** share) | variance share `var_fraction` | theta paid per day of variance | sigma multiplier | weekend `var_fraction` (2.583 cal days) | weekend ratio |
+|---|---|---|---|---|---|---|
+| EURUSD | 0.583 | **0.3820** | **1.53×** | 1.236 | 0.3607 | 7.16× |
+| USDJPY | 0.583 | **0.4484** | **1.30×** | 1.141 | 0.4227 | 6.11× |
+| GBPUSD | 0.583 | **0.3497** | **1.67×** | 1.291 | 0.3307 | 7.81× |
+| AUDUSD | 0.583 | **0.4950** | **1.18×** | 1.086 | 0.4616 | 5.60× |
 
-14/24 = 58% is wrong by 1.72× in variance (1.31× in sigma) on EURUSD. A ladder built on clock
-time puts every rung 31% too far out and understates every touch probability.
+14/24 = 58% is wrong by 1.53× in variance (1.236× in sigma) on EURUSD. A ladder built on clock
+time puts every rung 24% too far out and understates every touch probability.
+
+**Calibration and provenance of the level, as distinct from the shape.** The hour-by-hour
+*shape* above is modelled. The day/night *level* is anchored on the one measurement available:
+the forecasting quant's estimator puts the EURUSD window at **0.382** of a day's variance
+(against 0.583 of the clock — ratio **1.53**, sigma multiplier **1.236**). The raw modelled
+shape gave 0.339, i.e. it made the night too quiet. `NIGHT_CALIBRATION = 1.2033` scales the
+night hours of *every* shipped profile and renormalises, which reproduces 0.382 exactly on
+EURUSD and moves the other pairs consistently while leaving the relative pair tilts as modelled
+as they were. So: **the EURUSD level is measured; every pair tilt and every other pair's level
+is not.** A user-supplied or `estimate_hour_profile` profile is used verbatim — the calibration
+factor applies only to the shipped defaults.
+
+*(An earlier PM note quoted 0.34 / 1.72 for this row; 0.583/0.382 = 1.53 and the forecaster's own
+sigma multiplier of 1.236 is consistent with 1.53, so 1.53 is what the code and this document
+use. The qualitative conclusion is unchanged and still leads the screen.)*
 
 The weekend column is the one worth staring at: `session_variance_weight` zeroes the 48 hours
 the market is shut (Fri 21:00Z → Sun 21:00Z, with a `SUNDAY_THIN_FACTOR = 0.55` on the reopen),
@@ -192,10 +215,10 @@ Synthesised two years of hourly bars from the EURUSD default profile (weekends r
 
 | n obs | span | corr(est, truth) | RMS relative error | window share, truth | window share, estimated |
 |---|---|---|---|---|---|
-| 12,759 | 731 days | **0.9933** | **8.2%** | 0.3393 | **0.3449** (+1.6%) |
+| 12,759 | 731 days | **0.9912** | **8.5%** | 0.3820 | **0.3832** (+0.3%) |
 
 At the volume Yahoo actually serves, the estimator recovers the window's variance share to
-under 2%. The per-hour error is 8% RMS, which is why `smooth=True` (circular 1-2-1) and
+better than 1%. The per-hour error is 8% RMS, which is why `smooth=True` (circular 1-2-1) and
 `blend_default=True` (shrink to the shipped profile with weight `min_obs/(min_obs + n_h)`) are
 both on by default: the profile is a smooth diurnal function and the estimator's noise is not.
 
@@ -220,12 +243,16 @@ and if the range forecast is just implied put through the session clock,
 
 | window | closed form `σ*/σ` | measured (full reprice) | reading |
 |---|---|---|---|
-| EURUSD weeknight | 0.918 | **0.915** (7.28% vs 7.96% marked) | needs realised **+9.3%** over implied |
-| USDJPY weeknight | 1.001 | **0.993** (9.77% vs 9.84%) | essentially break-even — the Tokyo fix pays for the night |
-| EURUSD weekend | 0.424 | **0.413** (3.29% vs 7.96%) | needs realised **2.4× implied** |
+| EURUSD weeknight | 0.974 | **0.971** (7.73% vs 7.96% marked) | needs realised **+3.0%** over implied |
+| USDJPY weeknight | 1.055 | **1.048** (10.31% vs 9.84%) | **positive** carry — the Tokyo fix pays for the night |
+| EURUSD weekend | 0.449 | **0.437** (3.48% vs 7.96%) | needs realised **2.2× implied** |
 
 That is the honest headline: on EURUSD, holding front gamma through an ordinary night is
-negative carry; on USDJPY it is roughly free; over a weekend it is expensive on any pair.
+marginally negative carry; on USDJPY, on this profile, it is marginally *positive*; over a
+weekend it is expensive on any pair. Note how close EURUSD and USDJPY sit to the line — the
+sign of the weeknight answer is decided by the pair tilt in the hour profile, which is the part
+that is **not** measured. Treat "positive on USDJPY" as a hypothesis to test with
+`estimate_hour_profile` on real bars, not as a result.
 **The ladder does not change this** — see §7 — which is why `ladder_summary` reports the carry
 decision (`gamma_pnl`, `theta`, `carry`, `crossover_vol`) *separately* from what the orders buy.
 
@@ -313,7 +340,103 @@ gamma and risk aversion entirely. Reported with its Leland number and the vol dr
 `50·Le·σ` in vol points, so the cost of the rule is visible. It exists to be beaten, and §5
 shows by how much.
 
-### 4.5 The empirical referee
+### 4.5 What all of them assume, and what the user noticed
+
+Whalley–Wilmott, Zakamouline and the Leland grid are all derived for a **driftless diffusion
+with independent increments**. That is not a technical footnote here — it is the assumption that
+makes §2's "expected capture is band-independent" result true, and therefore the assumption that
+makes the whole cost-versus-variance framing the *only* thing a band trades off.
+
+The user's question — *"if it keeps going one direction you want to optimise the level
+dynamically so that we don't hedge too early"* — is precisely a question about that assumption,
+and it is not a directional call. The gamma kernel is the sum of **squared moves between
+hedges**, and squares are not additive: `(a+b)² > a² + b²` for same-sign legs and
+`(a+b)² < a² + b²` for opposite-sign ones. +25 then +25 pips captures 2,500 hedged once against
+1,250 hedged each leg; +25 then −25 captures 0 hedged once against 1,250 hedged each. So under
+serial correlation the band *does* move expected capture.
+
+PM simulation, 4,000 AR(1) paths per cell, 240 steps, **variance equalised across φ** so only
+persistence differs. Captured sum of squared moves:
+
+| band | trending φ=+0.3 | random walk | choppy φ=−0.3 |
+|---|---|---|---|
+| 0.25 | 240.6 | 240.0 | 239.4 |
+| 1.00 | 261.5 | 240.1 | 215.8 |
+| 2.00 | 302.8 | 239.4 | 173.9 |
+| 4.00 | 348.1 | 237.0 | 148.4 |
+
+The **random-walk column is flat**, which reproduces §2 and validates the simulation. The other
+two are not: **+45% captured at a wide band when trending, −38% when choppy**, and the optimal
+band is monotone in φ.
+
+### 4.6 The persistence correction, and why it must be clamped
+
+Parameterise the memory by a Hurst exponent. For a self-similar path with exponent `H`,
+traversing `h` takes time `~ h^{1/H}`, so over a fixed window the number of rebalances is
+`~ h^{−1/H}` and each is worth `Γh²/2`:
+
+```
+E[capture](h)  ~  (Γ/2) · h^{e},      e = 2 − 1/H
+```
+
+`H = 1/2` gives `e = 0` and the textbook band-independence; `H > 1/2` (trending) gives `e > 0`;
+`H < 1/2` (choppy) gives `e < 0`. Fitting the table above to a power law in the band gives
+`e = +0.136` at φ=+0.3 and `e = −0.169` at φ=−0.3, i.e. **H = 0.536 and H = 0.461**, so
+`(H − 0.5)/φ` is 0.121 and 0.130. `HURST_PER_PHI = 0.125` is the round number between them, and
+the fit reproduces the measured capture ratios to a few per cent across a 16× range of bands.
+
+The objective, normalised so the multiplier is 1 at the Brownian optimum `h₀`:
+
+```
+U(h) = (ΓV/2)(h/h₀)^e  −  λS|Γ|V/h  −  (γ/12)Γ²h²V
+```
+
+`V` cancels out of `dU/dh = 0`, which `persistence_adjusted_band()` solves by bisection.
+
+**The raw solution is violent and must not be shipped as-is.** On the reference EURUSD book at
+interbank cost it returns **×6.97** at φ=+0.30 and **×0.03** at φ=−0.30. That is the model
+outside its range, not a result: capture dominates cost and risk by two orders of magnitude, so
+any `e > 0` pushes the band out until the variance penalty finally catches it — which assumes
+AR(1) memory still operates at *seven times* the Brownian band. It does not; an AR(1)'s memory
+dies after a few steps, and the power law was fitted over a 16× range of bands, not a 400× one.
+
+So the applied multiplier is clamped into `[min(1, √R), max(1, √R)]` with
+`R = (1+φ)/(1−φ)`, the AR(1) long-run variance ratio (1.86 at φ=+0.3, 0.54 at φ=−0.3, so
+`√R` = 1.36 and 0.73). `R` is the most total variance persistence can add relative to a random
+walk; its square root is the corresponding **distance** rescaling, and nothing about persistence
+justifies moving a distance by more than that. The unclamped figure is returned as
+`diagnostics["persistence_mult_raw"]`.
+
+Applied result, EURUSD reference book, one-day horizon:
+
+| φ | H | interbank band | retail band | applied ×| raw × |
+|---|---|---|---|---|---|
+| −0.30 | 0.463 | 45.2p | 133.2p | 0.734 | 0.017 |
+| −0.15 | 0.481 | 53.0p | 156.1p | 0.860 | 0.038 |
+| 0.00 | 0.500 | **61.6p** | **181.5p** | 1.000 | 1.000 |
+| +0.15 | 0.519 | 71.7p | 211.2p | 1.163 | 4.645 |
+| +0.30 | 0.537 | 84.0p | 247.4p | 1.363 | 2.280 |
+
+**That the unclamped answer is absurd is itself the argument for the ratchet.** The right
+response to "spot keeps going one way" is a *state-dependent rule* that stops hedging while the
+move is still extending, not a static multiplier applied all night in both directions. That
+logic belongs in `fxgamma/portfolio/ratchet.py`; `bandopt` deliberately provides only the
+symmetric baseline plus the hooks:
+
+* `optimal_band(..., persistence=φ, hurst=H, up_mult=, down_mult=)`,
+* `BandResult.band_spot_up / band_spot_down / band_pips_up / band_pips_down /
+  band_delta_up / band_delta_down / persistence / hurst / persistence_mult`,
+* `BandResult.is_symmetric`,
+* and `overnight_ladder(..., persistence=, hurst=, up_mult=, down_mult=)`, which spaces the
+  rungs above spot on `band_spot_up` and those below on `band_spot_down`, each independently
+  clamped by the delta cap and the clip floor.
+
+Defaults are symmetric and Brownian throughout. **Nothing here estimates φ**, because the
+forecasting quant measured that path roughness cannot be forecast from daily bars: it loses to
+the Brownian null on 5 of 5 pairs, with daily sampling recovering only 46–63% of the true
+crossing count. φ is an input a user with a view can set. It is not a prediction this tool makes.
+
+### 4.7 The empirical referee
 
 `method="empirical"` sweeps `HedgeRule(mode="band", band_delta=H)` through `backtest.engine`.
 Four design choices make it a referee rather than a second opinion:
@@ -387,6 +510,12 @@ position's gamma P&L over the horizon (`compare_bands(...).utility_giveup_pct`):
   the gamma P&L given up at retail cost, because a one-day-sigma grid rehedges far too often
   when each rehedge costs 5.8 pips round trip.
 
+**These bands answer the random-walk column of §4.5 and nothing else.** Both Whalley–Wilmott
+and Zakamouline assume a driftless diffusion with independent increments, and the empirical
+referee runs on GBM, which has them by construction. On a trending path the optimal band is
+wider than every number in the table; on a choppy one it is tighter (§4.6). The table validates
+the maths, not the market.
+
 **Not tested here, and it matters:** every number above is on GBM with constant vol.
 Real spot has jumps, intraday vol seasonality (§3, which the band formula ignores entirely) and
 mean reversion at some horizons — all of which move the optimum. The synthetic validation
@@ -413,16 +542,17 @@ EURUSD reference ladder, 0.5mm delta cap, 4 rungs/side, one night (`ladder_cost_
 
 | `cost_bp` | round trip (pips) | conversion (USD) | cost (USD) | night net |
 |---|---|---|---|---|
-| 0.2 (interbank) | 0.23 | 1,109 | 15 | −350 |
-| 1.0 | 1.17 | 1,109 | 77 | −412 |
-| 2.5 | 2.91 | 1,109 | 193 | −528 |
-| **5.0 (retail default)** | 5.83 | 1,109 | **386** | **−721** |
-| 10.0 | 11.65 | 1,109 | 772 | −1,107 |
-| 20.0 | 23.30 | 1,109 | 1,545 | −1,879 |
+| 0.2 (interbank) | 0.23 | 1,278 | 18 | −135 |
+| 1.0 | 1.17 | 1,278 | 89 | −206 |
+| 2.5 | 2.91 | 1,278 | 222 | −340 |
+| **5.0 (retail default)** | 5.83 | 1,278 | **445** | **−562** |
+| 10.0 | 11.65 | 1,278 | 890 | −1,007 |
+| 20.0 | 23.30 | 1,278 | 1,779 | −1,897 |
 
 At about **14bp round trip the ladder's cost exceeds everything it converts** and the orders are
 pure value destruction on this spacing. That is the number to check against the user's actual
-broker before shipping any of this.
+broker before shipping any of this. Note the conversion column does not move: the delta cap sets
+the spacing here, so cost changes the bill without changing the ladder.
 
 ---
 
@@ -444,12 +574,36 @@ first" test. On a symmetric ATM straddle the linear approximation is only ~2% ou
 snapped to a technical level, the delta is re-read **at the moved level** — reusing the unsnapped
 clip would leave the cumulative delta wrong there and at every rung beyond it.
 
-`p_touch` is the GBM first-passage probability under the forward drift
-(`zones.touch_probability`). `exp_crossings` is `E[L(x)]/h` from §2 — the expected number of
-**fills**, which is not a probability and is not bounded by 1: the nearest rung of a tight
-ladder fills 0.8–0.9 times on an ordinary night and several times on a choppy one. `p_touch`
-tells you whether you get filled once; `exp_crossings` tells you how often, and that is what
-determines what the rung is worth.
+`p_touch` is the **first-passage** probability under the forward drift
+(`zones.touch_probability`), i.e. the reflection-principle answer, **not** the terminal
+probability — which is roughly half of it and would halve every rung's expected contribution,
+worst at the near rungs that do most of the work. Verified against the driftless closed form
+`2·N(−d/σ_window)`:
+
+| distance | `touch_probability` | `2N(−d/σ)` | ratio | terminal `N(−d/σ)` |
+|---|---|---|---|---|
+| 0.25σ | 0.80236 | 0.80259 | 1.0000 | 0.40129 |
+| 0.49σ | 0.62394 | 0.62413 | 1.0000 | 0.31207 |
+| 0.98σ | 0.32731 | 0.32709 | 1.0007 | 0.16354 |
+| 1.97σ | 0.04935 | 0.04884 | 1.0104 | 0.02442 |
+| 3.00σ | 0.00281 | 0.00270 | 1.0392 | 0.00135 |
+
+(The small excess further out is the lognormal-plus-drift correction, which is correct — the
+implementation is the full GBM first-passage formula, not the driftless approximation.)
+
+`exp_crossings` is `κ·E[L(x)]/h` from §2 — the expected number of **fills**, which is not a
+probability and is not bounded by 1: the nearest rung of a tight ladder fills ~0.9 times on an
+ordinary night and several times on a choppy one. `p_touch` tells you whether you get filled
+once; `exp_crossings` tells you how often, and that is what determines what the rung is worth.
+
+**`κ` (path roughness) defaults to 1.0, the Brownian baseline, and stays there.** A real path
+crosses a fine grid more or fewer times than `E[L]/h` for the same terminal variance, and that
+ratio is exactly what decides how many times a ladder pays — but the forecasting quant
+implemented and verified the crossings/efficiency machinery (identity to 1–5%) and found that
+**forecasting κ from daily bars loses to the Brownian null on 5 of 5 pairs**: daily sampling
+recovers only 46–63% of the true crossing count. So κ is an explicit override for a user with a
+view, never something this tool derives, and `ladder_summary()["fills_basis"]` and the printed
+panel both say *"E[fills] assume a Brownian path"*.
 
 ### 7.2 Spacing, in priority order
 
@@ -467,66 +621,71 @@ fill.
 ### 7.3 Worked ladder — EURUSD long straddle
 
 Book: EUR/USD 10mm per leg, ATM 1.1650, 30 days. Spot 1.1650, ATM 7.96%. Long gamma **3.48mm
-per 1%**. Window: London close → open, `var_fraction` 0.3393, 0.5833 calendar days,
-**1σ = 34 pips**, breakeven move 37 pips. Delta cap 0.5mm, 4 rungs/side, retail 5bp.
+per 1%**. Window: London close → open, `var_fraction` 0.3820, 0.5833 calendar days,
+**1σ = 36 pips**, breakeven move 37 pips. Delta cap 0.5mm, 4 rungs/side, retail 5bp, κ = 1.
 
 ```
-CARRY   gamma +1,732 + theta −2,067 = −335 USD    crossover ATM 7.28% vs 7.96% marked
+CARRY   gamma +1,949 + theta −2,067 = −117 USD    crossover ATM 7.73% vs 7.96% marked
+E[fills] assume a BROWNIAN path (kappa 1) -- roughness is an input here, not a forecast
 LIMIT orders, spacing 17 pips  [DELTA CAP 0.50mm (16.7 pips) over zakamouline optimum 181.5 pips]
-  SELL 0.48mm EUR at 1.1717  (+67p, 1.97σ, touch  5%, E[fills] 0.04, banks   +10)
-  SELL 0.49mm EUR at 1.1700  (+50p, 1.47σ, touch 14%, E[fills] 0.13, banks   +33)
-  SELL 0.49mm EUR at 1.1683  (+33p, 0.98σ, touch 33%, E[fills] 0.35, banks   +94)
-  SELL 0.50mm EUR at 1.1667  (+17p, 0.49σ, touch 63%, E[fills] 0.82, banks  +221)
-  BUY  0.50mm EUR at 1.1633  (−17p, 0.49σ, touch 62%, E[fills] 0.82, banks  +223)
-  BUY  0.50mm EUR at 1.1617  (−33p, 0.98σ, touch 32%, E[fills] 0.35, banks   +96)
-  BUY  0.50mm EUR at 1.1600  (−50p, 1.47σ, touch 14%, E[fills] 0.13, banks   +35)
-  BUY  0.50mm EUR at 1.1583  (−67p, 1.97σ, touch  5%, E[fills] 0.04, banks   +10)
+  SELL 0.48mm EUR at 1.1717  (+67p, 1.85σ, touch  7%, E[fills] 0.05, banks   +14)
+  SELL 0.49mm EUR at 1.1700  (+50p, 1.39σ, touch 17%, E[fills] 0.16, banks   +43)
+  SELL 0.49mm EUR at 1.1683  (+33p, 0.93σ, touch 36%, E[fills] 0.41, banks  +111)
+  SELL 0.50mm EUR at 1.1667  (+17p, 0.46σ, touch 65%, E[fills] 0.90, banks  +245)
+  BUY  0.50mm EUR at 1.1633  (−17p, 0.46σ, touch 64%, E[fills] 0.90, banks  +247)
+  BUY  0.50mm EUR at 1.1617  (−33p, 0.93σ, touch 35%, E[fills] 0.41, banks  +113)
+  BUY  0.50mm EUR at 1.1600  (−50p, 1.39σ, touch 16%, E[fills] 0.16, banks   +44)
+  BUY  0.50mm EUR at 1.1583  (−67p, 1.85σ, touch  6%, E[fills] 0.05, banks   +15)
 ```
 
 | line | USD |
 |---|---|
-| position's expected gamma P&L over the window (`0.5·Γ·V`) | **+1,732** |
+| position's expected gamma P&L over the window (`0.5·Γ·V`) | **+1,949** |
 | theta, pro-rata on 0.5833 **calendar** days | **−2,067** |
-| **carry (hold-or-not; nothing to do with the ladder)** | **−335** |
-| of the 1,732, converted to cash by the ladder | 1,109 (**64%**) |
-| ladder transaction cost | −386 |
-| **ladder's effect on the EXPECTED P&L** | **−386** (exactly minus the cost) |
-| overnight P&L standard deviation, no ladder → with ladder | **−72%** |
-| night, all in | **−721** |
-| 3σ gap scenario (102 pips), full reprice + fills | +3,356 up / +3,507 down |
+| **carry (hold-or-not; nothing to do with the ladder)** | **−117** |
+| of the 1,949, converted to cash by the ladder | 1,278 (**66%**) |
+| ladder transaction cost | −445 |
+| **ladder's effect on the EXPECTED P&L** | **−445** (exactly minus the cost) |
+| overnight P&L standard deviation, no ladder → with ladder | **−73%** |
+| night, all in | **−562** |
+| 3σ gap scenario (108 pips), full reprice + fills | +4,010 up / +4,206 down |
 
-**How to read this.** The `−335` is the decision: this position is negative carry overnight and
-it would be negative carry if you left no orders at all. The ladder's contribution to the mean
-is `−386`. What you get for that 386 is 1,109 of mark-to-market turned into cash you keep even
-if spot round-trips, and a 72% cut in the standard deviation of the overnight outcome. That is
-a risk-control trade, and it is worth doing on those grounds — but calling the 1,109 "capture"
-would be a lie, because it is money the position already owned.
+**How to read this.** The `−117` is the decision: this position is (just) negative carry
+overnight and it would be negative carry if you left no orders at all. The ladder's contribution
+to the mean is `−445`. What you get for that 445 is 1,278 of mark-to-market turned into cash you
+keep even if spot round-trips, and a 73% cut in the standard deviation of the overnight outcome.
+That is a risk-control trade, and it is worth doing on those grounds — but calling the 1,278
+"capture" would be a lie, because it is money the position already owned.
 
-**Conversion identity check:** `Σ exp_realised = 1,109.0` against `0.5·Γ·V = 1,731.8`, i.e. a
-finite 4-rung ladder reaches 64.0% of the theoretical maximum. The share rises towards 1 as
+**Conversion identity check:** `Σ exp_realised = 1,277.6` against `0.5·Γ·V = 1,949.4`, i.e. a
+finite 4-rung ladder reaches 65.5% of the theoretical maximum. The share rises towards 1 as
 rungs are added and the spacing tightens; it can never exceed 1, which is the arithmetic proof
 that the ladder converts rather than creates.
 
 ### 7.4 Worked ladder — USDJPY
 
-Same structure, USD 10mm per leg ATM 147.50. Long gamma 2.81mm per 1%. `var_fraction` **0.4032**
-(Tokyo fix), 1σ = 58 pips, breakeven 58 pips. Spacing 26 pips (cap binds over a 259.6-pip
+Same structure, USD 10mm per leg ATM 147.50. Long gamma 2.81mm per 1%. `var_fraction` **0.4484**
+(Tokyo fix), 1σ = 61 pips, breakeven 58 pips. Spacing 26 pips (cap binds over a 259.6-pip
 optimum).
 
 | line | JPY |
 |---|---|
-| gamma P&L | +321,344 |
+| gamma P&L | +357,381 |
 | theta (0.5833 cal days) | −325,509 |
-| **carry** | **−4,165** — essentially flat; crossover 9.77% vs 9.84% marked |
-| converted by the ladder | 213,167 (**66%**) |
-| cost | −60,005 |
-| sd reduction | **−74%** |
-| 3σ gap (174 pips) | +1,097,129 up / +282,139 down |
+| **carry** | **+31,872** — positive; crossover 10.31% vs 9.84% marked |
+| converted by the ladder | 241,125 (**67%**) |
+| cost | −67,876 |
+| sd reduction | **−75%** |
+| night, all in | −36,004 |
+| 3σ gap (184 pips) | +1,247,481 up / +383,668 down |
 
-USDJPY is the interesting case: its overnight window carries 40% of the day's variance against
-58% of the theta, and the two nearly cancel. **On this pair the night is close to free; on
-EURUSD and GBPUSD it is not.** That difference comes entirely from the hour profile, which is
-why §3's provenance warning matters.
+USDJPY is the interesting case: its overnight window carries 45% of the day's variance against
+58% of the theta, and the two more than cancel. **On this pair the night pays for itself; on
+EURUSD and GBPUSD it does not.** The whole of that difference comes from the pair tilt in the
+hour profile, which is the part that is *modelled rather than measured* (§3.2). Note also that
+the ladder's cost (67,876) exceeds the carry (31,872): the position is worth holding overnight
+and the orders are still a net cost. Those are two separate decisions and the summary keeps them
+separate.
 
 ---
 
@@ -544,7 +703,7 @@ about the framing changes:
   through a gap and says so, rather than producing a comforting number.
 * The loss beyond the last rung is unbounded. `delta_beyond_last_rung` is reported for exactly
   this reason.
-* On the mirror-image EURUSD book: carry **+335**, ladder cost **386**, 3σ gap **−3,356 / −3,507**.
+* On the mirror-image EURUSD book: carry **+117**, ladder cost **445**, 3σ gap **−4,010 / −4,206**.
   The expectation is positive and the tail is the trade. Sizing off the expectation is how
   short-gamma books die.
 
@@ -565,10 +724,15 @@ willing to wake up holding. Concretely, on the reference EUR/USD 10mm straddle:
   clips does not pay*. Widen or do not do it.
 * **Overnight:** ignore the analytic band. **Set `max_overnight_delta` to the delta you would
   be unhappy to find on your screen at 07:00, and let it bind.** On the reference book, 0.5mm
-  gives a 17-pip ladder that converts 64% of the night's gamma and cuts the overnight standard
-  deviation by 72% for 386 USD. 2.0mm gives a 67-pip ladder that converts 7%, cuts the standard
-  deviation by 0%, and is decoration — because an unhedged book only accumulates 1.0mm of delta
+  gives a 17-pip ladder that converts 66% of the night's gamma and cuts the overnight standard
+  deviation by 73% for 445 USD. 2.0mm gives a 67-pip ladder that converts ~7%, cuts the standard
+  deviation by 0%, and is decoration — because an unhedged book only accumulates ~1.1mm of delta
   at one overnight sigma anyway, so a 2mm cap never binds.
+* **If you have a view that spot is trending or chopping, say so as a number.** Pass
+  `persistence` (AR(1) φ of the increments) or `hurst`, and `up_mult`/`down_mult` for an
+  asymmetric ladder. At φ = +0.3 the band widens 36%; at φ = −0.3 it tightens 27% (§4.6). Do not
+  expect the tool to infer φ for you — it cannot be forecast from daily bars, and the ladder
+  says so on the panel.
 * **Never ask yourself for a risk-aversion coefficient.** Nobody can introspect one.
   `bandopt.risk_aversion_for_band()` goes the other way: give it your delta cap and it returns
   the coefficient consistent with it, for anything downstream that needs one.
@@ -592,6 +756,9 @@ willing to wake up holding. Concretely, on the reference EUR/USD 10mm straddle:
   `estimate_hour_profile` on two years of Yahoo hourly bars on your own machine and the numbers
   in §3 will move — probably by less than 10% on the window share, but they will move.
 * Do not believe the touch probabilities in a gap. They are GBM.
+* Do not read `E[fills]` as a forecast of choppiness. It is the Brownian baseline (`κ = 1`), and
+  the panel says so. Roughness is real and it is what decides how many times each rung pays —
+  it just cannot be predicted from daily data.
 * Do not use `zones.COST_BP` for your own ladder. It is an interbank table.
 
 ---
@@ -625,14 +792,22 @@ example is not quietly reused.
 
 **Additive fields on the frozen types.** `LadderRung` gains `pair, k, order_type,
 spacing_pips, sigma_dist, exp_crossings, exp_realised, exp_cost, exp_marginal, delta_at_level,
-ccy, cost_bp, fx_to_report, note`; `BandResult` gains `pair, band_spot, band_pct,
+ccy, cost_bp, fx_to_report, note`; `LadderRung` also gains `kappa`. `BandResult` gains `pair, band_spot, band_pct,
 band_sigma_days, exp_var, exp_sd, gamma, gamma_1pct, sigma, horizon_days, cost_bp, lam,
 risk_aversion, risk_aversion_quote, policy, ccy, report_ccy, fx_to_report, leland,
-vol_drag_pts, breakeven_pips, max_delta, cap_binds, implied_risk_aversion, exp_marginal,
-cost_tier, asymptotic_ratio, diagnostics`. All appended with defaults, so the frozen positional
+vol_drag_pts, breakeven_pips, band_spot_up, band_spot_down, band_pips_up, band_pips_down,
+band_delta_up, band_delta_down, persistence, hurst, persistence_mult, max_delta, cap_binds,
+implied_risk_aversion, exp_marginal, cost_tier, asymptotic_ratio, diagnostics`. All appended with defaults, so the frozen positional
 signatures in `docs/08` §3 still construct. No frozen field changed name, type or meaning.
 `PassiveWindow` gains `clock_hours, calendar_days, open_hours, tz, profile_source,
 spans_weekend, note, hour_var, event_var, events`.
+
+**Interface note for `ratchet.py`.** `optimal_band` is asymmetric- and state-capable and is
+meant to be the ratchet's symmetric baseline: it accepts `persistence`, `hurst`, `up_mult`,
+`down_mult` and returns `band_spot_up`/`band_spot_down` (plus pips and delta forms),
+`is_symmetric`, `persistence_mult` and `diagnostics["persistence_mult_raw"]`.
+`overnight_ladder` forwards all four and spaces each side on its own half-width, independently
+clamped by the delta cap and the clip floor. No ratchet logic lives here, by design.
 
 **Still open.**
 
@@ -643,10 +818,13 @@ spans_weekend, note, hour_var, event_var, events`.
 * The band models are all GBM. Jumps, intraday vol seasonality and the fact that the overnight
   distribution is *not* the day distribution scaled are unmodelled. The session weight fixes
   the second moment; it does nothing for the shape.
-* `snap=True` remains unmeasured and therefore **off by default**, pending
-  `signals/levels.measure_reversal_stats` and its random-level control (PM steer, `docs/08` §2).
-  The mechanics are implemented, tested for delta consistency, and will stay off until the
-  measurement justifies them.
+* `snap=True` stays **off by default** and the measurement now supports that rather than merely
+  leaving the question open: `signals/levels.measure_reversal_stats` reports **4 of 80 cells
+  significant** after multiple-testing correction, **2 of 80** under an alternative control,
+  **zero replication**, and effect sizes of 0.2–0.4 pips. That does not earn a place in the
+  ladder economics. Caveat both ways: it is synthetic data, so it validates the machinery and
+  does not settle the market question. The snapping mechanics are implemented and the clip is
+  re-read at the moved level; the flag stays off.
 * `asymptotic_ratio > 0.5` should probably force a fallback to the empirical sweep rather than
   a warning. Left as a warning for now because the sweep takes ~70s and the ladder is
   interactive.

@@ -239,3 +239,73 @@ untrustworthy, and finding it in one's own harness is worth more than the result
 so the frozen signature could not work); `oi_levels` gains an optional `pair=` so pip size is not
 guessed; `fxgamma/signals/__init__.py` exports the new modules (**done by PM** — the owner had
 finished).
+
+---
+
+# AMENDMENT — band results; the WW constant bug; overnight band DEMOTED (binding)
+
+Source: `docs/09_hedging_theory.md`.
+
+## A real bug in the classical formula, found and fixed
+
+Whalley-Wilmott's `3/2` constant is for **hedge-to-edge**. Everything in this repo hedges **to
+target**, whose constant is **6** — a band `4**(1/3) = 1.587x` wider. That single correction
+explains essentially the whole WW-versus-empirical gap. `zones.py` had restated the formula with the
+edge constant and was therefore **1.587x too tight** for the policy the repo actually runs; the PM
+has fixed it to take the constant from `bandopt.POLICY_CONST` rather than restate it, because a
+duplicated formula is exactly how `band_pct` and `COMPONENTS` drifted earlier on this project.
+
+## Measured analytic-vs-empirical agreement
+
+10-day horizon, 64 paths x 24 steps/day, common random numbers.
+
+| | WW/emp | **Zakamouline/emp** | grid/emp |
+|---|---|---|---|
+| EURUSD interbank 0.2bp | 0.69 | **1.10** | 1.04 |
+| EURUSD retail 5bp | 0.49 | **0.79** | 0.25 |
+| USDJPY interbank 0.3bp | 0.77 | **1.23** | 1.11 |
+| USDJPY retail 5bp | 0.51 | **0.81** | 0.29 |
+
+Zakamouline drifts from slightly wide to slightly tight as cost rises because its
+`asymptotic_ratio -> 1.0`: the lambda -> 0 expansion is out of regime at retail cost. Reported as a
+diagnostic rather than tuned away, which is the right call.
+
+Method note worth keeping: the empirical referee **imposes** `E[hedging error] = 0` rather than
+estimating it — resolving a $200 cost difference through a $38k-sd sample mean would need ~1e5 paths
+— and then *tests* the imposition (worst |z| = 1.92). That is how to make a small effect measurable
+without fooling yourself.
+
+## RULING — the overnight band is DEMOTED; the delta cap is the decision
+
+**The objective is extremely flat: being 30% off the optimal band costs 0.1-0.9% of the gamma P&L.**
+This corroborates the trader's independent estimate that the band decision is worth ~USD 60 a night.
+
+Therefore: **use Zakamouline intraday** (~60 pips EURUSD interbank, ~180 retail); **overnight, ignore
+the band and let `max_overnight_delta` bind.** The screen must present it that way. Selling band
+optimisation as the answer would be selling the user the least valuable knob on the panel.
+
+This does not contradict the trend-conditional work. Under a **random walk** the band barely matters,
+which is exactly why the flat result appears; the whole value lives in the conditional case, which
+`ratchet.py` is testing.
+
+## Persistence cannot ship unclamped
+
+Taken literally, the first-order condition gives a band multiplier of **x6.97** at phi=+0.3. Clamped
+to `sqrt(R)`. The agent's conclusion is endorsed and relayed to `ratchet.py`: *that the raw answer is
+absurd is the argument for a state-dependent ratchet rather than a static multiplier.*
+
+## Crossover vols, and one flagged as a hypothesis not a result
+
+EURUSD weeknight crossover **7.73%** against 7.96% marked -> marked above crossover, so long gamma
+is **negative** overnight carry. USDJPY **10.31%** against 9.84% -> positive.
+
+**Carried caveat, and it must be badged in the UI.** Recalibrating the hour profiles to hit the
+measured 0.382 variance share on EURUSD is what flips USDJPY positive (+31,872 JPY), and that rests
+on a *modelled* pair tilt in synthetic data, not a measurement. The agent flagged it as a hypothesis
+rather than a result, which is correct. No pair-level overnight carry claim ships as fact until it is
+measured on the user's own hourly history.
+
+## RFC-1 (accepted, assigned to PM)
+
+`zones.risk_aversion` and `bandopt`'s differ in units. Reconcile to one definition; until then the
+two must not be compared. Recorded so the next reader does not assume they are interchangeable.

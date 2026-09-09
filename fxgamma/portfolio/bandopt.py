@@ -82,7 +82,115 @@ from .zones import COST_BP, TRADING_DAYS
 
 __all__ = ["BandResult", "BookGamma", "book_gamma", "optimal_band", "compare_bands",
            "band_utility_curve", "leland_number", "POLICY_CONST", "METHODS",
-           "RETAIL_COST_BP", "cost_bp_for", "risk_aversion_for_band"]
+           "RETAIL_COST_BP", "cost_bp_for", "risk_aversion_for_band",
+           "HURST_PER_PHI", "hurst_from_persistence", "persistence_adjusted_band"]
+
+#: ``H = 0.5 + HURST_PER_PHI * phi``.  Calibrated to the PM's 4,000-path AR(1)
+#: simulation (240 steps, variance equalised across phi so only persistence differs):
+#: fitting captured sum-of-squared-moves to a power law in the band gives an exponent
+#: of +0.136 at phi=+0.3 and -0.169 at phi=-0.3, i.e. H = 0.536 and H = 0.461, so
+#: (H - 0.5)/phi is 0.121 and 0.130.  0.125 is the round number between them.
+HURST_PER_PHI = 0.125
+
+def hurst_from_persistence(phi: float) -> float:
+    """AR(1) coefficient of the increments -> an effective Hurst exponent.
+
+    ``H = 0.5 + 0.125 * phi``, clipped to (0.05, 0.95).  ``phi = 0`` gives ``H = 0.5``,
+    the Brownian case, in which the band drops out of the expected capture entirely
+    (module docstring, and docs/09 s2).
+    """
+    return float(min(max(0.5 + HURST_PER_PHI * float(phi), 0.05), 0.95))
+
+
+def persistence_adjusted_band(h0: float, *, hurst: float, lam: float, spot: float,
+                              gamma: float, gamma_q: float,
+                              policy: str = "center") -> float:
+    """Re-solve the band's first-order condition for a path with memory.
+
+    Why the Brownian band is the wrong answer when increments are correlated
+    ----------------------------------------------------------------------
+    The gamma kernel is the sum of **squared moves between hedges**, and squares are
+    not additive: two same-sign legs give ``(a+b)^2 > a^2 + b^2`` while two opposite
+    ones give ``(a+b)^2 < a^2 + b^2``.  +25 then +25 pips captures 2,500 if you hedge
+    once and 1,250 if you hedge each leg; +25 then -25 captures 0 if you hedge once and
+    1,250 if you hedge each.  So on a trending path a wider band captures **more**, and
+    on a choppy one it captures **less** -- and the classic result that expected capture
+    is band-independent holds only for **independent increments**.
+
+    Parameterisation.  For a self-similar path with Hurst exponent ``H``, traversing a
+    distance ``h`` takes time ``~ h^{1/H}``, so over a fixed window the number of
+    rebalances is ``~ h^{-1/H}`` and each is worth ``Gamma h^2 / 2``:
+
+        E[capture](h)  ~  Gamma * h^{2 - 1/H} / 2 ,      e := 2 - 1/H
+
+    ``H = 1/2`` gives ``e = 0`` and the textbook band-independence; ``H > 1/2``
+    (trending) gives ``e > 0``; ``H < 1/2`` (choppy) gives ``e < 0``.  Fitted against
+    the PM's AR(1) simulation this reproduces the measured capture ratios to a few per
+    cent across a 16x range of band widths.
+
+    The objective, normalised so the multiplier is 1 at the Brownian optimum ``h0``:
+
+        U(h) = (Gamma V / 2)(h/h0)^e  -  lambda S |Gamma| V / h  -  (gamma/12) Gamma^2 h^2 V
+
+    ``V`` cancels out of ``dU/dh = 0``, which is then solved by bisection.  Returns
+    ``h0`` exactly when ``H = 0.5``.
+
+    **The raw solution must be clamped, and here is why.**  Unclamped, this FOC is
+    violent: on the reference EURUSD book at interbank cost it returns **x6.97** at
+    ``phi = +0.30`` and **x0.03** at ``phi = -0.30``.  That is the model being taken
+    outside its range, not a result.  The capture term dominates the cost and risk
+    terms by two orders of magnitude, so any ``e > 0`` pushes the band out until the
+    variance penalty finally catches it -- which assumes AR(1) memory still operates at
+    seven times the Brownian band, and it does not: an AR(1)'s memory dies after a few
+    steps, and the power law was fitted over a 16x range of bands, not a 400x one.
+
+    So the applied multiplier is clamped into ``[min(1, sqrt(R)), max(1, sqrt(R))]``
+    where ``R = (1+phi)/(1-phi)`` is the AR(1) long-run variance ratio -- 1.86 at
+    ``phi=+0.3`` and 0.54 at ``phi=-0.3``, so ``sqrt(R)`` is 1.36 and 0.73.  ``R`` is
+    the most total variance persistence can add relative to a random walk, and its
+    square root is the corresponding **distance** rescaling; nothing about persistence
+    justifies moving a distance by more than that.  ``BandResult`` carries the
+    unclamped figure as ``diagnostics["persistence_mult_raw"]`` so a caller that knows
+    better can use it.
+
+    That the unclamped answer is absurd is itself the argument for the ratchet: the
+    right response to "spot keeps going one way" is a **state-dependent rule** that
+    stops hedging while the move is still extending, not a static band multiplier
+    applied all night in both directions.
+
+    **This is a first-order adjustment, not the ratchet.**  It scales a *symmetric*
+    band by a persistence estimate the caller supplies.  The dynamic, state-dependent
+    "do not hedge too early into a trend" logic belongs in
+    ``fxgamma/portfolio/ratchet.py`` and should consume this as its symmetric baseline.
+    And per the forecasting quant's measurement, persistence **cannot be forecast from
+    daily bars** (it loses to the Brownian null on 5 of 5 pairs), so ``phi``/``hurst``
+    is an explicit input with a Brownian default and is never estimated here.
+    """
+    e = 2.0 - 1.0 / float(hurst)
+    if abs(e) < 1e-9 or h0 <= 0 or gamma == 0 or gamma_q <= 0:
+        return float(h0)
+    G, S = abs(float(gamma)), float(spot)
+    k = POLICY_CONST[policy] / 6.0        # 1 for "center", 1/4 for "edge"
+
+    def dU(h: float) -> float:
+        return (0.5 * G * e * h ** (e - 1.0) / h0 ** e
+                + lam * S * G / h ** 2
+                - (gamma_q / (6.0 * k)) * G * G * h)
+
+    lo, hi = h0 / 60.0, h0 * 60.0
+    flo, fhi = dU(lo), dU(hi)
+    if flo <= 0 or fhi >= 0:              # no interior root: take the endpoint
+        raw = float(hi if fhi > 0 else lo)
+    else:
+        for _ in range(140):
+            m = 0.5 * (lo + hi)
+            if dU(m) > 0:
+                lo = m
+            else:
+                hi = m
+        raw = float(0.5 * (lo + hi))
+    return raw
+
 
 #: Round-trip spot cost in bp for a **retail / no-OTC-access** account.
 #:
@@ -208,6 +316,16 @@ class BandResult:
     leland: float = float("nan")      # Leland number at the implied rehedge interval
     vol_drag_pts: float = float("nan")  # cost expressed in vol points
     breakeven_pips: float = 0.0       # 2*lambda*S: below this a rehedge cannot pay
+    # ---- asymmetric / state-dependent band (symmetric by default) ----
+    band_spot_up: float = 0.0         # half-width above spot, in spot units
+    band_spot_down: float = 0.0       # half-width below spot
+    band_pips_up: float = 0.0
+    band_pips_down: float = 0.0
+    band_delta_up: float = 0.0        # base ccy
+    band_delta_down: float = 0.0
+    persistence: float = 0.0          # AR(1) phi of the increments, as supplied
+    hurst: float = 0.5                # effective Hurst exponent used
+    persistence_mult: float = 1.0     # band / Brownian band
     max_delta: float = 0.0            # delta cap in force (0 = none)
     cap_binds: bool = False           # True when the cap, not the optimum, set the band
     implied_risk_aversion: float = float("nan")   # ra consistent with the band shown
@@ -217,6 +335,11 @@ class BandResult:
     diagnostics: dict = field(default_factory=dict)
 
     # convenient report-ccy copies
+    @property
+    def is_symmetric(self) -> bool:
+        return abs(self.band_spot_up - self.band_spot_down) <= 1e-15 * max(
+            self.band_spot_up, 1.0)
+
     @property
     def exp_capture_rep(self) -> float:
         return self.exp_capture * self.fx_to_report
@@ -374,6 +497,8 @@ def optimal_band(book: Book, mkt: MarketSnapshot, pair: str, *,
                  horizon_days: float = 1.0, method: str = "zakamouline",
                  report_ccy: str = "USD", policy: str = "center",
                  max_delta: float | None = None, cost_tier: str = "retail",
+                 persistence: float = 0.0, hurst: float | None = None,
+                 up_mult: float = 1.0, down_mult: float = 1.0,
                  marks: Mapping[str, float] | None = None,
                  sigma: float | None = None,
                  rule: HedgeRule | None = None,
@@ -399,6 +524,17 @@ def optimal_band(book: Book, mkt: MarketSnapshot, pair: str, *,
     :data:`fxgamma.portfolio.zones.COST_BP` table.  Pass ``cost_bp`` explicitly with
     the user's own broker number whenever you have it: the band goes as
     ``cost^(1/3)``, so a 25x cost error is a 2.9x band error.
+
+    **Asymmetric and state-capable, by design.**  ``persistence`` (the AR(1) phi of the
+    increments) or ``hurst`` directly re-solves the first-order condition for a path
+    with memory -- wider when trending, tighter when choppy -- via
+    :func:`persistence_adjusted_band`; both default to the Brownian case, in which
+    nothing changes.  ``up_mult`` / ``down_mult`` then scale the two sides
+    independently, and the result carries ``band_spot_up`` / ``band_spot_down`` (equal
+    unless asked otherwise).  The dynamic ratchet that decides those multipliers from
+    the state of the move lives in ``fxgamma/portfolio/ratchet.py`` and consumes this
+    as its symmetric baseline; nothing here estimates persistence, because it cannot be
+    estimated from daily bars (docs/09 s4.6).
 
     Raises ``ValueError`` on an unknown method rather than falling back (architecture
     s7: never silently substitute).
@@ -431,7 +567,7 @@ def optimal_band(book: Book, mkt: MarketSnapshot, pair: str, *,
                           risk_aversion=risk_aversion, gamma_q=gamma_q,
                           horizon_days=horizon_days, report_ccy=report_ccy, fq=fq,
                           policy=policy, max_delta=max_delta, cost_tier=cost_tier,
-                          **empirical_kw)
+                          up_mult=up_mult, down_mult=down_mult, **empirical_kw)
 
     const = POLICY_CONST[policy]
     sig = bg.sigma
@@ -477,7 +613,9 @@ def optimal_band(book: Book, mkt: MarketSnapshot, pair: str, *,
                                horizon_days=horizon_days)
     return _finish(bg, method, H, h_spot, curve, lam, cbp, risk_aversion, gamma_q,
                    horizon_days, report_ccy, fq, used_policy, " ".join(notes),
-                   sigma=sig, max_delta=max_delta, cost_tier=cost_tier)
+                   sigma=sig, max_delta=max_delta, cost_tier=cost_tier,
+                   persistence=persistence, hurst=hurst,
+                   up_mult=up_mult, down_mult=down_mult)
 
 
 # --------------------------------------------------------------------------- #
@@ -559,6 +697,7 @@ def _empirical(book: Book, mkt: MarketSnapshot, pair: str, *, bg: BookGamma,
                lam: float, cbp: float, risk_aversion: float, gamma_q: float,
                horizon_days: float, report_ccy: str, fq: float, policy: str,
                max_delta: float | None = None, cost_tier: str = "",
+               up_mult: float = 1.0, down_mult: float = 1.0,
                n_paths: int = 48, n_bands: int = 15, span: float = 5.0,
                steps_per_day: int = 24, seed0: int = 20260909,
                sigma_r: float | None = None, bands_spot: Sequence[float] | None = None,
@@ -704,6 +843,7 @@ def _empirical(book: Book, mkt: MarketSnapshot, pair: str, *, bg: BookGamma,
                    exp_rehedges=float(r_at["exp_rehedges"]),
                    utility=float(r_at["utility"]),
                    max_delta=max_delta, cost_tier=cost_tier,
+                   up_mult=up_mult, down_mult=down_mult,
                    diagnostics={"n_paths": len(paths), "steps_per_day": spd,
                                 "tenor_days": tenor, "notional_base": notional,
                                 "sigma_r": sigma_r, "grid_argmax_pips": float(df["band_pips"].iloc[i_max]),
@@ -727,8 +867,30 @@ def _finish(bg: BookGamma, method: str, H: float, h_spot: float, curve: pd.DataF
             *, sigma: float, exp_cost: float | None = None,
             exp_rehedges: float | None = None, utility: float | None = None,
             diagnostics: dict | None = None, max_delta: float | None = None,
-            cost_tier: str = "") -> BandResult:
+            cost_tier: str = "", persistence: float = 0.0,
+            hurst: float | None = None, up_mult: float = 1.0,
+            down_mult: float = 1.0) -> BandResult:
     spec = pair_spec(bg.pair)
+    H_eff = float(hurst) if hurst is not None else hurst_from_persistence(persistence)
+    p_mult = 1.0
+    p_raw = 1.0
+    if abs(H_eff - 0.5) > 1e-12 and np.isfinite(h_spot) and h_spot > 0:
+        h_new = persistence_adjusted_band(h_spot, hurst=H_eff, lam=lam, spot=bg.spot,
+                                          gamma=bg.gamma, gamma_q=gamma_q, policy=policy)
+        p_raw = h_new / h_spot
+        phi = float(persistence) if hurst is None else (H_eff - 0.5) / HURST_PER_PHI
+        R = (1.0 + phi) / (1.0 - phi) if abs(phi) < 1.0 else (100.0 if phi > 0 else 0.01)
+        rt = math.sqrt(max(R, 1e-6))
+        p_mult = min(max(p_raw, min(1.0, rt)), max(1.0, rt))
+        h_spot = h_spot * p_mult
+        H = abs(bg.gamma) * h_spot
+        note = (note + f" PERSISTENCE: phi={phi:+.3f} -> Hurst {H_eff:.3f} (capture "
+                f"exponent {2 - 1 / H_eff:+.3f}); raw FOC multiplier x{p_raw:.3f}, "
+                f"CLAMPED to x{p_mult:.3f} at sqrt of the AR(1) long-run variance ratio "
+                f"R={R:.3f}. Whalley-Wilmott and Zakamouline both assume INDEPENDENT "
+                "increments, so this correction sits outside their derivation, is "
+                "first-order only, and is not a substitute for a state-dependent "
+                "ratchet -- see docs/09 s4.6.").strip()
     cap_binds = False
     if max_delta is not None and float(max_delta) > 0 and np.isfinite(H) and H > float(max_delta):
         H = float(max_delta)
@@ -764,13 +926,18 @@ def _finish(bg: BookGamma, method: str, H: float, h_spot: float, curve: pd.DataF
         policy=policy, ccy=spec.quote, report_ccy=report_ccy.upper(), fx_to_report=fq,
         leland=Le, vol_drag_pts=50.0 * Le * sigma * 100.0 if np.isfinite(Le) else float("nan"),
         breakeven_pips=2.0 * lam * bg.spot / spec.pip,
+        band_spot_up=h_spot * float(up_mult), band_spot_down=h_spot * float(down_mult),
+        band_pips_up=h_spot * float(up_mult) / spec.pip,
+        band_pips_down=h_spot * float(down_mult) / spec.pip,
+        band_delta_up=H * float(up_mult), band_delta_down=H * float(down_mult),
+        persistence=float(persistence), hurst=H_eff, persistence_mult=p_mult,
         max_delta=float(max_delta or 0.0), cap_binds=cap_binds, cost_tier=cost_tier,
         exp_marginal=-(cost if exp_cost is None else exp_cost),
         implied_risk_aversion=risk_aversion_for_band(
             H, lam=lam, spot=bg.spot, gamma=bg.gamma, policy=policy,
             rd=bg.rd, T=bg.T_ref) / (fq or 1.0),
         asymptotic_ratio=h_spot / (bg.spot * sigma * math.sqrt(max(tau, 1e-12))),
-        diagnostics=diagnostics or {})
+        diagnostics={**(diagnostics or {}), "persistence_mult_raw": p_raw})
 
 
 def _empty(bg: BookGamma, method: str, cbp: float, lam: float, ra: float,
