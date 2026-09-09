@@ -81,7 +81,58 @@ from .risk import fx_rate, price_book
 from .zones import COST_BP, TRADING_DAYS
 
 __all__ = ["BandResult", "BookGamma", "book_gamma", "optimal_band", "compare_bands",
-           "band_utility_curve", "leland_number", "POLICY_CONST", "METHODS"]
+           "band_utility_curve", "leland_number", "POLICY_CONST", "METHODS",
+           "RETAIL_COST_BP", "cost_bp_for", "risk_aversion_for_band"]
+
+#: Round-trip spot cost in bp for a **retail / no-OTC-access** account.
+#:
+#: :data:`fxgamma.portfolio.zones.COST_BP` is an interbank table.  This user has no OTC
+#: prime relationship, and the trader review puts their real all-in cost at 15-40x the
+#: interbank number.  Using the interbank table for a retail ladder understates the
+#: cost of every rung by more than an order of magnitude, and the cost term is the only
+#: thing the band trades against -- so the wrong table gives a band roughly
+#: ``25^(1/3) = 2.9x`` too tight.  These are the shipped retail defaults; they are
+#: assumptions, not measurements, and ``optimal_band``/``overnight_ladder`` take
+#: ``cost_bp`` explicitly so the user can put in their own broker's number.
+RETAIL_COST_BP: dict[str, float] = {
+    "EURUSD": 5.0, "USDJPY": 5.0, "GBPUSD": 7.0, "USDCHF": 8.0, "USDCAD": 8.0,
+    "AUDUSD": 8.0, "NZDUSD": 12.0, "USDSEK": 25.0, "USDNOK": 25.0,
+    "EURJPY": 10.0, "EURGBP": 10.0, "EURCHF": 10.0,
+}
+
+
+def cost_bp_for(pair: str, tier: str = "retail") -> float:
+    """Round-trip spot cost in bp.  ``tier`` in ``{"retail", "interbank"}``.
+
+    Defaults to **retail**, because that is what this user pays.  Anything reading the
+    interbank table must say so on screen.
+    """
+    t = str(tier).strip().lower()
+    if t == "interbank":
+        return COST_BP.get(pair, 0.5)
+    if t != "retail":
+        raise ValueError(f"unknown cost tier {tier!r}; known: retail, interbank")
+    return RETAIL_COST_BP.get(pair, 10.0 * COST_BP.get(pair, 0.5))
+
+
+def risk_aversion_for_band(band_delta_base: float, *, lam: float, spot: float,
+                           gamma: float, policy: str = "center",
+                           rd: float = 0.0, T: float = 0.0) -> float:
+    """Invert the cubic: what risk aversion makes ``band_delta_base`` optimal?
+
+    ``gamma_risk = const * e^{-rd T} * lambda * S * G^2 / H^3``.
+
+    This is the function that lets the tool **ask the user for a delta cap instead of
+    a risk-aversion coefficient**.  Nobody can introspect their own absolute risk
+    aversion in inverse dollars; everybody can answer "what is the most delta you are
+    willing to wake up holding".  Answer that, and this returns the ``risk_aversion``
+    that is consistent with it, which can then be used everywhere else.
+    """
+    H = abs(float(band_delta_base))
+    if H <= 0 or gamma == 0 or lam <= 0:
+        return float("nan")
+    return (POLICY_CONST[policy] * math.exp(-rd * max(T, 0.0)) * lam * spot
+            * gamma * gamma / H ** 3)
 
 #: ``H^3 = POLICY_CONST[policy] * lambda * S * G^2 / gamma``.
 #:
@@ -113,13 +164,17 @@ class BandResult:
 
     ``band_pips``        half-width of the no-trade band measured in **spot pips**.
     ``band_delta_base``  the same band in base-ccy delta -- ``band_pips * pip * |G|``.
-    ``exp_capture``      expected gamma P&L over ``horizon_days``, quote ccy.  Equal
-                         for every method: ``0.5 * G * V``.  It is reported so the
-                         reader can see that it does not move.
+    ``exp_capture``      the **position's** expected gamma P&L over ``horizon_days``,
+                         ``0.5 * G * V``, quote ccy.  Identical for every method, and
+                         identical to not hedging at all.  It is NOT something the
+                         band earns -- it is the mark-to-market you own either way.
+                         The band's marginal effect on the mean is exactly
+                         ``-exp_cost``; what it buys for that is ``exp_var``.
     ``exp_cost``         expected transaction cost over the horizon, quote ccy.
     ``exp_rehedges``     expected number of rebalances over the horizon (hedge-to-
                          target counting; see ``POLICY_CONST``).
     ``utility``          ``exp_capture - exp_cost - (gamma/2) * exp_var``, quote ccy.
+                         Only the last two terms depend on the band.
     ``curve``            the full trade-off curve, one row per candidate band.
     """
     band_pips: float
@@ -153,6 +208,11 @@ class BandResult:
     leland: float = float("nan")      # Leland number at the implied rehedge interval
     vol_drag_pts: float = float("nan")  # cost expressed in vol points
     breakeven_pips: float = 0.0       # 2*lambda*S: below this a rehedge cannot pay
+    max_delta: float = 0.0            # delta cap in force (0 = none)
+    cap_binds: bool = False           # True when the cap, not the optimum, set the band
+    implied_risk_aversion: float = float("nan")   # ra consistent with the band shown
+    exp_marginal: float = 0.0         # effect of hedging on the MEAN: exactly -exp_cost
+    cost_tier: str = ""
     asymptotic_ratio: float = float("nan")   # band / (S sigma sqrt(horizon))
     diagnostics: dict = field(default_factory=dict)
 
@@ -313,6 +373,7 @@ def optimal_band(book: Book, mkt: MarketSnapshot, pair: str, *,
                  cost_bp: float | None = None, risk_aversion: float = 1e-6,
                  horizon_days: float = 1.0, method: str = "zakamouline",
                  report_ccy: str = "USD", policy: str = "center",
+                 max_delta: float | None = None, cost_tier: str = "retail",
                  marks: Mapping[str, float] | None = None,
                  sigma: float | None = None,
                  rule: HedgeRule | None = None,
@@ -324,6 +385,20 @@ def optimal_band(book: Book, mkt: MarketSnapshot, pair: str, *,
     -- the horizon cancels out of the first-order condition -- but it does scale
     ``exp_capture``, ``exp_cost`` and ``exp_var``, which is what the trader reads.
     The ``empirical`` method genuinely uses it: that is the length of path it walks.
+
+    ``max_delta`` is the **delta cap**: the largest base-ccy delta the user is willing
+    to be carrying between rebalances.  When supplied it is a hard ceiling on the band
+    -- ``band_delta_base = min(analytic, max_delta)`` -- and ``cap_binds`` says which
+    one won.  Prefer this to tuning ``risk_aversion``: on the reference book the whole
+    band decision is worth tens of dollars a night while the delta you wake up holding
+    is worth thousands, and nobody can state their own absolute risk aversion in
+    inverse dollars anyway.  ``implied_risk_aversion`` reports the coefficient that
+    would have produced whatever band came back, so the two views stay consistent.
+
+    ``cost_tier`` defaults to **retail** (:data:`RETAIL_COST_BP`), not the interbank
+    :data:`fxgamma.portfolio.zones.COST_BP` table.  Pass ``cost_bp`` explicitly with
+    the user's own broker number whenever you have it: the band goes as
+    ``cost^(1/3)``, so a 25x cost error is a 2.9x band error.
 
     Raises ``ValueError`` on an unknown method rather than falling back (architecture
     s7: never silently substitute).
@@ -338,7 +413,7 @@ def optimal_band(book: Book, mkt: MarketSnapshot, pair: str, *,
     bg = book_gamma(book, mkt, pair, marks=marks, sigma=sigma)
     if rule is not None and rule.cost_bp and cost_bp is None:
         cost_bp = rule.cost_bp
-    cbp = float(cost_bp) if cost_bp is not None else COST_BP.get(pair, 0.5)
+    cbp = float(cost_bp) if cost_bp is not None else cost_bp_for(pair, cost_tier)
     lam = cbp / 2.0 / 1e4
     fq = fx_rate(spec.quote, report_ccy, mkt)
     # risk aversion is quoted in 1/report_ccy; a quote-ccy variance is (1/fq)^2 the
@@ -356,7 +431,8 @@ def optimal_band(book: Book, mkt: MarketSnapshot, pair: str, *,
         return _empirical(book, mkt, pair, bg=bg, lam=lam, cbp=cbp,
                           risk_aversion=risk_aversion, gamma_q=gamma_q,
                           horizon_days=horizon_days, report_ccy=report_ccy, fq=fq,
-                          policy=policy, **empirical_kw)
+                          policy=policy, max_delta=max_delta, cost_tier=cost_tier,
+                          **empirical_kw)
 
     const = POLICY_CONST[policy]
     sig = bg.sigma
@@ -402,7 +478,7 @@ def optimal_band(book: Book, mkt: MarketSnapshot, pair: str, *,
                                horizon_days=horizon_days)
     return _finish(bg, method, H, h_spot, curve, lam, cbp, risk_aversion, gamma_q,
                    horizon_days, report_ccy, fq, used_policy, " ".join(notes),
-                   sigma=sig)
+                   sigma=sig, max_delta=max_delta, cost_tier=cost_tier)
 
 
 # --------------------------------------------------------------------------- #
@@ -483,6 +559,7 @@ def _zakamouline(bg: BookGamma, *, lam: float, gamma_q: float, const: float,
 def _empirical(book: Book, mkt: MarketSnapshot, pair: str, *, bg: BookGamma,
                lam: float, cbp: float, risk_aversion: float, gamma_q: float,
                horizon_days: float, report_ccy: str, fq: float, policy: str,
+               max_delta: float | None = None, cost_tier: str = "",
                n_paths: int = 48, n_bands: int = 15, span: float = 5.0,
                steps_per_day: int = 24, seed0: int = 20260909,
                sigma_r: float | None = None, bands_spot: Sequence[float] | None = None,
@@ -627,6 +704,7 @@ def _empirical(book: Book, mkt: MarketSnapshot, pair: str, *, bg: BookGamma,
                    exp_cost=float(r_at["exp_cost"]),
                    exp_rehedges=float(r_at["exp_rehedges"]),
                    utility=float(r_at["utility"]),
+                   max_delta=max_delta, cost_tier=cost_tier,
                    diagnostics={"n_paths": len(paths), "steps_per_day": spd,
                                 "tenor_days": tenor, "notional_base": notional,
                                 "sigma_r": sigma_r, "grid_argmax_pips": float(df["band_pips"].iloc[i_max]),
@@ -649,8 +727,18 @@ def _finish(bg: BookGamma, method: str, H: float, h_spot: float, curve: pd.DataF
             horizon_days: float, report_ccy: str, fq: float, policy: str, note: str,
             *, sigma: float, exp_cost: float | None = None,
             exp_rehedges: float | None = None, utility: float | None = None,
-            diagnostics: dict | None = None) -> BandResult:
+            diagnostics: dict | None = None, max_delta: float | None = None,
+            cost_tier: str = "") -> BandResult:
     spec = pair_spec(bg.pair)
+    cap_binds = False
+    if max_delta is not None and float(max_delta) > 0 and np.isfinite(H) and H > float(max_delta):
+        H = float(max_delta)
+        h_spot = H / abs(bg.gamma)
+        cap_binds = True
+        note = (note + f" DELTA CAP BINDS: the analytic band exceeded the "
+                f"{float(max_delta) / 1e6:,.2f}mm cap and was truncated to it; the band you "
+                "are running is the cap, not the optimum, and that is the right way round "
+                "-- the cap is a risk statement, the optimum is a cost/variance guess.").strip()
     tau = float(horizon_days) / TRADING_DAYS
     V = sigma * sigma * tau * bg.spot * bg.spot
     cap = 0.5 * bg.gamma * V
@@ -677,6 +765,11 @@ def _finish(bg: BookGamma, method: str, H: float, h_spot: float, curve: pd.DataF
         policy=policy, ccy=spec.quote, report_ccy=report_ccy.upper(), fx_to_report=fq,
         leland=Le, vol_drag_pts=50.0 * Le * sigma * 100.0 if np.isfinite(Le) else float("nan"),
         breakeven_pips=2.0 * lam * bg.spot / spec.pip,
+        max_delta=float(max_delta or 0.0), cap_binds=cap_binds, cost_tier=cost_tier,
+        exp_marginal=-(cost if exp_cost is None else exp_cost),
+        implied_risk_aversion=risk_aversion_for_band(
+            H, lam=lam, spot=bg.spot, gamma=bg.gamma, policy=policy,
+            rd=bg.rd, T=bg.T_ref) / (fq or 1.0),
         asymptotic_ratio=h_spot / (bg.spot * sigma * math.sqrt(max(tau, 1e-12))),
         diagnostics=diagnostics or {})
 

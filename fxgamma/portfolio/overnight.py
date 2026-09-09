@@ -3,44 +3,69 @@
 ``overnight_ladder(book, mkt, pair, ...) -> list[LadderRung]`` and
 ``ladder_summary(...) -> dict`` (docs/08_overnight_gamma.md s3).
 
-The user trades London by hand and is asleep the rest of the time.  This module turns
-the book's gamma into a set of resting orders that keep monetising it overnight, and
-into an honest arithmetic of whether tonight is worth doing at all.
+READ THIS FIRST: overnight gamma is usually negative carry
+----------------------------------------------------------
+London close to London open is 14 of 24 hours, so you pay **58% of a day's theta**.
+On the shipped EURUSD hour profile that window carries only **34% of a day's
+variance** -- Asia is quiet and the two hours around the New York close are the
+deadest of the twenty-four.  Correcting for the fact that theta runs on 365 calendar
+days while variance is delivered over 252 trading days, the window pays for itself
+only if realised vol comes in about **9% above implied**; over a weekend, where you
+pay 2.6 calendar days of theta for ~0.35 days of tradeable variance, it needs realised
+vol about **2.3x implied**.  :func:`crossover_vol` turns that into the one number the
+decision actually needs: *the ATM implied at which tonight's forecast range exactly
+pays tonight's theta*.  Above it, holding the gamma overnight loses money in
+expectation.
+
+So this module does **not** claim the ladder monetises anything.  Under driftless
+spot, leaving the orders does not change the expected P&L at all: mark-to-market
+already contains the gamma, every hedge is a fair bet, and the ladder's only effect on
+the mean is **minus its transaction cost**.  What it does buy is
+
+* **conversion** -- unrealised mark-to-market becomes realised cash you keep even if
+  spot comes back, and
+* **variance reduction** -- you do not wake up holding a delta you never chose.
+
+Those are worth having.  They are not "capture", and the fields here are named
+accordingly (``exp_realised``, ``exp_cost``, ``exp_marginal``, ``sd_reduction_pct``).
 
 Three things it gets right that a naive ladder gets wrong
 --------------------------------------------------------
 
-**1. Session variance time, not clock time.**  London close 17:00 to London open 07:00
-is 14 of 24 hours, but it is *not* 14/24 = 58% of a day's variance.  Asia is quiet,
-the Tokyo fix and the London open are not, and the two hours around the New York
-close are the deadest of the twenty-four.  On the default EURUSD profile the overnight
-window carries **~34%** of a day's variance -- a factor of 1.7 in variance and 1.31 in
-sigma against the clock-time answer.  Every rung distance and every touch probability
-is proportional to that sigma, so getting it wrong misprices the whole ladder.
-See :data:`DEFAULT_HOUR_PROFILES` and :func:`estimate_hour_profile`.
+**1. Session variance time, not clock time.**  See above; the ratio is 1.7x on
+EURUSD, and every rung distance and every touch probability scales with the sigma it
+produces.  Scheduled events are a real part of it -- roughly a third of the shipped
+calendar falls inside this window -- so the profile is event-aware rather than a
+single scalar: see :func:`session_variance_weight` and :data:`EVENT_VAR_UPLIFT`.
 
 **2. The number of times a rung actually pays is a local-time question.**  For a grid
 of spacing ``h``, the expected number of crossings of the level ``x`` away from spot
 over a window whose spot standard deviation is ``s`` is ``E[L(x)] / h`` where
 ``E[L(x)] = 2 s (phi(u) - u (1 - Phi(u)))``, ``u = |x| / s``, is the expected Brownian
 local time at that level (Tanaka's formula).  Summing over the grid reproduces
-``E[total crossings] = V / h^2`` and hence ``E[capture] = Gamma V / 2``, the
-continuous-hedging gamma P&L.  This is not a hand-wave and it is not a "probability of
-touch": a rung that is touched once pays half a round trip; the same rung in a choppy
-night can pay six times.  :func:`expected_crossings`.
+``E[total crossings] = V / h^2`` and hence ``sum of conversions = Gamma V / 2``, the
+position's whole gamma P&L.  That identity is the proof that the ladder converts
+rather than creates.  :func:`expected_crossings`.
 
-**3. The band comes from the optimiser, not a rule of thumb.**  Spacing is
-:func:`fxgamma.portfolio.bandopt.optimal_band` evaluated over *this window's*
-variance.  Read ``docs/09_hedging_theory.md`` s2 before reading the P&L numbers: the
-*expected* gamma capture does not depend on the spacing.  Spacing buys you lower cost
-at the price of higher variance, and it decides how much of the theoretical
-``Gamma V / 2`` a *finite* ladder actually reaches.
+**3. The delta cap leads; the analytic band is a refinement inside it.**  On the
+reference book the entire band decision is worth of order 60 USD a night, while the
+delta you are willing to wake up holding is worth thousands, and a realistic minimum
+clip binds before the analytic optimum does.  ``overnight_ladder`` therefore takes
+``max_overnight_delta`` as its primary risk input, clamps the
+:func:`fxgamma.portfolio.bandopt.optimal_band` spacing inside it, and reports which
+constraint actually set the spacing.  Nothing here asks the user for a risk-aversion
+coefficient; :func:`fxgamma.portfolio.bandopt.risk_aversion_for_band` goes the other
+way when a coefficient is needed downstream.
+
+Cost is a retail cost.  ``zones.COST_BP`` is an interbank table and this user has no
+OTC access, so the default here is :data:`fxgamma.portfolio.bandopt.RETAIL_COST_BP`
+and :func:`ladder_cost_sensitivity` shows how much of the answer that assumption owns.
 
 Short gamma
 -----------
 The ladder inverts and the orders become **stops**, not limits.  A short-gamma ladder
 left unattended is a materially different and more dangerous object than a long-gamma
-one -- it has unbounded loss, it sells lows and buys highs by construction, and the
+one -- the expected gamma term is negative, the theta is the entire edge, and the
 stops that are supposed to protect it are exactly the orders that will not fill at
 your price in the gap you are worried about.  :func:`ladder_summary` refuses to frame
 it as an income strategy and returns ``gamma_side="short"`` with the warnings up
@@ -60,17 +85,26 @@ import pandas as pd
 from ..conventions import PAIRS, pair_spec
 from ..models import gk
 from ..types import Book, HedgeRule, MarketSnapshot
-from .bandopt import BandResult, BookGamma, book_gamma, optimal_band
-from .risk import fx_rate, price_book, spot_ladder
+from .bandopt import (RETAIL_COST_BP, BandResult, BookGamma, book_gamma,
+                      cost_bp_for, optimal_band, risk_aversion_for_band)
+from .risk import fx_rate, price_book, shift_market, spot_ladder
 from .zones import COST_BP, TRADING_DAYS, touch_probability
 
 __all__ = [
     "LadderRung", "PassiveWindow", "SessionProfile",
-    "DEFAULT_HOUR_PROFILES", "MARKET_CLOSE_UTC_H", "MARKET_OPEN_UTC_H",
+    "DEFAULT_HOUR_PROFILES", "EVENT_VAR_UPLIFT", "MARKET_CLOSE_UTC_H",
+    "MARKET_OPEN_UTC_H", "RETAIL_LOT_BASE",
     "passive_window", "session_variance_weight", "hour_profile",
     "estimate_hour_profile", "expected_crossings", "expected_local_time",
-    "overnight_ladder", "ladder_summary", "format_ladder",
+    "crossover_vol", "overnight_ladder", "ladder_summary",
+    "ladder_cost_sensitivity", "ladder_frame", "format_ladder",
 ]
+
+#: Smallest base-ccy clip a retail account can actually deal (one standard lot).
+#: The trader review's point that the clip floor binds before the analytic optimum
+#: does: a 30-pip ladder on a 3mm-gamma book asks for clips this size or smaller, and
+#: a clip you cannot deal is not a band, it is a rounding error.
+RETAIL_LOT_BASE = 100_000.0
 
 UTC = timezone.utc
 
@@ -93,7 +127,12 @@ class LadderRung:
                         split of the total.
     ``p_touch``         first-passage probability of reaching this level inside the
                         window (``zones.touch_probability``, forward drift).
-    ``exp_pnl``         **net** expected contribution: ``exp_capture - exp_cost``.
+    ``exp_pnl``         **net cash this rung is expected to bank**:
+                        ``exp_realised - exp_cost``.  Read the module docstring before
+                        reading it as profit: under driftless spot the ladder does not
+                        change the expected P&L of the position at all, it converts
+                        mark-to-market into realised cash and caps the delta.  The
+                        rung's effect on the *mean* is ``exp_marginal = -exp_cost``.
     """
     level: float
     side: int
@@ -111,8 +150,10 @@ class LadderRung:
     spacing_pips: float = 0.0        # distance to the next rung inward
     sigma_dist: float = 0.0          # distance in window sigmas
     exp_crossings: float = 0.0       # expected fills over the window (local time)
-    exp_capture: float = 0.0         # gross gamma capture from this rung, quote ccy
+    exp_realised: float = 0.0        # mark-to-market CONVERTED to cash here, quote ccy
     exp_cost: float = 0.0            # expected transaction cost, quote ccy
+    exp_marginal: float = 0.0        # effect on the expected P&L: exactly -exp_cost
+    cost_bp: float = 0.0             # round-trip cost assumption used
     delta_at_level: float = 0.0      # book option delta at this level (pre-hedge)
     ccy: str = ""
     fx_to_report: float = 1.0
@@ -126,8 +167,9 @@ class LadderRung:
         return {f: getattr(self, f) for f in
                 ("pair", "k", "level", "side", "order_type", "clip_base",
                  "cum_delta_base", "pips_from_spot", "spacing_pips", "sigma_dist",
-                 "p_touch", "exp_crossings", "exp_capture", "exp_cost", "exp_pnl",
-                 "anchor", "anchor_dist_pips", "delta_at_level", "ccy", "note")}
+                 "p_touch", "exp_crossings", "exp_realised", "exp_cost", "exp_pnl",
+                 "exp_marginal", "anchor", "anchor_dist_pips", "delta_at_level",
+                 "ccy", "cost_bp", "note")}
 
 
 @dataclass(frozen=True)
@@ -151,6 +193,14 @@ class PassiveWindow:
     profile_source: str = ""
     spans_weekend: bool = False
     note: str = ""
+    # ---- event-aware detail: var_fraction is a scalar, the night is not ----
+    #: (UTC hour start, days-of-variance contributed) for every hour of the window,
+    #: so a consumer can see *where* the variance sits rather than only how much.
+    hour_var: tuple[tuple[datetime, float], ...] = ()
+    #: days of variance attributable to scheduled events inside the window
+    event_var: float = 0.0
+    #: the events themselves, "HH:MM CCY label (importance)"
+    events: tuple[str, ...] = ()
 
     @property
     def clock_fraction(self) -> float:
@@ -204,6 +254,22 @@ MARKET_CLOSE_UTC_H = 21.0   # Friday
 MARKET_OPEN_UTC_H = 21.0    # Sunday
 #: Sunday's reopening hours are thinner than the same hours midweek.
 SUNDAY_THIN_FACTOR = 0.55
+
+#: Extra variance a scheduled event puts into its hour, in **average-hour units**
+#: (the same units as :data:`DEFAULT_HOUR_PROFILES`), by ``importance``.
+#:
+#: A ``PassiveWindow.var_fraction`` that is one scalar cannot describe a night with a
+#: BoJ decision in it, and roughly a third of the shipped event calendar falls inside
+#: the London-close-to-open window (BoJ, RBA, RBNZ and every Asian data print live
+#: there).  So the window's variance is built hour by hour with these uplifts added to
+#: the hour that contains the event.  An importance-3 hour ends up carrying roughly
+#: 5-10x a normal hour of that time of day, which is the order of magnitude the
+#: intraday event-study literature reports.
+#:
+#: MODELLED DEFAULTS.  When a ``signals.rangeforecast.RangeForecast`` is available its
+#: ``components["event"]`` is the measured version and should be preferred -- pass the
+#: forecast to :func:`overnight_ladder` and it overrides all of this.
+EVENT_VAR_UPLIFT: dict[int, float] = {3: 4.0, 2: 1.5, 1: 0.4}
 
 #: Relative **variance** per UTC hour, average weekday hour = 1.0 after normalising.
 #:
@@ -368,8 +434,11 @@ def _liquidity_factor(t: datetime) -> float:
 
 
 def session_variance_weight(start: datetime, end: datetime, pair: str,
-                            profile: SessionProfile | Sequence[float] | None = None
-                            ) -> float:
+                            profile: SessionProfile | Sequence[float] | None = None,
+                            *, events: "pd.DataFrame | None" = None,
+                            event_uplift: Mapping[int, float] | None = None,
+                            detail: bool = False
+                            ) -> float | tuple[float, list[tuple[datetime, float]], float, list[str]]:
     """Share of a **full day's** variance contained in ``[start, end)``.
 
     Walks the window in (partial) UTC hours, weighting each by the pair's hour-of-day
@@ -386,14 +455,27 @@ def session_variance_weight(start: datetime, end: datetime, pair: str,
     jump at the Sunday reopen and cannot be traded through.  Gap risk is a separate,
     fatter-tailed object; ``ladder_summary`` reports it as a scenario rather than
     folding it into a Gaussian sigma where it would be silently understated.
+
+    ``events`` is the frozen calendar frame (``datetime, ccy, event, importance``)
+    from ``MarketDataProvider.events``.  Events whose ``ccy`` is one of the pair's two
+    currencies and whose timestamp falls inside the window add
+    :data:`EVENT_VAR_UPLIFT` to their hour.  This is what stops a single scalar
+    ``var_fraction`` from pricing a BoJ night the same as an ordinary Tuesday.
+
+    ``detail=True`` returns ``(var_fraction, hour_var, event_var, event_labels)``.
     """
     prof = hour_profile(pair, profile)
     w = prof.array()
+    spec = pair_spec(pair) if pair else None
+    up = dict(EVENT_VAR_UPLIFT if event_uplift is None else event_uplift)
     s = start.astimezone(UTC) if start.tzinfo else start.replace(tzinfo=UTC)
     e = end.astimezone(UTC) if end.tzinfo else end.replace(tzinfo=UTC)
     if e <= s:
         return 0.0
+    ev_rows = _events_in(events, s, e, spec)
     total = 0.0
+    ev_total = 0.0
+    hour_var: list[tuple[datetime, float]] = []
     t = s
     guard = 0
     while t < e and guard < 24 * 400:
@@ -401,14 +483,48 @@ def session_variance_weight(start: datetime, end: datetime, pair: str,
         nxt = (t.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
         step = min(nxt, e)
         frac = (step - t).total_seconds() / 3600.0
-        total += w[t.hour] * frac * _liquidity_factor(t)
+        liq = _liquidity_factor(t)
+        base = w[t.hour] * frac * liq
+        bump = 0.0
+        for ts, imp, _lbl in ev_rows:
+            if t <= ts < step:
+                bump += float(up.get(int(imp), 0.0)) * (liq if liq > 0 else 1.0)
+        total += base + bump
+        ev_total += bump
+        hour_var.append((t, (base + bump) / 24.0))
         t = step
-    return float(total / 24.0)
+    vf = float(total / 24.0)
+    if detail:
+        return vf, hour_var, float(ev_total / 24.0), [r[2] for r in ev_rows]
+    return vf
+
+
+def _events_in(events: "pd.DataFrame | None", s: datetime, e: datetime,
+               spec: Any) -> list[tuple[datetime, int, str]]:
+    """Rows of the frozen event calendar that land in the window and matter to the pair."""
+    if events is None or not len(events):
+        return []
+    df = pd.DataFrame(events)
+    if "datetime" not in df.columns:
+        return []
+    ts = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+    keep = ts.notna() & (ts >= pd.Timestamp(s)) & (ts < pd.Timestamp(e))
+    if spec is not None and "ccy" in df.columns:
+        keep &= df["ccy"].astype(str).str.upper().isin({spec.base, spec.quote})
+    out: list[tuple[datetime, int, str]] = []
+    for i in np.where(keep.to_numpy())[0]:
+        r = df.iloc[int(i)]
+        imp = int(r.get("importance", 1) or 1)
+        out.append((ts.iloc[int(i)].to_pydatetime(), imp,
+                    f"{ts.iloc[int(i)]:%a %H:%M}Z {r.get('ccy', '')} "
+                    f"{r.get('event', '')} (imp {imp})"))
+    return out
 
 
 def passive_window(asof: datetime, tz: str = "Europe/London", close_h: int = 17,
                    open_h: int = 7, *, pair: str = "",
                    profile: SessionProfile | Sequence[float] | None = None,
+                   events: "pd.DataFrame | None" = None,
                    label: str | None = None) -> PassiveWindow:
     """The next unattended window: today's ``close_h`` in ``tz`` to the next ``open_h``.
 
@@ -437,7 +553,8 @@ def passive_window(asof: datetime, tz: str = "Europe/London", close_h: int = 17,
         while back.weekday() >= 5:
             back -= timedelta(days=1)
         start = datetime.combine(back, time(int(close_h)), tzinfo=zone)
-    vf = session_variance_weight(start, end, pair, profile)
+    vf, hour_var, ev_var, ev_lbl = session_variance_weight(
+        start, end, pair, profile, events=events, detail=True)
     prof = hour_profile(pair, profile)
     clock = (end - start).total_seconds() / 3600.0
     openh = _open_hours(start, end)
@@ -449,11 +566,14 @@ def passive_window(asof: datetime, tz: str = "Europe/London", close_h: int = 17,
         var_fraction=vf, clock_hours=clock,
         calendar_days=(end - start).total_seconds() / 86400.0,
         open_hours=openh, tz=tz, profile_source=prof.source, spans_weekend=spans_we,
+        hour_var=tuple(hour_var), event_var=ev_var, events=tuple(ev_lbl),
         note=(f"{clock:.0f} clock hours ({clock / 24.0 * 100:.0f}% of the clock) but "
               f"{vf * 100:.0f}% of a day's variance on the {prof.source} "
               f"{prof.pair or 'generic'} hour profile"
               + (f"; {clock - openh:.0f} of those hours the market is shut"
-                 if clock - openh > 0.5 else "")))
+                 if clock - openh > 0.5 else "")
+              + (f"; {ev_var * 100:.0f} pts of that variance is scheduled events "
+                 f"({len(ev_lbl)} in the window)" if ev_var > 0 else "")))
 
 
 def _open_hours(start: datetime, end: datetime) -> float:
@@ -506,6 +626,121 @@ def expected_crossings(x: float | np.ndarray, sd: float, h: float) -> float | np
 
 
 # --------------------------------------------------------------------------- #
+# is tonight worth holding at all?  (the crossover vol)
+# --------------------------------------------------------------------------- #
+def crossover_vol(book: Book, mkt: MarketSnapshot, pair: str, *,
+                  window: PassiveWindow | None = None,
+                  range_forecast: Any | None = None,
+                  profile: SessionProfile | Sequence[float] | None = None,
+                  events: "pd.DataFrame | None" = None,
+                  marks: Mapping[str, float] | None = None,
+                  report_ccy: str = "USD",
+                  lo: float = -0.90, hi: float = 4.0, tol: float = 1e-6) -> dict[str, Any]:
+    """The go / no-go number: the ATM implied at which tonight exactly breaks even.
+
+    The window's gamma P&L on a **fixed** forecast range ``sd`` is
+    ``0.5 * Gamma(sigma) * sd^2``; the theta bill is ``|theta(sigma)| * calendar_days``.
+    Gamma falls and theta rises with implied, so the two cross once.  Solve
+
+        0.5 * Gamma(sigma*) * sd^2  =  |theta(sigma*)| * calendar_days
+
+    by bisection on a parallel vol shift, repricing the whole book each time (rates,
+    skew, multiple expiries and all -- not the textbook ATM identity).  Above
+    ``sigma*`` you are paying more theta than the forecast range can pay back, and
+    holding gamma over the window is negative carry **in expectation**; the ladder
+    does not change that, it only decides how much of the outcome you bank and how
+    much delta you wake up holding.
+
+    The closed form behind it, for intuition: with the BS identity
+    ``theta = -0.5 Gamma S^2 sigma^2 / 365`` the crossover is
+
+        sigma* = sigma_window * sqrt(365 / calendar_days)
+
+    and, if the range forecast is just the implied scaled by session variance
+    (``sigma_window = sigma sqrt(var_fraction / 252)``), that collapses to
+    ``sigma* / sigma = sqrt(365 * var_fraction / (252 * calendar_days))`` -- a pure
+    calendar fact, independent of the book.  On the shipped EURUSD profile it is
+    **0.92** for a weeknight (you need realised ~9% over implied) and **0.44** over a
+    weekend (you need realised ~2.3x implied).  The 252-vs-365 split is amendment
+    v1.4 W-7 and it is doing real work here: ignore it and the weeknight number comes
+    out as 1.31x instead of 1.09x.
+    """
+    spec = pair_spec(pair)
+    win = window or passive_window(mkt.asof, pair=pair, profile=profile, events=events)
+    bg0 = book_gamma(book, mkt, pair, marks=marks)
+    S = bg0.spot
+    if range_forecast is not None:
+        sw = float(getattr(range_forecast, "sigma_window", range_forecast))
+        basis = "range forecast"
+    else:
+        sw = bg0.sigma * math.sqrt(max(win.var_fraction, 1e-12) / TRADING_DAYS)
+        basis = (f"ATM {bg0.sigma * 100:.2f}% x sqrt({win.var_fraction:.3f}/252) "
+                 "-- NOT a forecast, just today's implied put through the session clock")
+    sd = S * sw
+    D = win.calendar_days
+
+    def f(x: float) -> float:
+        # magnitudes: "does the forecast range pay the theta bill" is the same
+        # question for a long and a short book, only the sign of the answer differs
+        bg = book_gamma(book, shift_market(mkt, vol_add=x), pair, marks=marks)
+        return 0.5 * abs(bg.gamma) * sd * sd - abs(bg.theta) * D
+
+    a, b = float(lo) * bg0.sigma, float(hi) * bg0.sigma
+    fa, fb = f(a), f(b)
+    x = float("nan")
+    if fa > 0 > fb:
+        for _ in range(80):
+            m = 0.5 * (a + b)
+            fm = f(m)
+            if fm > 0:
+                a = m
+            else:
+                b = m
+            if b - a < tol:
+                break
+        x = 0.5 * (a + b)
+    sigma_star = bg0.sigma + x
+    need_sd = (math.sqrt(max(2.0 * abs(bg0.theta) * D / abs(bg0.gamma), 0.0))
+               if bg0.gamma else float("nan"))
+    carry = 0.5 * bg0.gamma * sd * sd + bg0.theta * D
+    return {
+        "pair": pair, "crossover_vol": sigma_star, "atm_now": bg0.sigma,
+        "ratio": sigma_star / bg0.sigma if bg0.sigma else float("nan"),
+        "sigma_window": sw, "sigma_window_pips": sd / spec.pip, "range_basis": basis,
+        "breakeven_move_pips": need_sd / spec.pip,
+        "required_vs_forecast": need_sd / sd if sd else float("nan"),
+        "expected_carry": carry, "calendar_days": D,
+        "var_fraction": win.var_fraction, "window_label": win.label,
+        "negative_carry": bool(carry < 0),
+        "verdict": _carry_verdict(bg0, sigma_star, need_sd, sd, spec, D, win),
+        "ccy": spec.quote,
+    }
+
+
+def _carry_verdict(bg: BookGamma, sigma_star: float, need_sd: float, sd: float,
+                   spec: Any, D: float, win: PassiveWindow) -> str:
+    if bg.gamma == 0 or not np.isfinite(sigma_star):
+        return "no gamma in this pair -- nothing to decide"
+    long_g = bg.gamma > 0
+    need_p, fc_p = need_sd / spec.pip, sd / spec.pip
+    head = (f"needs a {need_p:,.0f} pip move over the window to pay "
+            f"{abs(bg.theta) * D:,.0f} {spec.quote} of theta; the forecast range is "
+            f"{fc_p:,.0f} pips (1 sigma). Crossover ATM {sigma_star * 100:.2f}% vs "
+            f"{bg.sigma * 100:.2f}% marked")
+    if long_g and need_sd > sd:
+        return ("NEGATIVE CARRY overnight: " + head + ". Holding this gamma through the "
+                "window loses money in expectation. The ladder is RISK CONTROL, not "
+                "monetisation -- leave it because you want the delta capped and the "
+                "gamma banked, not because the night pays.")
+    if long_g:
+        return ("POSITIVE CARRY overnight: " + head + ". Unusual, and worth checking the "
+                "vol mark before believing it.")
+    return ("SHORT GAMMA: " + head + ". You are being paid the theta; the window's "
+            "expected gamma bleed is smaller than it, which is the whole trade. The "
+            "risk is the tail, not the mean.")
+
+
+# --------------------------------------------------------------------------- #
 # the ladder
 # --------------------------------------------------------------------------- #
 def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
@@ -513,29 +748,46 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
                      rule: HedgeRule | None = None,
                      levels: "pd.DataFrame | None" = None,
                      n_rungs: int = 4, cost_bp: float | None = None,
+                     max_overnight_delta: float | None = None,
+                     min_clip_base: float = RETAIL_LOT_BASE,
                      method: str = "zakamouline", risk_aversion: float = 1e-6,
                      range_forecast: Any | None = None,
                      profile: SessionProfile | Sequence[float] | None = None,
+                     events: "pd.DataFrame | None" = None,
                      band_pips: float | None = None,
+                     cost_tier: str = "retail",
                      snap: bool = False, snap_max_pips: float | None = None,
                      snap_inside_pips: float = 1.0,
-                     min_clip_base: float = 0.0,
                      assume_flat_at_close: bool = True,
                      report_ccy: str = "USD",
                      marks: Mapping[str, float] | None = None,
                      band: BandResult | None = None) -> list[LadderRung]:
-    """The orders to leave tonight.
+    """The orders to leave tonight.  Everything past ``cost_bp`` is a keyword-only
+    addition with a default, so the frozen signature keeps working.
 
-    Parameters that are not in the frozen signature are keyword-only additions with
-    defaults, so the contract signature keeps working.
+    Spacing, in priority order
+    --------------------------
+    1. ``band_pips``, if the caller states one.
+    2. otherwise :func:`fxgamma.portfolio.bandopt.optimal_band` at ``method``, over
+       *this window's* variance and at ``cost_bp`` (default: the **retail** table),
+    3. **clamped above** by ``max_overnight_delta / |Gamma|`` -- the delta cap is the
+       primary risk input and it wins over the optimiser, and
+    4. **floored below** by ``min_clip_base / |Gamma|`` -- a clip you cannot deal is
+       not a band.  Defaults to one standard lot (:data:`RETAIL_LOT_BASE`).
 
+    Which constraint actually bound is recorded in ``LadderRung.note`` on the first
+    rung and in ``ladder_summary()["spacing_source"]``.
+
+    ``max_overnight_delta``   the most base-ccy delta the user is willing to wake up
+                         holding.  Ask for this, never for a risk-aversion
+                         coefficient; ``bandopt.risk_aversion_for_band`` converts it
+                         when a coefficient is needed downstream.
     ``range_forecast``   anything exposing ``sigma_window`` (the frozen
                          ``signals.rangeforecast.RangeForecast``), or a bare float,
                          interpreted as the **stdev of the log move over the window**.
-                         When absent the window sigma is the book's gamma-weighted ATM
-                         implied scaled by the session variance weight -- which is the
-                         honest fallback, not a forecast.  Absent-safe: nothing from
-                         ``signals`` is imported.
+                         When present it overrides the session-scaled implied *and*
+                         the event uplift, since the forecast already contains them.
+                         Absent-safe: nothing from ``signals`` is imported.
     ``levels``           optional frame from ``signals.levels.technical_levels`` with
                          columns ``level, kind, strength, age_days, source``.  Absent
                          and duck-typed on purpose -- that module is being built
@@ -545,64 +797,81 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
                          ``measure_reversal_stats`` says it beats an unsnapped ladder
                          against its random-level control.  When on, a rung within
                          ``snap_max_pips`` of an anchor moves to ``snap_inside_pips``
-                         *inside* it (you want to be filled before the level, not at
-                         it), and records ``anchor`` / ``anchor_dist_pips``.
-    ``assume_flat_at_close``  the user hedges to the rule's target before going home,
-                         so the first clip is the delta *increment* from spot to the
-                         first rung.  Set False to fold today's residual delta into
-                         the first rung instead; ``ladder_summary`` reports it either
-                         way.
+                         *inside* it and **its clip is recomputed at the moved level**
+                         -- keeping the original clip would leave the cumulative delta
+                         wrong at that rung and at every rung beyond it.
 
-    Clip sizing: ``clip_k = |delta(L_k) - delta(L_{k-1})|`` read off a full
-    repricing of the book (``risk.spot_ladder``), not from a constant gamma.  On a
-    book with strikes inside the ladder that matters: the linear-gamma answer
-    over-hedges the first rung and under-hedges the outer ones.
+    Clip sizing: ``clip_k = |delta(L_k) - delta(L_{k-1})|`` read off a **full
+    repricing** of the book (``risk.spot_ladder``), never ``Gamma_1pct x spacing``.
+    On a symmetric ATM straddle the linear approximation is only ~2% out at 1W, but a
+    skewed book is exactly where a symmetric ladder built off one ``Gamma_1pct`` goes
+    wrong, and that is the book this feature is for.
     """
     spec = pair_spec(pair)
     S = float(mkt.spot[pair])
     rule = rule or HedgeRule()
     target = float(rule.target_delta)
-    win = window or passive_window(mkt.asof, pair=pair, profile=profile)
-    vf = win.var_fraction if window is None else session_variance_weight(
-        win.start, win.end, pair, profile)
+    win = window or passive_window(mkt.asof, pair=pair, profile=profile, events=events)
+    vf = win.var_fraction
     bg = book_gamma(book, mkt, pair, marks=marks)
     if bg.gamma == 0.0 or bg.n_live == 0:
         return []
 
     cbp = float(cost_bp) if cost_bp is not None else (
-        float(rule.cost_bp) if rule.cost_bp else COST_BP.get(pair, 0.5))
+        float(rule.cost_bp) if (rule.cost_bp and cost_bp is None and rule is not None
+                                and rule.cost_bp != HedgeRule().cost_bp)
+        else cost_bp_for(pair, cost_tier))
     lam = cbp / 2.0 / 1e4
     fq = fx_rate(spec.quote, report_ccy, mkt)
 
     # ---- window sigma ------------------------------------------------------ #
     sig_ann = bg.sigma
     if range_forecast is not None:
-        sw = getattr(range_forecast, "sigma_window", range_forecast)
-        sigma_window = float(sw)
-        sig_basis = "range forecast"
+        sigma_window = float(getattr(range_forecast, "sigma_window", range_forecast))
+        sig_basis = f"range forecast sigma_window {sigma_window * 100:.3f}%"
     else:
         sigma_window = sig_ann * math.sqrt(max(vf, 1e-12) / TRADING_DAYS)
-        sig_basis = f"ATM {sig_ann * 100:.2f}% x sqrt({vf:.3f}/252)"
+        sig_basis = (f"ATM {sig_ann * 100:.2f}% x sqrt({vf:.3f}/252) -- session-scaled "
+                     "implied, not a forecast")
     sd_spot = S * sigma_window
 
-    # ---- spacing ----------------------------------------------------------- #
+    # ---- spacing: cap first, optimum second, clip floor third -------------- #
+    cap = float(max_overnight_delta) if (max_overnight_delta and max_overnight_delta > 0) \
+        else (abs(rule.band_delta) if rule.band_delta else
+              abs(rule.band_pct) * (bg.gross_notional or 0.0))
+    cap_default = not (max_overnight_delta and max_overnight_delta > 0)
+    h_cap = cap / abs(bg.gamma) if cap > 0 else math.inf
+    h_floor = float(min_clip_base) / abs(bg.gamma) if min_clip_base > 0 else 0.0
     if band_pips is not None:
-        h = float(band_pips) * spec.pip
-        band_note = f"caller-supplied spacing {band_pips:,.1f} pips"
+        h_opt = float(band_pips) * spec.pip
+        src = f"caller-supplied {band_pips:,.1f} pips"
     else:
         band = band or optimal_band(book, mkt, pair, cost_bp=cbp,
                                     risk_aversion=risk_aversion,
                                     horizon_days=max(vf, 1e-6), method=method,
-                                    report_ccy=report_ccy, marks=marks)
-        h = band.band_spot
-        band_note = f"{band.method} band {band.band_pips:,.1f} pips"
+                                    report_ccy=report_ccy, marks=marks,
+                                    cost_tier=cost_tier)
+        h_opt = band.band_spot
+        src = f"{band.method} optimum {band.band_pips:,.1f} pips"
+    h = min(h_opt, h_cap)
+    which = src if h == h_opt else (
+        f"DELTA CAP {cap / 1e6:,.2f}mm ({h_cap / spec.pip:,.1f} pips) over {src}"
+        + ("  [cap NOT supplied -- defaulted to HedgeRule.band_pct x gross notional; "
+           "set max_overnight_delta to the delta you are actually willing to wake up "
+           "holding]" if cap_default else ""))
+    if h < h_floor:
+        h = h_floor
+        which = (f"MIN CLIP {min_clip_base / 1e6:,.2f}mm ({h_floor / spec.pip:,.1f} pips) "
+                 f"over {src}" + (" and over the delta cap -- the smallest dealable clip "
+                                  "already breaches your delta cap; deal smaller or widen "
+                                  "the cap" if h > h_cap else ""))
     if not (h > 0) or not np.isfinite(h):
         return []
 
     # ---- the book's true delta profile ------------------------------------- #
-    span_pct = max(1.5 * n_rungs * h / S * 100.0, 1.0)
+    span_pct = max(1.6 * n_rungs * h / S * 100.0, 1.0)
     lad = spot_ladder(book, mkt, pair, lo_pct=-span_pct, hi_pct=span_pct,
-                      n=int(max(201, 40 * n_rungs + 1)), sticky="strike",
+                      n=int(max(201, 60 * n_rungs + 1)), sticky="strike",
                       report_ccy=report_ccy, marks=marks)
     Sg = lad["spot"].to_numpy(float)
     Dg = lad["delta_base"].to_numpy(float)
@@ -611,7 +880,6 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
         return float(np.interp(x, Sg, Dg))
 
     d0 = delta_at(S)
-    residual = d0 - target if not assume_flat_at_close else 0.0
     anchors = _anchor_frame(levels, spec)
     drift = bg.rd - bg.rf
     T_eff = max(vf, 1e-9) / TRADING_DAYS
@@ -620,30 +888,34 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
     rungs: list[LadderRung] = []
     for sgn in (+1, -1):                            # above spot, then below
         prev_level = S
-        prev_delta = d0 - residual                  # what we are hedged to at the close
-        cum_hedge = -residual if not assume_flat_at_close else 0.0
+        # what the book is hedged to at the close: flat at the target if the user
+        # squares up before going home, otherwise still carrying today's residual,
+        # which the first rung then has to absorb.
+        prev_delta = d0 if assume_flat_at_close else target
+        cum_hedge = -(d0 - target) if assume_flat_at_close else 0.0
         for k in range(1, int(n_rungs) + 1):
             level = S + sgn * k * h
             anchor, adist = "", 0.0
             if snap and anchors is not None and len(anchors):
-                level, anchor, adist = _snap(level, sgn, anchors, spec,
-                                             snap_max_pips if snap_max_pips is not None
-                                             else 0.5 * h / spec.pip,
-                                             snap_inside_pips)
+                level, anchor, adist = _snap(
+                    level, sgn, anchors, spec,
+                    snap_max_pips if snap_max_pips is not None else 0.5 * h / spec.pip,
+                    snap_inside_pips)
             if level <= 0:
                 break
+            # NB: delta is read AFTER any snap, so the clip belongs to the level the
+            # order actually rests at.  Reusing the unsnapped clip would leave the
+            # cumulative delta wrong here and at every rung beyond.
             d_here = delta_at(level)
             trade = -(d_here - prev_delta)          # base ccy, + = buy base
             clip = abs(trade)
-            if clip < float(min_clip_base):
-                prev_level, prev_delta = level, d_here
-                continue
             cum_hedge += trade
             spacing = abs(level - prev_level)
             x = abs(level - S)
             n_cross = float(expected_crossings(x, sd_spot, max(spacing, 1e-12)))
-            # each crossing is half a round trip of size `spacing` on `clip`
-            cap = 0.5 * n_cross * clip * spacing * (1.0 if long_gamma else -1.0)
+            # each crossing is half a round trip of size `spacing` on `clip`:
+            # this is CONVERSION of mark-to-market into cash, not new P&L
+            realised = 0.5 * n_cross * clip * spacing * (1.0 if long_gamma else -1.0)
             cost = n_cross * clip * level * lam
             p_t = touch_probability(S, level, T_eff, sig_ann, drift=drift)
             rungs.append(LadderRung(
@@ -651,20 +923,22 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
                 clip_base=float(clip),
                 cum_delta_base=float(d_here + cum_hedge),
                 pips_from_spot=float((level - S) / spec.pip),
-                p_touch=float(p_t), exp_pnl=float(cap - cost),
+                p_touch=float(p_t), exp_pnl=float(realised - cost),
                 anchor=anchor, anchor_dist_pips=float(adist),
                 pair=pair, k=int(k),
                 order_type="limit" if long_gamma else "stop",
                 spacing_pips=float(spacing / spec.pip),
                 sigma_dist=float(x / sd_spot) if sd_spot > 0 else float("nan"),
-                exp_crossings=n_cross, exp_capture=float(cap), exp_cost=float(cost),
+                exp_crossings=n_cross, exp_realised=float(realised),
+                exp_cost=float(cost), exp_marginal=float(-cost),
                 delta_at_level=float(d_here), ccy=spec.quote, fx_to_report=fq,
-                note=band_note if k == 1 and sgn > 0 else ""))
+                cost_bp=cbp))
             prev_level, prev_delta = level, d_here
     rungs.sort(key=lambda r: -r.level)
-    if rungs and sig_basis:
-        rungs[0] = replace(rungs[0], note=(rungs[0].note + f" | window sigma {sig_basis} "
-                                           f"= {sd_spot / spec.pip:,.1f} pips").strip(" |"))
+    if rungs:
+        rungs[0] = replace(rungs[0], note=(
+            f"spacing: {which} | window sigma {sig_basis} = {sd_spot / spec.pip:,.1f} pips"
+            f" | cost {cbp:g}bp ({cost_tier})"))
     return rungs
 
 
@@ -706,129 +980,236 @@ def _snap(level: float, sgn: int, anchors: "pd.DataFrame", spec: Any,
 def ladder_summary(rungs: Sequence[LadderRung], book: Book, mkt: MarketSnapshot,
                    pair: str, *, window: PassiveWindow | None = None,
                    profile: SessionProfile | Sequence[float] | None = None,
+                   events: "pd.DataFrame | None" = None,
+                   range_forecast: Any | None = None,
                    report_ccy: str = "USD",
                    marks: Mapping[str, float] | None = None,
+                   rule: HedgeRule | None = None,
+                   assume_flat_at_close: bool = True,
                    gap_sigmas: float = 3.0) -> dict[str, Any]:
-    """Capture, cost, theta and net for the window -- the go / no-go number.
+    """Is tonight worth it -- and what does the ladder actually do about it?
 
-    Theta is charged on **calendar** days and capture is earned on **variance** days.
-    Those are different clocks and over a weekend they diverge violently: Friday to
-    Monday is 3.0 calendar days of theta against ~0.35 days of variance, so the same
-    ladder that is worth leaving on a Tuesday night is a 9:1 loser on a Friday.  The
-    summary prints both so the trader can see it rather than being told a single
-    ``net``.
+    Two questions, deliberately separated, because conflating them is how this feature
+    would mislead:
 
-    ``capture_vs_theory`` is the fraction of the continuous-hedging maximum
-    ``Gamma V / 2`` that a *finite* ladder of this many rungs actually reaches.  It is
-    the honest answer to "should I add rungs": when it is already 0.9, more rungs buy
-    nothing.
+    **A. Should the position be held at all overnight?**  ``carry`` = the window's
+    expected gamma P&L minus the window's theta, and ``crossover_vol`` = the implied
+    at which those two are equal.  This has **nothing to do with the ladder**: it is
+    true whether you leave orders or go flat.  Theta is charged pro-rata on
+    **calendar** days -- 14 hours is 0.583 of a day, so 0.583x the daily theta, not a
+    whole day's (amendment v1.8's pro-rata ruling, and the same error the PM caught in
+    the brief's own worked example) -- while variance arrives on the session clock.
+    Those two clocks are why a night that looks free is usually not.
+
+    **B. Given that you are holding it, what do the orders buy?**  Three numbers:
+    ``realised_conversion`` (mark-to-market turned into cash you keep even if spot
+    round-trips), ``exp_cost``, and ``sd_reduction_pct`` (how much smaller the
+    overnight P&L standard deviation is with the ladder than without).  The ladder's
+    effect on the **expected** P&L is ``marginal_vs_no_ladder = -exp_cost`` and
+    nothing else: under driftless spot every hedge is a fair bet.  ``exp_realised`` is
+    conversion, not creation, which is why ``conversion_vs_gamma_pnl`` -- the share of
+    the position's whole gamma P&L that a *finite* ladder reaches -- tops out at 1.
 
     ``gap_scenario`` prices a jump straight to ``gap_sigmas`` window sigmas with the
     ladder filling on the way -- a full repricing through ``risk.spot_ladder``, not a
-    quadratic.  For a short-gamma ladder that is the number that matters and it is
-    reported first.
+    quadratic.  For a short-gamma ladder it is the number that matters.
     """
     spec = pair_spec(pair)
     S = float(mkt.spot[pair])
-    win = window or passive_window(mkt.asof, pair=pair, profile=profile)
+    win = window or passive_window(mkt.asof, pair=pair, profile=profile, events=events)
     vf = win.var_fraction
     bg = book_gamma(book, mkt, pair, marks=marks)
     fq = fx_rate(spec.quote, report_ccy, mkt)
     long_gamma = bg.gamma > 0
     sig_ann = bg.sigma
-    sigma_window = sig_ann * math.sqrt(max(vf, 1e-12) / TRADING_DAYS)
+    if range_forecast is not None:
+        sigma_window = float(getattr(range_forecast, "sigma_window", range_forecast))
+        range_basis = "range forecast"
+    else:
+        sigma_window = sig_ann * math.sqrt(max(vf, 1e-12) / TRADING_DAYS)
+        range_basis = "session-scaled implied (NOT a forecast)"
     sd_spot = S * sigma_window
     V = sd_spot ** 2
 
-    cap = float(sum(r.exp_capture for r in rungs))
+    conv = float(sum(r.exp_realised for r in rungs))
     cost = float(sum(r.exp_cost for r in rungs))
-    theory = 0.5 * bg.gamma * V
-    theta = bg.theta * win.calendar_days
-    net = cap - cost + theta
+    gamma_pnl = 0.5 * bg.gamma * V                 # the position's, ladder or not
+    theta = bg.theta * win.calendar_days            # pro-rata calendar days (W-14)
+    carry = gamma_pnl + theta                       # A: hold-or-not
+    net = carry - cost                              # A + B, the whole night
     exp_fills = float(sum(r.exp_crossings for r in rungs))
-    p_any = max((r.p_touch for r in rungs), default=0.0)
     spacing = float(np.median([r.spacing_pips for r in rungs])) if rungs else float("nan")
+    h = spacing * spec.pip if np.isfinite(spacing) else float("nan")
 
+    # variance of the overnight P&L, with and without the ladder.
+    # unhedged, delta-flat, long gamma:   P&L = 0.5 G dS^2  ->  var = 0.5 G^2 V^2
+    # laddered on spacing h:              residual delta error var = G^2 h^2 V / 6
+    sd_no = abs(bg.gamma) * V / math.sqrt(2.0)
+    sd_yes = (abs(bg.gamma) * h * math.sqrt(V / 6.0)
+              if np.isfinite(h) else float("nan"))
+    sd_yes = min(sd_yes, sd_no) if np.isfinite(sd_yes) else sd_no
+    sd_cut = 100.0 * (1.0 - sd_yes / sd_no) if sd_no > 0 else float("nan")
+
+    cross = crossover_vol(book, mkt, pair, window=win, range_forecast=range_forecast,
+                          profile=profile, events=events, marks=marks,
+                          report_ccy=report_ccy)
+    # the delta the user squares up at the close, so the gap scenario is the P&L of
+    # the position they actually leave rather than of the un-hedged option legs
+    target = float((rule or HedgeRule()).target_delta)
+    close_hedge = (-(bg.delta_base - target)) if assume_flat_at_close else 0.0
     gap = _gap_scenario(rungs, book, mkt, pair, S, sd_spot, gap_sigmas,
-                        report_ccy=report_ccy, marks=marks)
+                        report_ccy=report_ccy, marks=marks, close_hedge=close_hedge)
+
+    delta_1sig = abs(bg.gamma) * sd_spot          # delta accumulated at 1 window sigma
+    max_delta = max((r.clip_base for r in rungs), default=0.0)
+    outer = max((abs(r.pips_from_spot) for r in rungs), default=0.0)
+    beyond = 0.0
+    if rungs:
+        far = max(rungs, key=lambda r: abs(r.pips_from_spot))
+        beyond = abs(far.delta_at_level + sum(
+            r.side * r.clip_base for r in rungs
+            if (far.level > S and S < r.level <= far.level)
+            or (far.level < S and far.level <= r.level < S)))
 
     warnings: list[str] = []
     if not long_gamma:
         warnings.append(
-            "SHORT GAMMA. This is not an income ladder. Every order is a STOP, so it "
-            "fills at or beyond your level, not at it; the expected gamma contribution "
-            "is NEGATIVE and the ladder's job is to bound a loss, not to earn. The "
-            "theta you are collecting is the whole of the edge and the tail is "
-            "unbounded. Leaving stops unattended in a gap is how the loss becomes much "
-            "larger than the ladder implies -- see gap_scenario.")
+            "SHORT GAMMA. This is not an income ladder. Every order is a STOP: it fills "
+            "at or beyond your level, never at it, and in the gap you are actually "
+            "worried about it will not fill anywhere near it. The expected gamma term "
+            "is NEGATIVE, the theta is the entire edge, and the loss is unbounded "
+            "beyond the last rung. Read gap_scenario before leaving these unattended.")
+    if cross.get("negative_carry"):
+        warnings.append(
+            cross["verdict"] + " Leaving the ladder does not change that: its effect on "
+            "the expected P&L is minus its cost. The alternative worth pricing is going "
+            "flat into the close, or selling the front gamma.")
     if win.spans_weekend:
         warnings.append(
-            f"WEEKEND: {win.calendar_days:.1f} calendar days of theta "
-            f"({theta:,.0f} {spec.quote}) against {vf:.2f} days of tradeable variance. "
-            "Weekend gap risk is NOT in the sigma above -- it arrives in one jump you "
-            "cannot hedge through.")
-    if rungs:
-        thin = [r.k for r in rungs if r.p_touch < 0.02]
-        if thin:
-            warnings.append(
-                f"rung(s) {sorted(set(thin))} have a touch probability under 2% on this "
-                "window's sigma -- they contribute essentially nothing. Either drop them "
-                "or accept that the ladder is really 1-2 rungs deep.")
-    if long_gamma and net < 0:
-        warnings.append("Expected capture does not cover tonight's theta. The ladder is "
-                        "still the right ladder; the position is simply paying to be long "
-                        "gamma over a quiet window.")
+            f"WEEKEND: {win.calendar_days:.2f} calendar days of theta "
+            f"({theta:,.0f} {spec.quote}) for {vf:.2f} days of tradeable variance -- "
+            f"{win.clock_hours - win.open_hours:.0f} of the {win.clock_hours:.0f} hours "
+            "the market is shut. Weekend gap risk is NOT in the sigma above: it arrives "
+            "in one jump you cannot hedge through, and no resting order helps.")
+    if win.events:
+        warnings.append("scheduled events inside the window: " + "; ".join(win.events)
+                        + f" -- they add {win.event_var:.2f} days of variance on the "
+                        "modelled uplift table, which is a modelled default, not a "
+                        "measurement. Prefer a RangeForecast if you have one.")
+    thin = sorted({r.k for r in rungs if r.p_touch < 0.02})
+    if thin:
+        warnings.append(
+            f"rung(s) {thin} have a touch probability under 2% on this window's sigma "
+            "-- they contribute essentially nothing. The ladder is really "
+            f"{len({r.k for r in rungs if r.p_touch >= 0.02})} rungs deep per side.")
+    snapped_big = [r.k for r in rungs if r.anchor and rungs
+                   and r.clip_base > 1.2 * float(np.median([q.clip_base for q in rungs]))]
+    if snapped_big:
+        warnings.append(
+            f"rung(s) {sorted(set(snapped_big))} were snapped OUTWARD to an anchor and now "
+            f"carry a clip more than 20% above the ladder median ({max_delta / 1e6:,.2f}mm "
+            "at the largest). Snapping moves the level, and the clip is re-read at the "
+            "moved level, so a snap away from spot widens the delta you carry between "
+            "fills and can breach max_overnight_delta.")
+    if rungs and max_delta > delta_1sig:
+        warnings.append(
+            f"the ladder barely binds: the clip is {max_delta / 1e6:,.2f}mm but an "
+            f"unhedged book only accumulates {delta_1sig / 1e6:,.2f}mm of delta at one "
+            f"window sigma ({2 * delta_1sig / 1e6:,.2f}mm at two). The first rung is "
+            f"{min(r.sigma_dist for r in rungs):,.1f} sigmas out and the P&L standard "
+            f"deviation falls "
+            f"by {sd_cut:,.0f}%. If the point is risk control, set max_overnight_delta "
+            "to the delta you actually mind waking up with -- that is the input worth "
+            "thousands; the analytic band inside it is worth tens.")
     if win.profile_source != "estimated":
-        warnings.append(f"session variance profile is a MODELLED DEFAULT "
-                        f"({win.profile_source}); it has not been fitted to data. "
-                        "Every distance and probability here scales with it.")
+        warnings.append(
+            f"session variance profile is a MODELLED DEFAULT ({win.profile_source}); it "
+            "has not been fitted to hourly data. Every distance, probability and "
+            "crossing count here scales with it.")
+    if rungs:
+        warnings.append(
+            f"cost assumption {rungs[0].cost_bp:g}bp round trip "
+            f"({rungs[0].cost_bp / 2e4 * S / spec.pip:.2f} pips one way). This is a "
+            "RETAIL default, not the interbank zones.COST_BP table. Run "
+            "ladder_cost_sensitivity() -- the band goes as cost^(1/3) and the cost line "
+            "is linear in it.")
 
-    verdict = _verdict(long_gamma, cap, cost, theta, net, spec.quote)
-    out = {
+    out: dict[str, Any] = {
         "pair": pair, "spot": S, "asof": mkt.asof,
         "gamma_side": "long" if long_gamma else "short",
         "gamma_1pct": bg.gamma_1pct, "gamma": bg.gamma,
         "n_rungs": len(rungs), "spacing_pips": spacing,
+        "spacing_source": rungs[0].note if rungs else "",
+        "max_clip_base": max_delta, "outer_rung_pips": outer,
+        "delta_beyond_last_rung": beyond,
+        "delta_at_close": bg.delta_base,
+        "close_hedge_base": close_hedge,
+        "delta_1sigma_unhedged": delta_1sig,
+        "delta_2sigma_unhedged": 2.0 * delta_1sig,
+        # --- the window ---
         "window_label": win.label, "window_start": win.start, "window_end": win.end,
         "clock_hours": win.clock_hours, "open_hours": win.open_hours,
         "calendar_days": win.calendar_days,
         "var_fraction": vf, "clock_fraction": win.clock_fraction,
-        "var_vs_clock": vf / win.clock_fraction if win.clock_fraction else float("nan"),
+        "theta_per_var_day": (win.clock_fraction / vf) if vf else float("nan"),
+        "event_var_fraction": win.event_var, "events": list(win.events),
         "profile_source": win.profile_source,
         "sigma_ann": sig_ann, "sigma_window": sigma_window,
-        "sigma_window_pips": sd_spot / spec.pip,
-        "exp_capture": cap, "exp_cost": cost, "exp_capture_net": cap - cost,
-        "theta": theta, "net": net,
-        "theory_max_capture": theory,
-        "capture_vs_theory": cap / theory if theory else float("nan"),
+        "sigma_window_pips": sd_spot / spec.pip, "range_basis": range_basis,
+        # --- A: hold or not (nothing to do with the ladder) ---
+        "gamma_pnl": gamma_pnl, "theta": theta, "carry": carry,
+        "crossover_vol": cross["crossover_vol"], "atm_now": sig_ann,
+        "crossover_ratio": cross["ratio"],
+        "breakeven_move_pips": cross["breakeven_move_pips"],
+        "negative_carry": cross["negative_carry"], "carry_verdict": cross["verdict"],
+        # --- B: what the orders buy ---
+        "realised_conversion": conv, "exp_cost": cost,
+        "marginal_vs_no_ladder": -cost,
+        "conversion_vs_gamma_pnl": conv / gamma_pnl if gamma_pnl else float("nan"),
+        "sd_overnight_no_ladder": sd_no, "sd_overnight_with_ladder": sd_yes,
+        "sd_reduction_pct": sd_cut,
         "exp_fills": exp_fills, "p_touch_first": rungs[0].p_touch if rungs else 0.0,
-        "p_touch_any": p_any,
-        "breakeven_move_pips": _breakeven_move(bg, win, spec),
-        "gap_scenario": gap,
-        "residual_delta_hedged_at_close": True,
-        "verdict": verdict, "warnings": warnings,
+        "p_touch_any": max((r.p_touch for r in rungs), default=0.0),
+        # --- the whole night ---
+        "net": net, "gap_scenario": gap,
+        "verdict": _verdict(long_gamma, conv, cost, theta, gamma_pnl, carry, net,
+                            sd_cut, spec.quote, cross),
+        "warnings": warnings,
         "ccy": spec.quote, "report_ccy": report_ccy.upper(), "fx_to_report": fq,
         "basis": ("variance on sqrt(252) trading days scaled by the session profile; "
-                  "theta on ACT/365 calendar days (amendment v1.4 W-7)"),
+                  "theta pro-rata on ACT/365 calendar days (amendment v1.4 W-7, v1.8 "
+                  "pro-rata theta). The two clocks are different on purpose."),
     }
-    for k in ("exp_capture", "exp_cost", "exp_capture_net", "theta", "net",
-              "theory_max_capture"):
+    for k in ("gamma_pnl", "theta", "carry", "realised_conversion", "exp_cost",
+              "marginal_vs_no_ladder", "net", "sd_overnight_no_ladder",
+              "sd_overnight_with_ladder"):
         out[f"{k}_rep"] = out[k] * fq
     return out
 
 
-def _breakeven_move(bg: BookGamma, win: PassiveWindow, spec: Any) -> float:
-    """The one-way move that makes gamma pay the window's theta, in pips."""
-    if bg.gamma == 0:
-        return float("nan")
-    th = abs(bg.theta * win.calendar_days)
-    x2 = 2.0 * th / abs(bg.gamma)
-    return math.sqrt(max(x2, 0.0)) / spec.pip
+def _verdict(long_gamma: bool, conv: float, cost: float, theta: float,
+             gamma_pnl: float, carry: float, net: float, sd_cut: float,
+             ccy: str, cross: Mapping[str, Any]) -> str:
+    hold = ("HOLDING IT IS NEGATIVE CARRY" if cross.get("negative_carry")
+            else "holding it is positive carry")
+    a = (f"{hold}: expected gamma {gamma_pnl:,.0f} {ccy} vs theta {theta:,.0f} "
+         f"= {carry:+,.0f}; crossover ATM {cross['crossover_vol'] * 100:.2f}% vs "
+         f"{cross['atm_now'] * 100:.2f}% marked.")
+    if not long_gamma:
+        return (a + f" SHORT GAMMA -- the ladder is a stop ladder that bounds the loss; "
+                f"it costs {cost:,.0f} {ccy} and cuts the overnight P&L sd by "
+                f"{sd_cut:,.0f}%. Size it off the tail, not the mean.")
+    b = (f" THE LADDER banks {conv:,.0f} {ccy} of that as cash for {cost:,.0f} of cost "
+         f"and cuts the overnight P&L standard deviation by {sd_cut:,.0f}%. Its effect "
+         f"on the expected P&L is exactly -{cost:,.0f}; everything else it does is "
+         "conversion and risk control.")
+    return a + b
 
 
 def _gap_scenario(rungs: Sequence[LadderRung], book: Book, mkt: MarketSnapshot,
                   pair: str, S: float, sd_spot: float, k: float, *,
-                  report_ccy: str, marks: Mapping[str, float] | None) -> dict[str, Any]:
+                  report_ccy: str, marks: Mapping[str, float] | None,
+                  close_hedge: float = 0.0) -> dict[str, Any]:
     """P&L if spot jumps ``k`` window sigmas, with the ladder filling on the way.
 
     Option P&L is a full repricing (``risk.spot_ladder``), not ``0.5 G dS^2``: at three
@@ -849,7 +1230,7 @@ def _gap_scenario(rungs: Sequence[LadderRung], book: Book, mkt: MarketSnapshot,
         opt = float(np.interp(Sx, lad["spot"].to_numpy(float),
                               lad["pnl"].to_numpy(float)))
         # hedges that fill on a monotone move to Sx
-        hedge = 0.0
+        hedge = close_hedge * (Sx - S)
         for r in rungs:
             if (sgn > 0 and r.level <= Sx and r.level > S) or \
                (sgn < 0 and r.level >= Sx and r.level < S):
@@ -867,54 +1248,94 @@ def _gap_scenario(rungs: Sequence[LadderRung], book: Book, mkt: MarketSnapshot,
     return out
 
 
-def _verdict(long_gamma: bool, cap: float, cost: float, theta: float, net: float,
-             ccy: str) -> str:
-    if long_gamma:
-        if net > 0:
-            return (f"WORTH LEAVING: expected capture {cap:,.0f} {ccy} less {cost:,.0f} "
-                    f"of cost covers {abs(theta):,.0f} of theta with {net:,.0f} to spare.")
-        if cap - cost > 0.5 * abs(theta):
-            return (f"MARGINAL: capture net of cost {cap - cost:,.0f} {ccy} recovers "
-                    f"{100 * (cap - cost) / max(abs(theta), 1e-9):.0f}% of the "
-                    f"{abs(theta):,.0f} theta. Leave the orders -- they are free money "
-                    "against a bill you are paying anyway -- but do not expect a profit.")
-        return (f"THIN: capture net of cost {cap - cost:,.0f} {ccy} against "
-                f"{abs(theta):,.0f} of theta. The orders still cost nothing to leave; "
-                "the position, not the ladder, is the problem.")
-    return (f"SHORT GAMMA: theta of {theta:,.0f} {ccy} against an expected gamma bleed "
-            f"of {abs(cap):,.0f} and {cost:,.0f} of cost -- net {net:,.0f}. Read "
-            "gap_scenario before you leave stops unattended; the expectation is not the "
-            "risk.")
-
-
 # --------------------------------------------------------------------------- #
-# printable
+# tables and printable output
 # --------------------------------------------------------------------------- #
-def format_ladder(rungs: Sequence[LadderRung], summary: Mapping[str, Any]) -> str:
-    """The thing the user reads at 17:00, verbatim-printable."""
+def ladder_frame(rungs: Sequence[LadderRung]) -> pd.DataFrame:
+    """The ladder as a table for the UI / a CSV of resting orders."""
     if not rungs:
-        return "no ladder: the book has no gamma in this pair"
+        return pd.DataFrame(columns=list(LadderRung(0, 0, 0, 0, 0, 0, 0).as_dict())
+                            + ["action"])
+    df = pd.DataFrame([r.as_dict() for r in rungs])
+    df["action"] = np.where(df["side"] > 0, "BUY", "SELL")
+    return df
+
+
+def ladder_cost_sensitivity(book: Book, mkt: MarketSnapshot, pair: str, *,
+                            cost_bps: Sequence[float] = (0.2, 1.0, 2.5, 5.0, 10.0, 20.0),
+                            **kw: Any) -> pd.DataFrame:
+    """How much of the answer the cost assumption owns.
+
+    ``zones.COST_BP`` is an interbank table and this user has no OTC access, so the
+    honest range spans two orders of magnitude.  The band scales as ``cost^(1/3)`` --
+    slowly -- but the cost line is **linear** in it, so what actually moves is whether
+    the ladder's cost eats the conversion, not where the rungs go.  Run this before
+    quoting any single net number.
+    """
+    rows: list[dict[str, Any]] = []
+    for c in cost_bps:
+        rungs = overnight_ladder(book, mkt, pair, cost_bp=float(c), **kw)
+        s = ladder_summary(rungs, book, mkt, pair,
+                           window=kw.get("window"), profile=kw.get("profile"),
+                           events=kw.get("events"),
+                           range_forecast=kw.get("range_forecast"),
+                           report_ccy=kw.get("report_ccy", "USD"),
+                           marks=kw.get("marks"))
+        rows.append({"cost_bp": float(c), "cost_pips_round_trip":
+                     float(c) / 1e4 * s["spot"] / pair_spec(pair).pip,
+                     "spacing_pips": s["spacing_pips"], "n_rungs": s["n_rungs"],
+                     "realised_conversion": s["realised_conversion"],
+                     "exp_cost": s["exp_cost"], "net": s["net"],
+                     "sd_reduction_pct": s["sd_reduction_pct"],
+                     "spacing_source": s["spacing_source"][:60]})
+    return pd.DataFrame(rows)
+
+
+def format_ladder(rungs: Sequence[LadderRung], summary: Mapping[str, Any]) -> str:
+    """The thing the user reads at 17:00, verbatim-printable.
+
+    Leads with the carry decision, because that is the decision.  The orders come
+    second, framed as what they are: conversion and a delta cap.
+    """
+    if not rungs:
+        return ("no ladder: " + ("the book has no gamma in this pair"
+                                 if summary.get("gamma", 0) == 0 else "no rungs produced"))
     spec = pair_spec(summary["pair"])
     dp = 4 if spec.pip < 1e-3 else 2
     side = {1: "BUY ", -1: "SELL"}
     ot = rungs[0].order_type.upper()
-    L = [f"{summary['pair']}  spot {summary['spot']:,.{dp}f}  "
-         f"{summary['gamma_side'].upper()} GAMMA {summary['gamma_1pct'] / 1e6:,.2f}mm per 1%",
-         f"{summary['window_label']}: {summary['clock_hours']:.0f}h clock, "
-         f"{summary['var_fraction']:.2f} days of variance "
-         f"({summary['var_vs_clock']:.2f}x the clock-time answer), "
-         f"1 sigma = {summary['sigma_window_pips']:,.0f} pips",
-         f"{ot} orders, spacing {summary['spacing_pips']:,.0f} pips:"]
+    ccy = summary["ccy"]
+    L = [
+        f"{summary['pair']}  spot {summary['spot']:,.{dp}f}  "
+        f"{summary['gamma_side'].upper()} GAMMA {summary['gamma_1pct'] / 1e6:,.2f}mm per 1%",
+        f"{summary['window_label']}: {summary['clock_hours']:.0f}h clock "
+        f"({summary['clock_fraction']:.0%} of a day's THETA) but "
+        f"{summary['var_fraction']:.2f} days of VARIANCE "
+        f"-- you pay {summary['theta_per_var_day']:.2f}x the theta per day of "
+        f"variance -- 1 sigma "
+        f"{summary['sigma_window_pips']:,.0f} pips, breakeven "
+        f"{summary['breakeven_move_pips']:,.0f} pips",
+        f"CARRY  gamma {summary['gamma_pnl']:+,.0f} + theta {summary['theta']:+,.0f} "
+        f"= {summary['carry']:+,.0f} {ccy}   |   crossover ATM "
+        f"{summary['crossover_vol'] * 100:.2f}% vs {summary['atm_now'] * 100:.2f}% marked",
+        f"{ot} orders, spacing {summary['spacing_pips']:,.0f} pips "
+        f"[{summary['spacing_source'].split('|')[0].strip()}]:",
+    ]
     for r in rungs:
         a = (f"  [{r.anchor} {r.anchor_dist_pips:+.0f}p]" if r.anchor else "")
         L.append(f"  {side[r.side]} {r.clip_base / 1e6:6.2f}mm {spec.base} at "
                  f"{r.level:,.{dp}f}  ({r.pips_from_spot:+6.0f}p, "
-                 f"{r.sigma_dist:.2f}sig, p_touch {r.p_touch:4.0%}, "
-                 f"E[fills] {r.exp_crossings:4.2f}, E[P&L] {r.exp_pnl:+7,.0f} "
-                 f"{summary['ccy']}){a}")
-    L.append(f"  capture {summary['exp_capture']:,.0f} - cost {summary['exp_cost']:,.0f} "
-             f"+ theta {summary['theta']:,.0f} = NET {summary['net']:,.0f} "
-             f"{summary['ccy']}")
+                 f"{r.sigma_dist:.2f}sig, touch {r.p_touch:4.0%}, "
+                 f"E[fills] {r.exp_crossings:4.2f}, banks {r.exp_pnl:+7,.0f} {ccy})" + a)
+    L.append(f"  LADDER banks {summary['realised_conversion']:,.0f} of the "
+             f"{summary['gamma_pnl']:,.0f} gamma P&L as cash, costs "
+             f"{summary['exp_cost']:,.0f}, cuts overnight P&L sd by "
+             f"{summary['sd_reduction_pct']:,.0f}%. Effect on EXPECTED P&L: "
+             f"{summary['marginal_vs_no_ladder']:+,.0f} {ccy} (= minus the cost).")
+    L.append(f"  NIGHT  {summary['net']:+,.0f} {ccy} expected; "
+             f"max delta between fills {summary['max_clip_base'] / 1e6:,.2f}mm; "
+             f"delta beyond the last rung "
+             f"{summary['delta_beyond_last_rung'] / 1e6:,.2f}mm")
     L.append(f"  {summary['verdict']}")
     for w in summary["warnings"]:
         L.append(f"  ! {w}")

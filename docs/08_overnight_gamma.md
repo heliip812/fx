@@ -171,3 +171,71 @@ cumulative delta is wrong at every rung beyond it.
 `zones.COST_BP` is an interbank table and **this user has no OTC access**; the trader puts their
 real all-in cost 15-40x higher. Cost is an explicit input with a no-OTC default, and the ladder's
 sensitivity to it must be shown.
+
+---
+
+# AMENDMENT — forecasting results; two components RULED OUT (binding)
+
+Source: `docs/10_forecast_evaluation.md`. Evaluated out-of-sample on the synthetic provider
+(n_oos=999 per pair, 5 pairs). The negative results below are the valuable part.
+
+## Measured, and it corrects a PM figure
+
+The London-close-to-London-open window is **0.382 of a day's variance** against **0.583 of the
+clock**. The theta/variance ratio is therefore **1.53**, superseding the PM's earlier **1.72**,
+which assumed a 0.34 share. Sigma scales by 1.236. (The agent's report states 0.382 "reproduces
+1.72"; it does not — 0.583/0.382 = 1.53, and its own sigma multiplier of 1.236 is consistent with
+1.53. The PM has verified and 1.53 stands.) **The qualitative conclusion is unchanged and still
+leads the screen:** overnight is theta-expensive relative to the gamma it can pay.
+
+Caveat that must appear in the UI: this profile is measured on **synthetic** data. The real number
+needs the user's own hourly history, and the ratio ranges 1.46-1.94 across plausible session
+profiles — enough to move the go/no-go on a marginal night.
+
+## USE
+
+**HAR-RV.** Beats yesterday's RV by +0.703 QLIKE R² and a trailing mean by +0.087, Diebold-Mariano
+t=-3.06 (p=0.004). Calibration is good in *level*, not merely in ranking: all four coverage
+quantiles within ~1.5 se and E|move| within 5% on 5/5 pairs. That matters because the forecast feeds
+a go/no-go decision, not just rung ordering.
+
+**Implied vol at a FIXED 0.5 weight**, not a fitted one. The fitted weight swings 0.22-1.00 with an
+honest OOS gain of -1.3% to +0.4% and nothing at p<0.08. Correctly diagnosed: the simulator's ATM is
+a linear function of trailing RV, so this is a machinery pass and not a market fact. Re-fit on real
+data before trusting any weight.
+
+**Session variance time, event segmentation, and kappa/efficiency/crossings as computed outputs**
+(identity verified to 1-5%; detects mean reversion at kappa=1.97 and momentum at kappa=0.32).
+
+## DO NOT USE
+
+**Forecasting kappa (path roughness) from daily bars.** Loses to the Brownian null on 5/5 pairs;
+daily sampling recovers only 46-63% of the true crossing count. Ruling: use the **Brownian baseline**
+for expected crossings, expose kappa as a user override, and state on the panel that expected fills
+assume a Brownian path. Do not present forecast roughness as predictive. Revisit only with intraday
+data.
+
+**Snapping rungs to technical levels — RULED OUT as a default.** 4 of 80 cells significant after
+Benjamini-Hochberg, 2 of 80 under the alternative control, **zero replication**, effect sizes
+0.2-0.4 pips. This is the direct answer to the user's request to combine technical analysis on
+levels: on this evidence it does not earn its place. Levels remain **displayed** as context, and
+snapping stays available but off. Honest in both directions: synthetic data validates the machinery,
+not the market question — `docs/10` states what the user should run on their own data and what
+result would justify turning it on.
+
+**Event uplift magnitude.** n≈25 per event type, no |t|>2. Event *segmentation* is kept (it changes
+where variance sits in the window); the *size* of the uplift is not estimated.
+
+## Method note worth preserving
+
+The agent found and fixed **two control bugs, each of which manufactured an effect**, and reports
+that the raw distance-matched control the PM's brief specified is **biased for range-proportional
+level kinds**. Recorded in `docs/10` §6.1. This is exactly the failure mode that makes level studies
+untrustworthy, and finding it in one's own harness is worth more than the result it overturned.
+
+## Contract fixes (approved)
+
+`measure_reversal_stats` gains `pair=` and a `level_panel` (a single-date frame carries no history,
+so the frozen signature could not work); `oi_levels` gains an optional `pair=` so pip size is not
+guessed; `fxgamma/signals/__init__.py` exports the new modules (**done by PM** — the owner had
+finished).

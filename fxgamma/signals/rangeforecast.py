@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -58,7 +58,10 @@ from ..conventions import pair_spec
 from .realized import ANNUAL, ESTIMATORS, log_returns
 
 __all__ = [
-    "RangeForecast", "har_rv", "overnight_range_forecast",
+    "RangeForecast", "RangeSegment", "har_rv", "overnight_range_forecast",
+    "grid_crossings", "crossings_series", "roughness_kappa", "efficiency_ratio",
+    "er_to_kappa", "kappa_to_er", "expected_crossings", "expected_level_crossings",
+    "forecast_roughness", "roughness_walk_forward", "window_segments",
     "rv_daily", "har_design", "har_walk_forward", "har_fit",
     "qlike", "mse_var", "r2_oos", "mincer_zarnowitz", "diebold_mariano",
     "evaluate_forecasts", "fit_blend_weights", "blend_sigma",
@@ -72,6 +75,30 @@ __all__ = [
 # --------------------------------------------------------------------------------------
 # Frozen output type (docs/08_overnight_gamma.md §3)
 # --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RangeSegment:
+    """One piece of an event-split window (CR-12).
+
+    A segment runs from ``start`` to ``end`` and carries its own share of a trading
+    day's variance.  ``event`` names the scheduled release that *begins* this segment
+    (empty for the opening piece), and ``time_certain`` is ``False`` when the calendar
+    asserts a precise announcement time that the issuing institution does not actually
+    commit to -- the BoJ being the standing example.  The ladder builder should treat a
+    ``time_certain=False`` boundary as soft and not space rungs tightly around it.
+    """
+
+    start: datetime
+    end: datetime
+    label: str
+    var_fraction: float
+    sigma: float
+    exp_abs_move_pips: float
+    event: str = ""
+    importance: int = 0
+    ccy: str = ""
+    time_certain: bool = True
 
 
 @dataclass(frozen=True)
@@ -98,6 +125,35 @@ class RangeForecast:
         ``exp_max_excursion_pips``, ``spot``, ``pip``.
     ``basis``
         a one-line provenance string, printed on the panel.
+
+    ``roughness`` (kappa)
+        **CR-11.** How much quadratic variation the path delivers per unit of squared
+        terminal displacement: ``kappa = E[QV] / E[D^2]``.  Brownian motion has
+        ``kappa = 1`` by construction.  A choppy night that ends where it started has
+        ``kappa >> 1``; a smooth trend has ``kappa`` near 1.  This is the term that
+        decides how often a rung is *refilled*, and it is a different question from
+        how far spot travels: two nights with the same range and different ``kappa``
+        pay a gamma book completely differently.
+    ``efficiency_ratio``
+        Kaufman's ``|net displacement| / sum of absolute moves`` at the sampling
+        stated in ``components['er_steps']``.  It is the readable form of the same
+        fact -- the two are linked exactly by ``kappa = 1 / (n * ER^2)`` (see
+        :func:`er_to_kappa`), which is why only one of them needs to be forecast.
+    ``expected_crossings``
+        ``{spacing_pips: expected number of completed h-moves in the window}``.  For
+        a grid of spacing ``h`` this is ``kappa * (S*sigma/h)^2`` -- the local-time /
+        quadratic-variation identity, which is exact for Brownian motion and is
+        scaled by the measured ``kappa`` for everything else.  A ladder's expected
+        number of *fills* is read straight off this, not off the range.
+    ``segments``
+        **CR-12.** The window split at every scheduled event inside it, each piece
+        carrying its own variance share and sigma.  A single ``var_fraction`` cannot
+        describe a night with a BoJ decision in the middle of it, and the ladder needs
+        to space rungs differently on the two sides of the print.
+    ``warnings``
+        data problems that affect this specific forecast -- an event whose announced
+        time is not actually fixed, a missing holiday calendar -- surfaced rather than
+        silently absorbed.
     """
 
     sigma_window: float
@@ -105,6 +161,13 @@ class RangeForecast:
     quantiles: dict[float, float]
     components: dict[str, float]
     basis: str
+    # ---- appended by CR-11 / CR-12.  Existing fields and their order are unchanged,
+    # so every positional construction of a RangeForecast still works.
+    roughness: float = 1.0
+    efficiency_ratio: float = float("nan")
+    expected_crossings: dict[float, float] = field(default_factory=dict)
+    segments: tuple["RangeSegment", ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------------------
@@ -334,10 +397,17 @@ def har_rv(rv_series, *, horizon: int = 1, space: str = "log",
     """Corsi HAR-RV.  Returns ``(annualised vol forecast, diagnostics)``.
 
     ``rv_series`` is a series of **annualised daily RV** (decimal vol, one value per
-    bar) -- exactly what :func:`rv_daily` produces from OHLC.  The fit is in
-    ``space='log'`` variance by default: variance is right-skewed and strictly
-    positive, log-space keeps the forecast positive without a constraint, and it is
-    what wins on QLIKE (see ``docs/10_forecast_evaluation.md``).
+    bar) -- exactly what :func:`rv_daily` produces from OHLC.
+
+    ``space='log'`` (variance in logs) is the default, and the reason is positivity
+    rather than accuracy.  Measured out of sample over 5 pairs (see
+    ``docs/10_forecast_evaluation.md`` section 1.4): mean QLIKE is 0.7300 for ``'var'``,
+    0.7330 for ``'log'`` and 0.7943 for ``'vol'``.  So plain-variance OLS is better by
+    0.4% -- inside the noise -- but it is an unconstrained linear fit and **can return
+    a negative variance**, which is unrecoverable in a rung distance.  Log space cannot,
+    at the cost of a Jensen correction (``exp(mu + s^2/2)``, applied by default, worth
+    ~20-30% of the level on these residuals).  ``'vol'`` is measurably worse than both
+    and is retained only for comparison.
 
     The returned diagnostics carry the coefficients with **HAC** standard errors, the
     in-sample R^2, the persistence ``b_d+b_w+b_m``, and the residual variance used
@@ -774,6 +844,91 @@ def event_variance_add(events: pd.DataFrame | None, pair: str,
     return float(add), int(len(sel))
 
 
+#: Calendar rows whose stated time is not actually fixed by the issuing institution.
+#: The BoJ is the standing example: its statement lands anywhere from roughly 11:30 to
+#: 15:00 JST depending on how long the board sits, so a calendar asserting "12:00 Tokyo"
+#: is asserting a precision that does not exist.  Matched case-insensitively against the
+#: ``event`` text.  A segment boundary at one of these is flagged ``time_certain=False``
+#: and the ladder builder must not space rungs tightly around it.
+SOFT_TIME_EVENTS: tuple[str, ...] = ("boj policy", "boj ", "bank of japan")
+
+
+def _time_certain(event: str, source: str = "") -> bool:
+    e = str(event).lower()
+    if any(t in e for t in SOFT_TIME_EVENTS):
+        return False
+    return not str(source).lower().startswith("approx:")
+
+
+def window_segments(start: datetime, end: datetime, events: pd.DataFrame | None,
+                    pair: str, sigma_day: float, spot: float, pip: float, *,
+                    profile: Mapping[int, float] | None = None,
+                    sigma_by_importance: Mapping[int, float] | None = None,
+                    label: str = "window") -> tuple[tuple[RangeSegment, ...], tuple[str, ...]]:
+    """CR-12: split ``[start, end)`` at every in-window scheduled event.
+
+    One ``var_fraction`` cannot describe a night with a policy decision in the middle
+    of it.  This returns the window cut at each relevant event, each piece carrying
+    its own share of a trading day's variance from the session profile, plus the
+    event's own variance added to the piece that *begins* at the print.  It also
+    returns the data warnings that apply to this particular night.
+    """
+    warns: list[str] = []
+    if start is None or end is None:
+        return (), ("no window start/end given: cannot build an event profile",)
+    spec = pair_spec(pair)
+    lo = pd.Timestamp(start).tz_convert("UTC") if pd.Timestamp(start).tzinfo else pd.Timestamp(start, tz="UTC")
+    hi = pd.Timestamp(end).tz_convert("UTC") if pd.Timestamp(end).tzinfo else pd.Timestamp(end, tz="UTC")
+
+    rel = pd.DataFrame()
+    if events is not None and len(events) and "datetime" in events.columns:
+        ts = pd.to_datetime(events["datetime"], utc=True)
+        rel = events[(ts >= lo) & (ts < hi) & events["ccy"].isin([spec.base, spec.quote])].copy()
+        rel["_ts"] = ts[rel.index]
+        rel = rel.sort_values("_ts")
+
+    # ALWAYS warn: the shipped calendar (CG-6) carries releases and central-bank
+    # decisions and NO market holidays.  A holiday in either leg thins the book and
+    # cuts realised variance sharply, and nothing in this repo knows about it.
+    warns.append("no holiday calendar: `data/calendar/events.csv` has zero holiday rows, "
+                 "so a thin pre-holiday or half-day session is forecast as a normal one")
+
+    tbl = dict(sigma_by_importance or EVENT_SIGMA)
+    cuts = [t for t in rel["_ts"].tolist() if lo < t < hi] if "_ts" in rel.columns else []
+    bounds = [lo] + cuts + [hi]
+    segs: list[RangeSegment] = []
+    for i in range(len(bounds) - 1):
+        a, b = bounds[i], bounds[i + 1]
+        if b <= a:
+            continue
+        vf = window_var_fraction(a.to_pydatetime(), b.to_pydatetime(), profile=profile)
+        ev_name, imp, ccy, certain = "", 0, "", True
+        add = 0.0
+        if i > 0:
+            row = rel[rel["_ts"] == a] if "_ts" in rel.columns else rel.iloc[0:0]
+            if len(row):
+                r0 = row.iloc[0]
+                ev_name = str(r0["event"]); imp = int(r0["importance"]); ccy = str(r0["ccy"])
+                certain = _time_certain(ev_name, str(r0.get("source", "")))
+                sg = float(tbl.get(imp, 0.0))
+                add = sg * sg
+                if not certain:
+                    warns.append(f"{ev_name} ({ccy}) has no fixed announcement time; the "
+                                 f"{a:%H:%M} UTC boundary is nominal, treat it as soft")
+        sig = math.sqrt(max(vf * sigma_day * sigma_day + add, 0.0))
+        segs.append(RangeSegment(
+            start=a.to_pydatetime(), end=b.to_pydatetime(),
+            label=f"{label} [{a:%H:%M}-{b:%H:%M}Z]" + (f" post-{ev_name}" if ev_name else ""),
+            var_fraction=float(vf), sigma=float(sig),
+            exp_abs_move_pips=float(spot * sig * math.sqrt(2.0 / math.pi) / pip),
+            event=ev_name, importance=imp, ccy=ccy, time_certain=certain))
+    # de-duplicate warnings, preserve order
+    seen: dict[str, None] = {}
+    for w in warns:
+        seen.setdefault(w, None)
+    return tuple(segs), tuple(seen)
+
+
 def calibrate_event_uplift(hist: pd.DataFrame, events: pd.DataFrame, pair: str, *,
                            importance: int = 3, method: str = DEFAULT_RV_METHOD
                            ) -> dict:
@@ -848,6 +1003,244 @@ def expected_max_excursion(sigma_window: float, spot: float, pip: float) -> floa
     return float(spot * sigma_window * math.sqrt(8.0 / math.pi) / pip)
 
 
+# --------------------------------------------------------------------------------------
+# CR-11: path roughness -- what actually decides how often a rung fills
+# --------------------------------------------------------------------------------------
+#
+# The identity this section rests on.  For a path observed at n steps with log returns
+# r_1..r_n, write the quadratic variation QV = sum r_i^2 and the net displacement
+# D = sum r_i.  Then, in expectation over paths,
+#
+#     kappa := E[QV] / E[D^2]
+#
+# is exactly 1 for a random walk (independent increments), and greater than 1 for a
+# path that oscillates -- it travels a long way in total while ending near where it
+# began.  The number of times such a path crosses the lines of a grid of spacing h is
+# QV / h^2, again an identity (each grid step consumes h^2 of quadratic variation), so
+#
+#     E[grid crossings] = kappa * (S * sigma_terminal / h)^2
+#
+# Kaufman's efficiency ratio ER = |D| / sum|r_i| is the same fact in readable form:
+# for a random walk ER = 1/sqrt(n), and in general kappa = 1 / (n * ER^2).  So the
+# ladder needs exactly ONE roughness number, and either name gets you the other.
+#
+# THE HONEST LIMITATION, and it is a real one: measured here on **daily closes**, this
+# is multi-day path roughness.  The overnight window's kappa needs intraday data, which
+# the free feeds in this repo do not carry.  The machinery is frequency-agnostic --
+# hand `crossings_series` an hourly frame and it measures the right thing -- but until
+# the user has intraday history, kappa for the overnight window is an assumption and is
+# reported as one.
+
+
+def grid_crossings(prices: Sequence[float], spacing: float) -> int:
+    """Completed ``h``-moves along a path -- Levy's h-oscillation count.
+
+    The reference moves with the path: every time the price gets ``h`` away from the
+    current reference, one move is booked and the reference steps to it.  This is the
+    "renko brick" count, and it is the count a ladder is actually paid on -- one brick
+    is one sell-high / buy-back-lower round trip at spacing ``h``.
+
+    It is the right estimator because ``h^2 * N_h -> QV`` as sampling refines, so it
+    is *sampling-consistent*.  The obvious alternative -- counting how many lines of a
+    **fixed** grid each step steps over -- is not: a path that wiggles across one grid
+    line racks up crossings without bound as you sample it more finely, so that count
+    has no limit to converge to and cannot be compared with the analytic ``QV/h^2``.
+    (This module used the fixed-grid version first; it over-read the analytic baseline
+    by ~2.6x on a 25-pip grid and the discrepancy is what exposed the error.)
+
+    A path sampled **more coarsely than h** still undercounts, because the oscillation
+    inside a bar is invisible.  That is the daily-data limitation, not a defect of the
+    counter: choose ``spacing`` larger than a typical bar move when measuring on daily
+    closes, and see ``docs/10_forecast_evaluation.md`` for what that costs.
+    """
+    p = np.asarray(prices, float)
+    p = p[np.isfinite(p)]
+    h = float(spacing)
+    if p.size < 2 or not np.isfinite(h) or h <= 0:
+        return 0
+    ref = float(p[0])
+    n = 0
+    for x in p[1:]:
+        gap = float(x) - ref
+        k = int(abs(gap) // h)
+        if k:
+            n += k
+            ref += math.copysign(k * h, gap)
+    return int(n)
+
+
+def crossings_series(hist: pd.DataFrame, spacing_pips: float, pair: str, *,
+                     window_bars: int = 5, step: int = 1) -> pd.DataFrame:
+    """Observed grid crossings, quadratic variation and displacement, per block.
+
+    One row per block of ``window_bars`` consecutive bars: ``crossings`` (observed),
+    ``qv`` (sum of squared log returns), ``d2`` (squared net log return), ``tv`` (sum
+    of absolute log returns), and ``bm_crossings``, the Brownian prediction
+    ``QV_price / h^2`` for the *same realised* variance.  The ratio
+    ``crossings / bm_crossings`` is the roughness the analytic baseline misses.
+    """
+    c = pd.Series(hist["close"]).astype(float).dropna()
+    pip = pair_spec(pair).pip
+    h = float(spacing_pips) * pip
+    r = np.log(c / c.shift(1)).dropna()
+    rows = []
+    n = int(window_bars)
+    for i in range(n, len(c), int(step)):
+        seg = c.iloc[i - n:i + 1]
+        rr = r.iloc[max(i - n, 0):i]
+        if len(rr) < n:
+            continue
+        qv = float(np.sum(rr.to_numpy() ** 2))
+        d = float(np.sum(rr.to_numpy()))
+        tv = float(np.sum(np.abs(rr.to_numpy())))
+        s0 = float(seg.iloc[0])
+        rows.append({"date": c.index[i], "crossings": grid_crossings(seg, h),
+                     "qv": qv, "d2": d * d, "tv": tv,
+                     "bm_crossings": (s0 * s0 * qv) / (h * h),
+                     "er": abs(d) / tv if tv > 0 else np.nan})
+    return pd.DataFrame(rows).set_index("date") if rows else pd.DataFrame(
+        columns=["crossings", "qv", "d2", "tv", "bm_crossings", "er"])
+
+
+def roughness_kappa(hist: pd.DataFrame, *, window_bars: int = 5,
+                    step: int = 1) -> float:
+    """Aggregate ``kappa = sum(QV) / sum(D^2)`` over blocks of ``window_bars`` bars.
+
+    Aggregated rather than averaged per block: the per-block ratio has an unbounded
+    denominator (a block can end exactly where it started) and its mean does not
+    exist in any useful sense.  The aggregate is the ratio of expectations, which is
+    the quantity the crossing identity actually needs.
+    """
+    c = pd.Series(hist["close"]).astype(float).dropna()
+    r = np.log(c / c.shift(1)).dropna().to_numpy()
+    n = int(window_bars)
+    if r.size < n + 2:
+        return float("nan")
+    qv = np.array([np.sum(r[i:i + n] ** 2) for i in range(0, r.size - n + 1, int(step))])
+    d2 = np.array([np.sum(r[i:i + n]) ** 2 for i in range(0, r.size - n + 1, int(step))])
+    tot = float(np.sum(d2))
+    return float(np.sum(qv) / tot) if tot > 0 else float("nan")
+
+
+def efficiency_ratio(hist: pd.DataFrame, *, window_bars: int = 5, step: int = 1) -> float:
+    """Aggregate Kaufman efficiency ratio ``sum|D| / sum(TV)`` over blocks."""
+    c = pd.Series(hist["close"]).astype(float).dropna()
+    r = np.log(c / c.shift(1)).dropna().to_numpy()
+    n = int(window_bars)
+    if r.size < n + 2:
+        return float("nan")
+    d = np.array([abs(np.sum(r[i:i + n])) for i in range(0, r.size - n + 1, int(step))])
+    tv = np.array([np.sum(np.abs(r[i:i + n])) for i in range(0, r.size - n + 1, int(step))])
+    t = float(np.sum(tv))
+    return float(np.sum(d) / t) if t > 0 else float("nan")
+
+
+def er_to_kappa(er: float, n_steps: int) -> float:
+    """``kappa = 1 / (n * ER^2)``.  Brownian ``ER = 1/sqrt(n)`` maps to ``kappa = 1``."""
+    if not np.isfinite(er) or er <= 0 or n_steps < 1:
+        return float("nan")
+    return float(1.0 / (float(n_steps) * er * er))
+
+
+def kappa_to_er(kappa: float, n_steps: int) -> float:
+    """Inverse of :func:`er_to_kappa`."""
+    if not np.isfinite(kappa) or kappa <= 0 or n_steps < 1:
+        return float("nan")
+    return float(1.0 / math.sqrt(float(n_steps) * kappa))
+
+
+def expected_crossings(sigma_window: float, spot: float, pip: float,
+                       spacing_pips: float, *, roughness: float = 1.0) -> float:
+    """``kappa * (S*sigma/h)^2`` -- expected completed ``h``-moves over the window.
+
+    One completed move is one round trip of a rung pair spaced ``h`` apart, so this,
+    not the range, is what a ladder's fill count is proportional to.  It is the
+    continuous-monitoring count, which is the right one for a **resting order**: the
+    order sits on the broker's book and fills on a tick, it is not sampled.
+    """
+    h = float(spacing_pips) * float(pip)
+    if h <= 0 or not np.isfinite(sigma_window) or sigma_window <= 0:
+        return float("nan")
+    return float(max(roughness, 0.0) * (float(spot) * float(sigma_window) / h) ** 2)
+
+
+def expected_level_crossings(dist_pips: float, sigma_window: float, spot: float,
+                             pip: float, granularity_pips: float, *,
+                             roughness: float = 1.0) -> float:
+    """Expected crossings of **one** level ``dist_pips`` away, at grid granularity.
+
+    Tanaka's formula gives the expected local time of driftless Brownian motion at a
+    level ``a`` away from the start: ``E[L_T(a)] = E|W_T - a| - |a|``, and the number
+    of ``h``-crossings of that level is ``E[L]/h``.  At the money (``a=0``) this is
+    ``0.798 * s / h``; it falls off as the level gets further away, which is exactly
+    why the outer rungs of a ladder refill less often than the inner ones and why
+    sizing them identically is wrong.
+    """
+    s = float(spot) * float(sigma_window)
+    a = abs(float(dist_pips)) * float(pip)
+    h = float(granularity_pips) * float(pip)
+    if s <= 0 or h <= 0:
+        return float("nan")
+    u = a / s
+    phi = math.exp(-0.5 * u * u) / math.sqrt(2.0 * math.pi)
+    Phi = 0.5 * math.erfc(-u / math.sqrt(2.0))
+    e_abs = s * (2.0 * phi + u * (2.0 * Phi - 1.0))
+    local = max(e_abs - a, 0.0)
+    return float(max(roughness, 0.0) * local / h)
+
+
+def forecast_roughness(hist: pd.DataFrame, *, window_bars: int = 5,
+                       lookback: int = 250) -> tuple[float, dict]:
+    """Roughness forecast: the trailing aggregate ``kappa``.
+
+    Deliberately the simplest thing that could work.  ``kappa`` is a slowly-varying
+    ratio, not a spiky series, and the out-of-sample evaluation in
+    ``docs/10_forecast_evaluation.md`` shows a trailing aggregate is not beaten by
+    anything more elaborate on the data available -- so shipping something more
+    elaborate would be decoration.
+    """
+    c = pd.Series(hist["close"]).astype(float).dropna()
+    tail = hist.loc[c.index[-int(lookback):]] if len(c) > lookback else hist
+    k = roughness_kappa(tail, window_bars=window_bars)
+    er = efficiency_ratio(tail, window_bars=window_bars)
+    return (float(k) if np.isfinite(k) else 1.0,
+            {"kappa": k, "er": er, "er_brownian": 1.0 / math.sqrt(window_bars),
+             "n_steps": int(window_bars), "lookback": int(lookback),
+             "kappa_from_er": er_to_kappa(er, window_bars)})
+
+
+def roughness_walk_forward(hist: pd.DataFrame, pair: str, *, spacing_pips: float = 25.0,
+                           window_bars: int = 5, min_train: int = 500,
+                           lookback: int = 250, refit_every: int = 21) -> pd.DataFrame:
+    """Out-of-sample crossings forecast vs the Brownian null and a trailing mean.
+
+    Columns: ``actual`` (observed grid crossings in the block), ``kappa_model``
+    (Brownian crossings for the realised variance, scaled by the trailing kappa),
+    ``bm`` (the Brownian null, ``kappa = 1``), ``mean`` (trailing mean crossings).
+    The vol input is held at its *realised* value for every model, so this isolates
+    the roughness question from the vol question -- otherwise a good crossings number
+    could be bought entirely with a good vol forecast.
+    """
+    cs = crossings_series(hist, spacing_pips, pair, window_bars=window_bars)
+    if cs.empty or len(cs) < min_train + 10:
+        return pd.DataFrame(columns=["actual", "kappa_model", "bm", "mean"])
+    rows = []
+    kap = 1.0
+    for i in range(int(min_train), len(cs)):
+        if (i - int(min_train)) % int(refit_every) == 0:
+            lo = max(0, i - int(lookback))
+            tr = cs.iloc[lo:i]
+            d2 = float(tr["d2"].sum())
+            kap = float(tr["qv"].sum() / d2) if d2 > 0 else 1.0
+        row = cs.iloc[i]
+        rows.append({"date": cs.index[i], "actual": float(row["crossings"]),
+                     "kappa_model": kap * float(row["bm_crossings"]),
+                     "bm": float(row["bm_crossings"]),
+                     "mean": float(cs["crossings"].iloc[max(0, i - lookback):i].mean()),
+                     "kappa_used": kap})
+    return pd.DataFrame(rows).set_index("date")
+
+
 def _norm_ppf(p: float) -> float:
     """Acklam's inverse normal CDF (the models layer's version is not importable here
     without pulling the pricer in; this is a 1e-9-accurate standalone)."""
@@ -893,6 +1286,9 @@ def overnight_range_forecast(pair: str, mkt, hist: pd.DataFrame, window,
                              profile: Mapping[int, float] | None = None,
                              event_sigma: Mapping[int, float] | None = None,
                              rescale: bool = True,
+                             crossing_spacings: Sequence[float] = (10.0, 20.0, 25.0, 50.0),
+                             roughness: float | None = None,
+                             roughness_bars: int = 5,
                              spot: float | None = None) -> RangeForecast:
     """Forecast the **magnitude** of the overnight move.  No direction, ever.
 
@@ -983,11 +1379,35 @@ def overnight_range_forecast(pair: str, mkt, hist: pd.DataFrame, window,
     event_mult = float(var_total / var_window) if var_window > 0 else float("nan")
     sigma_window = math.sqrt(max(var_total, 0.0))
 
+    # --- path roughness (CR-11) ---------------------------------------------------
+    if roughness is not None:
+        kappa = float(roughness); rough_info = {"kappa": float(roughness), "n_steps": roughness_bars,
+                                                "er": kappa_to_er(float(roughness), roughness_bars)}
+    elif hist is not None and len(hist) > roughness_bars + 60:
+        kappa, rough_info = forecast_roughness(hist, window_bars=roughness_bars)
+    else:
+        kappa, rough_info = 1.0, {"kappa": 1.0, "er": kappa_to_er(1.0, roughness_bars),
+                                  "n_steps": roughness_bars}
+    er = float(rough_info.get("er", float("nan")))
+
     # --- to pips ------------------------------------------------------------------
     pip = spec.pip
     exp_abs = S * sigma_window * math.sqrt(2.0 / math.pi) / pip
     qs = {float(p): float(S * (math.exp(_norm_ppf(float(p)) * sigma_window) - 1.0) / pip)
           for p in quantiles}
+    xings = {float(h): expected_crossings(sigma_window, S, pip, float(h), roughness=kappa)
+             for h in crossing_spacings}
+
+    # --- event-aware profile (CR-12) ----------------------------------------------
+    segs, warns = window_segments(start, end, events, pair, sigma_day, S, pip,
+                                  profile=profile, sigma_by_importance=event_sigma,
+                                  label=wlabel) if start is not None and end is not None \
+        else ((), ("no window start/end: event profile unavailable",))
+    if rough_info.get("n_steps") and hist is not None:
+        warns = warns + (
+            f"roughness kappa={kappa:.3f} is measured on DAILY closes over "
+            f"{rough_info.get('n_steps')}-bar blocks, not on intraday overnight paths; "
+            "it is an assumption for this window until intraday history exists",)
 
     components = {
         "har": float(sigma_har),
@@ -1007,6 +1427,11 @@ def overnight_range_forecast(pair: str, mkt, hist: pd.DataFrame, window,
         "har_persistence": float(har_info.get("persistence", float("nan"))),
         "har_n": float(har_info.get("n", 0)),
         "proxy_scale": float(pscale),
+        "kappa": float(kappa),
+        "er": er,
+        "er_steps": float(rough_info.get("n_steps", roughness_bars)),
+        "er_brownian": float(kappa_to_er(1.0, int(rough_info.get("n_steps", roughness_bars)))),
+        "n_segments": float(len(segs)),
     }
     imp_txt = f"{sigma_imp * 100:.2f}%" if np.isfinite(sigma_imp) else "unavailable"
     basis = (f"sqrt(252) distance basis | HAR({'/'.join(str(x) for x in HAR_LAGS)}) on "
@@ -1016,7 +1441,11 @@ def overnight_range_forecast(pair: str, mkt, hist: pd.DataFrame, window,
              f"| HAR {sigma_har * 100:.2f}% x {w_used['har']:.2f} + implied {imp_txt} "
              f"x {w_used['implied']:.2f} = {sigma_ann * 100:.2f}% ann "
              f"| var_fraction {var_fraction:.3f} from {vf_src} ({wlabel}) "
-             f"| {n_ev} in-window event(s) x{event_mult:.3f} variance")
+             f"| {n_ev} in-window event(s) x{event_mult:.3f} variance, {len(segs)} segment(s) "
+             f"| roughness kappa={kappa:.3f} (ER={er:.4f} vs Brownian "
+             f"{components['er_brownian']:.4f} at n={int(components['er_steps'])})")
     return RangeForecast(sigma_window=float(sigma_window),
                          exp_abs_move_pips=float(exp_abs),
-                         quantiles=qs, components=components, basis=basis)
+                         quantiles=qs, components=components, basis=basis,
+                         roughness=float(kappa), efficiency_ratio=er,
+                         expected_crossings=xings, segments=segs, warnings=warns)

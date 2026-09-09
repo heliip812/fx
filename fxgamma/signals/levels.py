@@ -38,8 +38,8 @@ builder and the measurement never see a bar they would not have had.
 from __future__ import annotations
 
 import math
-from datetime import date, datetime
-from typing import Iterable, Mapping, Sequence
+
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -49,6 +49,7 @@ from ..conventions import pair_spec
 __all__ = [
     "LEVEL_KINDS", "KIND_GROUP", "STRENGTH_PRIOR", "LEVEL_COLUMNS",
     "technical_levels", "oi_levels", "level_panel", "measure_reversal_stats",
+    "measure_fill_quality",
     "nearest_level", "pivot_levels", "swing_points", "round_levels",
 ]
 
@@ -394,6 +395,100 @@ def _bh(p: np.ndarray) -> np.ndarray:
     return adj
 
 
+def _prepare(hist: pd.DataFrame, levels: pd.DataFrame, pair: str | None,
+             horizon_h: float, control: str, n_control: int, jitter: float, seed: int):
+    """Shared engine for both measurements: build the panel, evaluate every real level
+    and every control replicate through the **identical** code path, and return the
+    per-observation arrays.  One engine, so the real and control columns can never
+    drift apart -- which is the single easiest way to fake an effect."""
+    if levels is None or len(levels) == 0:
+        return None
+    lv = levels
+    if "bar" not in lv.columns:
+        if pair is None:
+            raise ValueError("levels is not a panel (no 'bar' column) and pair= was not "
+                             "given, so the panel cannot be rebuilt")
+        lv = level_panel(hist, pair, kinds=sorted(set(lv["kind"])))
+        if lv.empty:
+            return None
+    pip = pair_spec(pair).pip if pair is not None else float(lv["level"].iloc[0]) * 1e-4
+
+    n_bars = max(1, int(math.ceil(float(horizon_h) / 24.0)))
+    mx, mn, cl = _fwd_stats(hist, n_bars)
+    close = hist["close"].to_numpy(float)
+
+    bar = lv["bar"].to_numpy(int)
+    lvl = lv["level"].to_numpy(float)
+    kind = lv["kind"].to_numpy(object)
+    ref = close[bar]
+    side = np.where(lvl > ref, 1, -1)
+    dist = np.abs(lvl - ref)
+    ok = np.isfinite(mx[bar]) & np.isfinite(mn[bar]) & np.isfinite(cl[bar]) & (dist > 0)
+    bar, lvl, kind, ref, side, dist = (a[ok] for a in (bar, lvl, kind, ref, side, dist))
+    fmax, fmin, fcl = mx[bar], mn[bar], cl[bar]
+    buf = 5.0 * pip
+
+    def _eval(L: np.ndarray) -> dict:
+        up = side > 0
+        touch = np.where(up, fmax >= L, fmin <= L)
+        exc = np.where(up, fmax - L, L - fmin) / pip
+        exc = np.where(touch, np.maximum(exc, 0.0), np.nan)
+        rev = np.where(up, fcl < L, fcl > L)
+        revb = np.where(up, fcl < L - buf, fcl > L + buf)
+        # signed mark of the resting order (sell above / buy below) at the horizon
+        mark = side * (L - fcl) / pip
+        # did spot also revisit the ladder centre, so the delta can come back off?
+        recycle = touch & np.where(up, fmin <= ref, fmax >= ref)
+        return {"touch": touch.astype(float), "rev": rev.astype(float), "exc": exc,
+                "revb": revb.astype(float), "mark": np.where(touch, mark, np.nan),
+                "recycle": recycle.astype(float)}
+
+    real = _eval(lvl)
+    rng = np.random.default_rng(int(seed))
+    kinds = sorted(set(kind.tolist()))
+    scale = _atr(hist, 14)[bar]
+    scale = np.where(np.isfinite(scale) & (scale > 0), scale, np.nanmedian(scale))
+    dist_u = dist / scale
+
+    ctrl = {k: np.zeros(lvl.size) for k in ("touch", "rev", "revb", "exc", "mark",
+                                            "recycle", "dist_mean")}
+    for _ in range(int(n_control)):
+        d_c = dist.copy()
+        if control == "permuted":
+            # permute the distance measured in ATRs, then map back through TODAY's ATR
+            for k in kinds:
+                m = kind == k
+                d_c[m] = rng.permutation(dist_u[m]) * scale[m]
+        elif control == "permuted_raw":
+            for k in kinds:
+                m = kind == k
+                d_c[m] = rng.permutation(dist[m])
+        elif control == "jitter":
+            u = rng.uniform(-float(jitter), float(jitter), dist.size)
+            u = np.where(np.abs(u) < 0.05 * float(jitter),
+                         np.sign(u + 1e-12) * 0.05 * float(jitter), u)
+            d_c = dist * (1.0 + u)
+        else:
+            raise ValueError("control must be 'permuted', 'permuted_raw' or 'jitter'")
+        Lc = ref + side * d_c
+        e = _eval(Lc)
+        m = e["touch"] > 0
+        # Accumulate the control as COUNTS of touch events, so the control mean is
+        # pooled over touches exactly the way the real mean is.  Averaging per
+        # observation instead silently reweights far levels up (a far level touches
+        # rarely but would still count once) -- that alone manufactured a ~10pp
+        # spurious effect in an earlier cut of this code.
+        ctrl["touch"] += e["touch"]
+        for key in ("rev", "revb", "recycle"):
+            ctrl[key] += np.where(m, e[key], 0.0)
+        ctrl["exc"] += np.where(m, np.nan_to_num(e["exc"]), 0.0)
+        ctrl["mark"] += np.where(m, np.nan_to_num(e["mark"]), 0.0)
+        ctrl["dist_mean"] += np.abs(Lc - ref)
+    ctrl["dist_mean"] /= float(n_control)
+    ubars = np.unique(bar)
+    return bar, lvl, kind, ref, side, dist, pip, n_bars, real, ctrl, ubars, rng
+
+
 def measure_reversal_stats(hist: pd.DataFrame, levels: pd.DataFrame, *,
                            horizon_h: int = 12, pair: str | None = None,
                            control: str = "permuted", n_control: int = 20,
@@ -462,94 +557,15 @@ def measure_reversal_stats(hist: pd.DataFrame, levels: pd.DataFrame, *,
       back beyond some buffer) is available via the returned ``reversal_rate_buf``.
     * **Multiple testing.**  See the module docstring.  Read the BH column.
     """
-    if levels is None or len(levels) == 0:
+    prep = _prepare(hist, levels, pair, horizon_h, control, n_control, jitter, seed)
+    if prep is None:
         return pd.DataFrame()
-    lv = levels
-    if "bar" not in lv.columns:
-        if pair is None:
-            raise ValueError("levels is not a panel (no 'bar' column) and pair= was not "
-                             "given, so the panel cannot be rebuilt")
-        lv = level_panel(hist, pair, kinds=sorted(set(lv["kind"])))
-        if lv.empty:
-            return pd.DataFrame()
-    if pair is not None:
-        pip = pair_spec(pair).pip
-    else:
-        pip = float(lv["level"].iloc[0]) * 1e-4
-
-    n_bars = max(1, int(math.ceil(float(horizon_h) / 24.0)))
-    mx, mn, cl = _fwd_stats(hist, n_bars)
-    close = hist["close"].to_numpy(float)
-
-    bar = lv["bar"].to_numpy(int)
-    lvl = lv["level"].to_numpy(float)
-    kind = lv["kind"].to_numpy(object)
-    ref = close[bar]
-    side = np.where(lvl > ref, 1, -1)
-    dist = np.abs(lvl - ref)
-    ok = np.isfinite(mx[bar]) & np.isfinite(mn[bar]) & np.isfinite(cl[bar]) & (dist > 0)
-    bar, lvl, kind, ref, side, dist = (a[ok] for a in (bar, lvl, kind, ref, side, dist))
-
-    fmax, fmin, fcl = mx[bar], mn[bar], cl[bar]
-    buf = 5.0 * pip
-
-    def _eval(L: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        up = side > 0
-        touch = np.where(up, fmax >= L, fmin <= L)
-        exc = np.where(up, fmax - L, L - fmin) / pip
-        exc = np.where(touch, np.maximum(exc, 0.0), np.nan)
-        rev = np.where(up, fcl < L, fcl > L)
-        revb = np.where(up, fcl < L - buf, fcl > L + buf)
-        return touch.astype(float), rev.astype(float), exc, revb.astype(float)
-
-    t_r, rev_r, exc_r, revb_r = _eval(lvl)
-
-    rng = np.random.default_rng(int(seed))
+    (bar, lvl, kind, ref, side, dist, pip, n_bars, real, ctrl, ubars, rng) = prep
     kinds = sorted(set(kind.tolist()))
-    # Scale for the scale-matched control: ATR at the asof bar, known at that bar.
-    scale = _atr(hist, 14)[bar]
-    scale = np.where(np.isfinite(scale) & (scale > 0), scale, np.nanmedian(scale))
-    dist_u = dist / scale
-    ctrl_levels = np.empty((int(n_control), lvl.size))
-    for c_i in range(int(n_control)):
-        d_c = dist.copy()
-        if control == "permuted":
-            # permute the distance measured in ATRs, then map back through TODAY's ATR
-            for k in kinds:
-                m = kind == k
-                d_c[m] = rng.permutation(dist_u[m]) * scale[m]
-        elif control == "permuted_raw":
-            for k in kinds:
-                m = kind == k
-                d_c[m] = rng.permutation(dist[m])
-        elif control == "jitter":
-            u = rng.uniform(-float(jitter), float(jitter), dist.size)
-            u = np.where(np.abs(u) < 0.05 * float(jitter), np.sign(u + 1e-12) * 0.05 * float(jitter), u)
-            d_c = dist * (1.0 + u)
-        else:
-            raise ValueError("control must be 'permuted', 'permuted_raw' or 'jitter'")
-        ctrl_levels[c_i] = ref + side * d_c
+    t_r, rev_r, exc_r, revb_r = real["touch"], real["rev"], real["exc"], real["revb"]
+    c_touch, c_rev, c_revb, c_exc = ctrl["touch"], ctrl["rev"], ctrl["revb"], ctrl["exc"]
+    dist_c_mean = ctrl["dist_mean"]
 
-    # Accumulate the control as **counts of touch events**, so that the control mean is
-    # pooled over touches exactly the way the real mean is.  Averaging per observation
-    # instead (each observation contributing its own across-replicate mean) silently
-    # reweights far levels up, because a far level touches rarely but would still count
-    # once -- and that alone manufactured a ~10pp spurious "effect" in an earlier cut of
-    # this code.  Same estimator on both sides or the comparison means nothing.
-    c_touch = np.zeros_like(t_r)          # number of touching replicates, per observation
-    c_rev = np.zeros_like(rev_r)          # of which, reversed
-    c_revb = np.zeros_like(revb_r)
-    c_exc = np.zeros_like(exc_r)          # summed excursion over touching replicates
-    dist_c_mean = np.zeros_like(dist)
-    for c_i in range(int(n_control)):
-        tt, rr, ee, rb = _eval(ctrl_levels[c_i])
-        m = tt > 0
-        c_touch += tt
-        c_rev += np.where(m, rr, 0.0)
-        c_revb += np.where(m, rb, 0.0)
-        c_exc += np.where(m, np.nan_to_num(ee), 0.0)
-        dist_c_mean += np.abs(ctrl_levels[c_i] - ref)
-    dist_c_mean /= n_control
 
     # ---- aggregate per kind, with a block bootstrap over dates -----------------------
     ubars = np.unique(bar)
@@ -623,6 +639,132 @@ def measure_reversal_stats(hist: pd.DataFrame, levels: pd.DataFrame, *,
     out["control"] = control
     out["horizon_bars"] = n_bars
     return out.sort_values("p_reversal_bh").reset_index(drop=True)
+
+
+def measure_fill_quality(hist: pd.DataFrame, levels: pd.DataFrame, *,
+                         horizon_h: int = 12, pair: str, control: str = "permuted",
+                         n_control: int = 20, jitter: float = 0.25,
+                         seed: int = 20260909, block: int = 21, n_boot: int = 400,
+                         min_obs: int = 100) -> pd.DataFrame:
+    """**CR-14. The test that decides whether snapping goes on by default.**
+
+    "Does spot reverse at this level more often than at a random level" is a fact
+    about spot; it is not the quantity a ladder cares about.  What the ladder cares
+    about is whether a rung *placed at the level* ends up better filled and better
+    priced than the same-size rung placed at the same distance from spot but not
+    snapped to anything.  That is what this measures, against the identical
+    distance-matched control :func:`measure_reversal_stats` uses.
+
+    The resting order implied by a level is a **sell above spot and a buy below**, and
+    every quantity below is signed from the point of view of that order.
+
+    Columns
+    -------
+    ``fill_rate`` / ``ctrl_fill_rate``
+        probability the order is hit at all within the horizon.
+    ``mark_pips`` / ``ctrl_mark_pips`` / ``d_mark``
+        mean mark-to-market of a **filled** clip at the horizon close, in pips,
+        positive = good: ``side * (level - close_horizon) / pip``.  ``d_mark`` is the
+        headline -- pips per fill gained (or lost) by snapping.
+    ``adverse_pips`` / ``ctrl_adverse_pips``
+        mean maximum adverse excursion beyond the fill.  This is the "mean excursion
+        beyond the level" of the reversal study, re-signed as what it costs you.
+    ``recycle_rate`` / ``ctrl_recycle_rate``
+        probability that, having filled, spot also revisits the ladder's centre (the
+        reference close) inside the horizon -- i.e. the delta can be taken off again.
+        **This is the gamma-monetisation event**, and on daily bars it is inferred
+        from the bar range, so it cannot see the order of the two visits.  It is an
+        upper bound.
+    ``ev_pips`` / ``ctrl_ev_pips`` / ``d_ev``
+        ``fill_rate * mark_pips``: the unconditional value of leaving the order there.
+        A level that fills less often but prices better can still lose on this, which
+        is why it is reported next to ``d_mark`` rather than instead of it.
+    ``snap_recommended``
+        ``d_mark > 0`` **and** BH-adjusted p < 0.05 **and** at least ``min_obs`` fills.
+        Nothing else turns snapping on.
+
+    Same caveats as :func:`measure_reversal_stats`: daily bars, no intraday
+    sequencing, overlapping observations handled by a block bootstrap, and a BH
+    adjustment because many kinds are tested at once.
+    """
+    prep = _prepare(hist, levels, pair, horizon_h, control, n_control, jitter, seed)
+    if prep is None:
+        return pd.DataFrame()
+    (bar, lvl, kind, ref, side, dist, pip, n_bars, real, ctrl, ubars, rng) = prep
+
+    rows = []
+    n_blocks = max(int(math.ceil(ubars.size / float(block))), 1)
+    bar_pos = {b: i for i, b in enumerate(ubars)}
+    kinds = sorted(set(kind.tolist()))
+    for k in kinds:
+        m = kind == k
+        t = real["touch"][m] > 0
+        n_fill = int(t.sum())
+        fr = float(np.mean(real["touch"][m])) if m.any() else float("nan")
+        mk = float(np.mean(real["mark"][m][t])) if t.any() else float("nan")
+        ad = float(np.mean(real["exc"][m][t])) if t.any() else float("nan")
+        rc = float(np.mean(real["recycle"][m][t])) if t.any() else float("nan")
+
+        ct = float(np.sum(ctrl["touch"][m]))
+        c_fr = ct / (m.sum() * float(n_control)) if m.any() else float("nan")
+        c_mk = float(np.sum(ctrl["mark"][m]) / ct) if ct > 0 else float("nan")
+        c_ad = float(np.sum(ctrl["exc"][m]) / ct) if ct > 0 else float("nan")
+        c_rc = float(np.sum(ctrl["recycle"][m]) / ct) if ct > 0 else float("nan")
+
+        pos = np.array([bar_pos[b] for b in bar[m]])
+        tm, mm, ct_k, cm_k = real["touch"][m], real["mark"][m], ctrl["touch"][m], ctrl["mark"][m]
+        d_mark_b = np.empty(int(n_boot)); d_ev_b = np.empty(int(n_boot))
+        starts_pool = ubars[: max(ubars.size - block + 1, 1)]
+        for b_i in range(int(n_boot)):
+            picks = rng.integers(0, starts_pool.size, n_blocks)
+            sel = np.concatenate([np.arange(q, min(q + block, ubars.size)) for q in picks])
+            take = np.isin(pos, sel)
+            if not take.any():
+                d_mark_b[b_i] = np.nan; d_ev_b[b_i] = np.nan; continue
+            tt = tm[take] > 0
+            a_m = float(np.mean(mm[take][tt])) if tt.any() else np.nan
+            cc = float(np.sum(ct_k[take]))
+            b_m = float(np.sum(cm_k[take]) / cc) if cc > 0 else np.nan
+            a_f = float(np.mean(tm[take]))
+            b_f = cc / (take.sum() * float(n_control))
+            d_mark_b[b_i] = a_m - b_m
+            d_ev_b[b_i] = a_f * a_m - b_f * b_m
+        d_mark = mk - c_mk
+        sd = float(np.nanstd(d_mark_b, ddof=1))
+        z = d_mark / sd if sd > 0 else float("nan")
+        pval = float(math.erfc(abs(z) / math.sqrt(2.0))) if np.isfinite(z) else float("nan")
+        rows.append({
+            "kind": k, "group": KIND_GROUP.get(k, "other"),
+            "n_obs": int(m.sum()), "n_dates": int(np.unique(bar[m]).size), "n_fill": n_fill,
+            "mean_dist_pips": float(np.mean(dist[m]) / pip),
+            "fill_rate": fr, "ctrl_fill_rate": c_fr, "d_fill": fr - c_fr,
+            "mark_pips": mk, "ctrl_mark_pips": c_mk, "d_mark": d_mark,
+            "d_mark_lo": float(np.nanpercentile(d_mark_b, 2.5)),
+            "d_mark_hi": float(np.nanpercentile(d_mark_b, 97.5)),
+            "adverse_pips": ad, "ctrl_adverse_pips": c_ad, "d_adverse": ad - c_ad,
+            "recycle_rate": rc, "ctrl_recycle_rate": c_rc, "d_recycle": rc - c_rc,
+            "ev_pips": fr * mk, "ctrl_ev_pips": c_fr * c_mk,
+            "d_ev": float(np.nanmean(d_ev_b)),
+            "d_ev_lo": float(np.nanpercentile(d_ev_b, 2.5)),
+            "d_ev_hi": float(np.nanpercentile(d_ev_b, 97.5)),
+            "p_mark": pval, "boot_sd": sd,
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    pv = out["p_mark"].to_numpy(float)
+    fin = np.isfinite(pv)
+    holm = np.full(pv.size, np.nan); bh = np.full(pv.size, np.nan)
+    if fin.any():
+        holm[fin] = _holm(pv[fin]); bh[fin] = _bh(pv[fin])
+    out["p_mark_holm"] = holm
+    out["p_mark_bh"] = bh
+    out["n_kinds_tested"] = int(out.shape[0])
+    out["snap_recommended"] = ((out["d_mark"] > 0) & (out["p_mark_bh"] < 0.05)
+                               & (out["n_fill"] >= int(min_obs)))
+    out["control"] = control
+    out["horizon_bars"] = n_bars
+    return out.sort_values("p_mark_bh").reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------------------
