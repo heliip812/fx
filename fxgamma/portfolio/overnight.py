@@ -74,25 +74,24 @@ front.  Nothing here stops you leaving one; it will not pretend it is the same t
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
-from datetime import date, datetime, time, timedelta, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
-from ..conventions import PAIRS, pair_spec
+from ..conventions import pair_spec
 from ..models import gk
 from ..types import Book, HedgeRule, MarketSnapshot
-from .bandopt import (RETAIL_COST_BP, BandResult, BookGamma, book_gamma,
-                      cost_bp_for, optimal_band, risk_aversion_for_band)
-from .risk import fx_rate, price_book, shift_market, spot_ladder
-from .zones import COST_BP, TRADING_DAYS, touch_probability
+from .bandopt import (BandResult, BookGamma, book_gamma, cost_bp_for, optimal_band)
+from .risk import fx_rate, shift_market, spot_ladder
+from .zones import TRADING_DAYS, touch_probability
 
 __all__ = [
     "LadderRung", "PassiveWindow", "SessionProfile",
-    "DEFAULT_HOUR_PROFILES", "EVENT_VAR_UPLIFT", "MARKET_CLOSE_UTC_H",
+    "DEFAULT_HOUR_PROFILES", "EVENT_VAR_UPLIFT", "NIGHT_CALIBRATION", "MARKET_CLOSE_UTC_H",
     "MARKET_OPEN_UTC_H", "RETAIL_LOT_BASE",
     "passive_window", "session_variance_weight", "hour_profile",
     "estimate_hour_profile", "expected_crossings", "expected_local_time",
@@ -154,6 +153,7 @@ class LadderRung:
     exp_cost: float = 0.0            # expected transaction cost, quote ccy
     exp_marginal: float = 0.0        # effect on the expected P&L: exactly -exp_cost
     cost_bp: float = 0.0             # round-trip cost assumption used
+    kappa: float = 1.0               # path-roughness multiplier on exp_crossings
     delta_at_level: float = 0.0      # book option delta at this level (pre-hedge)
     ccy: str = ""
     fx_to_report: float = 1.0
@@ -169,7 +169,7 @@ class LadderRung:
                  "cum_delta_base", "pips_from_spot", "spacing_pips", "sigma_dist",
                  "p_touch", "exp_crossings", "exp_realised", "exp_cost", "exp_pnl",
                  "exp_marginal", "anchor", "anchor_dist_pips", "delta_at_level",
-                 "ccy", "cost_bp", "note")}
+                 "ccy", "cost_bp", "kappa", "note")}
 
 
 @dataclass(frozen=True)
@@ -284,6 +284,9 @@ EVENT_VAR_UPLIFT: dict[int, float] = {3: 4.0, 2: 1.5, 1: 0.4}
 #: 00:00 UTC (09:55 Tokyo); GBP is the most London-centric of the majors; AUD and NZD
 #: keep more of their variance in Asia.
 #:
+#: The day/night **level** of all of them is then rescaled by :data:`NIGHT_CALIBRATION`
+#: so that EURUSD reproduces the one measured session share available (0.382).
+#:
 #: **Replace them with measurement as soon as you can.**  :func:`estimate_hour_profile`
 #: fits the same object from hourly bars, and Yahoo serves ~730 days of hourly FX bars,
 #: which is ample.  Network hosts are blocked in this sandbox, so nothing here has been
@@ -301,8 +304,31 @@ _GENERIC = (0.70, 0.65, 0.58, 0.50, 0.48, 0.52, 0.70, 1.25, 1.60, 1.55, 1.35, 1.
             1.70, 2.05, 2.10, 1.90, 1.50, 1.10, 0.82, 0.68, 0.58, 0.48, 0.42, 0.54)
 
 
-def _norm24(w: Sequence[float]) -> tuple[float, ...]:
-    a = np.asarray(w, dtype=float)
+#: Hours (UTC) that fall in the London-close-to-London-open window under BST.
+_NIGHT_HOURS_UTC = frozenset({16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4, 5})
+
+#: Single day/night rebalancing factor applied to every shipped profile.
+#:
+#: The *shape* of the profiles is modelled (s3 of docs/09).  Their day/night **level**
+#: is anchored on the one measurement available: the forecasting quant's estimator puts
+#: the London-close-to-open window at **0.382** of a day's variance on EURUSD, against
+#: 0.583 of the clock -- a theta-per-variance-day ratio of **1.53** and a sigma
+#: multiplier of sqrt(0.583/0.382) = 1.236.  The raw modelled shape gave 0.339 (ratio
+#: 1.72), i.e. it made the night too quiet.  Scaling the night hours of every profile by
+#: this factor and renormalising reproduces 0.382 exactly on EURUSD and shifts the other
+#: pairs consistently, while leaving the *relative* pair tilts (the Tokyo fix on JPY, the
+#: London concentration on GBP, the Asian weight on AUD) as modelled as they were.
+#:
+#: What is measured: the EURUSD level. What is not: every pair tilt, and the level on
+#: every other pair. Replace the lot with `estimate_hour_profile` on real hourly bars.
+NIGHT_CALIBRATION = 1.2033
+
+
+def _norm24(w: Sequence[float], calibrate: bool = True) -> tuple[float, ...]:
+    a = np.asarray(w, dtype=float).copy()
+    if calibrate:
+        for h in _NIGHT_HOURS_UTC:
+            a[h] *= NIGHT_CALIBRATION
     return tuple(float(x) for x in a * 24.0 / a.sum())
 
 
@@ -329,7 +355,7 @@ def hour_profile(pair: str = "", profile: SessionProfile | Sequence[float] | Non
     if isinstance(profile, SessionProfile):
         return profile
     if profile is not None:
-        return SessionProfile(pair.upper(), _norm24(profile), source="user",
+        return SessionProfile(pair.upper(), _norm24(profile, calibrate=False), source="user",
                               note="caller-supplied 24-hour variance weights (UTC)")
     p = pair.upper()
     w = DEFAULT_HOUR_PROFILES.get(p)
@@ -409,7 +435,7 @@ def estimate_hour_profile(hourly: pd.DataFrame, pair: str = "", *,
         w = (np.roll(w, 1) + 2.0 * w + np.roll(w, -1)) / 4.0
     span = (df.index[-1] - df.index[0]).total_seconds() / 86400.0
     return SessionProfile(
-        pair.upper(), _norm24(w), source="estimated", n_obs=int(r2.size),
+        pair.upper(), _norm24(w, calibrate=False), source="estimated", n_obs=int(r2.size),
         span_days=float(span),
         note=(f"estimated from {int(r2.size):,} hourly returns over {span:,.0f} days "
               f"(min bucket {int(n.min())} obs); trim={trim:g}, "
@@ -610,7 +636,8 @@ def expected_local_time(x: float | np.ndarray, sd: float) -> float | np.ndarray:
     return float(val) if np.isscalar(x) else np.asarray(val)
 
 
-def expected_crossings(x: float | np.ndarray, sd: float, h: float) -> float | np.ndarray:
+def expected_crossings(x: float | np.ndarray, sd: float, h: float,
+                       kappa: float = 1.0) -> float | np.ndarray:
     """Expected number of times a level ``x`` from spot is crossed in ``h``-sized steps.
 
     ``E[N(x)] = E[L_T(x)] / h``.  This is the number of times a resting order at that
@@ -621,8 +648,19 @@ def expected_crossings(x: float | np.ndarray, sd: float, h: float) -> float | np
     It is not a probability and it is not bounded by 1: the nearest rung of a tight
     ladder on a choppy night fills several times, and that is where the money is.
     ``p_touch`` says whether you get filled once; this says how often.
+
+    ``kappa`` is a **path-roughness multiplier**, and it is an input, not a forecast.
+    A real path is not Brownian: it crosses a fine grid more or fewer times than
+    ``E[L]/h`` for the same terminal variance, and that ratio is exactly what decides
+    how many times a ladder pays.  The forecasting quant implemented and verified the
+    crossings/efficiency machinery (identity to 1-5%) and found that **forecasting
+    kappa from daily bars loses to the Brownian null on 5 of 5 pairs** -- daily
+    sampling recovers only 46-63% of the true crossing count, so the estimate is not
+    predictive.  Therefore ``kappa`` defaults to **1.0 (Brownian)** everywhere, and the
+    panel must say that expected fills assume a Brownian path.  A user with a view
+    ("this pair chops") can set it; the tool will not set it for them.
     """
-    return expected_local_time(x, sd) / float(h)
+    return float(kappa) * expected_local_time(x, sd) / float(h)
 
 
 # --------------------------------------------------------------------------- #
@@ -759,6 +797,7 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
                      snap: bool = False, snap_max_pips: float | None = None,
                      snap_inside_pips: float = 1.0,
                      assume_flat_at_close: bool = True,
+                     kappa: float = 1.0,
                      report_ccy: str = "USD",
                      marks: Mapping[str, float] | None = None,
                      band: BandResult | None = None) -> list[LadderRung]:
@@ -778,6 +817,11 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
     Which constraint actually bound is recorded in ``LadderRung.note`` on the first
     rung and in ``ladder_summary()["spacing_source"]``.
 
+    ``kappa``            path-roughness multiplier on the expected number of fills.
+                         Defaults to 1.0, the Brownian baseline, and stays there:
+                         forecasting roughness from daily bars loses to that null on
+                         5 of 5 pairs, so it is exposed as an override, never derived.
+                         See :func:`expected_crossings`.
     ``max_overnight_delta``   the most base-ccy delta the user is willing to wake up
                          holding.  Ask for this, never for a risk-aversion
                          coefficient; ``bandopt.risk_aversion_for_band`` converts it
@@ -912,7 +956,7 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
             cum_hedge += trade
             spacing = abs(level - prev_level)
             x = abs(level - S)
-            n_cross = float(expected_crossings(x, sd_spot, max(spacing, 1e-12)))
+            n_cross = float(expected_crossings(x, sd_spot, max(spacing, 1e-12), kappa))
             # each crossing is half a round trip of size `spacing` on `clip`:
             # this is CONVERSION of mark-to-market into cash, not new P&L
             realised = 0.5 * n_cross * clip * spacing * (1.0 if long_gamma else -1.0)
@@ -932,7 +976,7 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
                 exp_crossings=n_cross, exp_realised=float(realised),
                 exp_cost=float(cost), exp_marginal=float(-cost),
                 delta_at_level=float(d_here), ccy=spec.quote, fx_to_report=fq,
-                cost_bp=cbp))
+                cost_bp=cbp, kappa=float(kappa)))
             prev_level, prev_delta = level, d_here
     rungs.sort(key=lambda r: -r.level)
     if rungs:
@@ -1168,6 +1212,10 @@ def ladder_summary(rungs: Sequence[LadderRung], book: Book, mkt: MarketSnapshot,
         "conversion_vs_gamma_pnl": conv / gamma_pnl if gamma_pnl else float("nan"),
         "sd_overnight_no_ladder": sd_no, "sd_overnight_with_ladder": sd_yes,
         "sd_reduction_pct": sd_cut,
+        "kappa": float(rungs[0].kappa) if rungs else 1.0,
+        "fills_basis": ("expected fills assume a BROWNIAN path (kappa = "
+                        f"{(rungs[0].kappa if rungs else 1.0):g}); path roughness is an "
+                        "override, not a forecast -- see expected_crossings()"),
         "exp_fills": exp_fills, "p_touch_first": rungs[0].p_touch if rungs else 0.0,
         "p_touch_any": max((r.p_touch for r in rungs), default=0.0),
         # --- the whole night ---
@@ -1318,6 +1366,8 @@ def format_ladder(rungs: Sequence[LadderRung], summary: Mapping[str, Any]) -> st
         f"CARRY  gamma {summary['gamma_pnl']:+,.0f} + theta {summary['theta']:+,.0f} "
         f"= {summary['carry']:+,.0f} {ccy}   |   crossover ATM "
         f"{summary['crossover_vol'] * 100:.2f}% vs {summary['atm_now'] * 100:.2f}% marked",
+        f"E[fills] assume a BROWNIAN path (kappa {summary['kappa']:g}) -- roughness is "
+        "an input here, not a forecast",
         f"{ot} orders, spacing {summary['spacing_pips']:,.0f} pips "
         f"[{summary['spacing_source'].split('|')[0].strip()}]:",
     ]

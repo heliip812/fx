@@ -68,7 +68,7 @@ the band problem at all -- it is the same whatever the band.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -420,7 +420,6 @@ def optimal_band(book: Book, mkt: MarketSnapshot, pair: str, *,
     # report-ccy one, so the coefficient that reproduces the same certainty
     # equivalent in quote ccy is gamma_rep * fq.
     gamma_q = float(risk_aversion) * fq
-    tau = float(horizon_days) / TRADING_DAYS
 
     if bg.gamma == 0.0:
         return _empty(bg, method, cbp, lam, risk_aversion, gamma_q, horizon_days,
@@ -597,7 +596,7 @@ def _empirical(book: Book, mkt: MarketSnapshot, pair: str, *, bg: BookGamma,
     ``Var[e(h)]`` is estimated as ``Var(P&L(h) - P&L(h_tightest))`` under CRN, the
     tightest band on the grid standing in for continuous hedging.
     """
-    from ..backtest.engine import BacktestConfig, PathData, run_backtest, synthetic_path
+    from ..backtest.engine import BacktestConfig, run_backtest, synthetic_path
 
     spec = pair_spec(pair)
     S, sig = bg.spot, bg.sigma
