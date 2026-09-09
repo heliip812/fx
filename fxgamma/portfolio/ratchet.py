@@ -218,7 +218,8 @@ def _lo_mackinlay_se(n_obs: int, q: int) -> float:
     return float(math.sqrt(2.0 * (2.0 * q - 1.0) * (q - 1.0) / (3.0 * q * n)))
 
 
-def estimate_persistence(prices: Sequence[float] | pd.Series, *, block: int = 14,
+def estimate_persistence(prices: Sequence[float] | pd.Series | None = None, *,
+                         block: int = 14,
                          returns: Sequence[float] | None = None) -> Persistence:
     """Measure path persistence from a price series (or ready-made returns).
 
@@ -231,6 +232,8 @@ def estimate_persistence(prices: Sequence[float] | pd.Series, *, block: int = 14
     """
     if returns is not None:
         r = np.asarray(returns, float)
+    elif prices is None:
+        raise TypeError("estimate_persistence needs prices= or returns=")
     else:
         p = np.asarray(pd.Series(prices).astype(float).dropna(), float)
         r = np.diff(np.log(p)) if p.size > 1 else np.array([])
@@ -291,6 +294,15 @@ def band_multiplier(p: Persistence | float, *, gain: float = 0.5,
     variance ratio is more than 2 se from 1**.  Turning that off is how you reproduce
     the failure mode in ``docs/12``: acting on an insignificant estimate is what turns
     a hedging rule into a noisy momentum bet.
+
+    See also :func:`fxgamma.portfolio.bandopt.persistence_adjusted_band`, which solves
+    the band's first-order condition for a path with memory rather than clipping a
+    power of ``VR``.  Taken literally that FOC returns **x6.97 at phi = +0.30**, which
+    is the model being used outside its range -- and the fact that the *static* answer
+    is absurd is the argument for a state-dependent rule.  Neither multiplier should
+    ship as a default: ``docs/12`` s6 finds the persistence unforecastable at the
+    horizon that would have to be forecast, and s7 finds the state-dependent rule is a
+    bet on ``phi`` rather than a hedging improvement.
     """
     if isinstance(p, Persistence):
         vr, sig, z = p.vr, (p.is_trending or p.is_choppy), p.z
@@ -1001,7 +1013,8 @@ def match_symmetric(paths: np.ndarray, rule_factory: Callable[[], TriggerRule], 
 
 def matched_comparison(paths: np.ndarray, rules: Mapping[str, Callable[[], TriggerRule]],
                        *, gamma: float, stat: str = "mean_abs_delta",
-                       **kw: Any) -> pd.DataFrame:
+                       lo: float = 1e-6, hi: float = 1.0, tol: float = 1e-3,
+                       max_iter: int = 40, **kw: Any) -> pd.DataFrame:
     """Each rule against **its own risk-matched symmetric band**, paired path by path.
 
     ``vs_matched`` is the only column in this module that is evidence about persistence.
@@ -1009,7 +1022,9 @@ def matched_comparison(paths: np.ndarray, rules: Mapping[str, Callable[[], Trigg
     """
     rows = []
     for name, f in rules.items():
-        h_star, target, got = match_symmetric(paths, f, gamma=gamma, stat=stat, **kw)
+        h_star, target, got = match_symmetric(paths, f, gamma=gamma, stat=stat,
+                                              lo=lo, hi=hi, tol=tol, max_iter=max_iter,
+                                              **kw)
         s = score_paths(paths, f, gamma=gamma, **kw)
         if not np.isfinite(h_star):
             rows.append({"rule": name, "h_matched": float("nan"), "net": s["net"],
@@ -1130,7 +1145,6 @@ def backtest_with_rule(path: Any, cfg: Any, rule_factory: Callable[[], TriggerRu
     from ..backtest.engine import BacktestResult, Leg, _legs_for, _mark   # noqa: PLC0415
     from ..backtest.metrics import summarise                              # noqa: PLC0415
     from .zones import COST_BP                                            # noqa: PLC0415
-    from datetime import timedelta                                        # noqa: PLC0415
 
     df = path.df
     n = len(df) if cfg.max_steps is None else min(len(df), int(cfg.max_steps))

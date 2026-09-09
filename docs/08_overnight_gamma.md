@@ -309,3 +309,66 @@ measured on the user's own hourly history.
 
 `zones.risk_aversion` and `bandopt`'s differ in units. Reconcile to one definition; until then the
 two must not be compared. Recorded so the next reader does not assume they are interchangeable.
+
+---
+
+# AMENDMENT — trend-conditional hedging: DETECTABLE, NOT FORECASTABLE (binding)
+
+Source: `docs/12_trend_conditional_hedging.md`. This closes the user's "don't hedge too early in a
+trend" question. The mechanism is real; the edge is not harvestable at the horizon that matters.
+
+## A correction to the PM's own simulation
+
+The PM's AR(1) table dropped the **leg still open at the end of the path**, which biases against
+wide bands. Verified: the random-walk column read 236.1 at band 4.0 instead of 240; marking the open
+leg makes it **flat at 240 at every band**, as theory requires. The trending and choppy effects
+(+45%, -38%) dwarf the ~1.6% artefact, so the qualitative conclusion is unaffected — but a rule that
+hedges less often looked ~1% worse for purely mechanical reasons. The open leg is marked throughout.
+Table otherwise reproduced cell-for-cell within 1-2 se.
+
+## The decomposition that settles the question
+
+```
+capture = QV + 2 * SUM(within-leg cross-terms)          (exact per path, residual 0.0)
+```
+Quadratic variation is untouchable by any hedging rule. Therefore **every penny a trend rule can earn
+is the return autocovariance inside its own legs** — which is the variance ratio, which is the
+`kappa` that `docs/10` already ruled unforecastable from daily bars. The two negative results are the
+same result, arrived at independently. That is the strongest form this finding could take.
+
+## Out-of-sample verdict
+
+- A single 14-hour session's variance ratio has **sd 1.25 around a mean of 1.0, median 0.49**.
+  One-night regime calls are **55% accurate** at |phi|=0.10.
+- Pooled over 20 nights the sd falls to 0.30. So **persistence is a measurable property of the pair,
+  not of tonight** — a genuinely useful distinction, and the only durable form of the signal.
+- Walk-forward, 19,960 nights per cell, trailing-20-session estimator: **R² negative against the
+  Brownian null in 7 of 7 cells**, including when true phi is held constant at +0.2. Null control
+  passes (+0.45 ± 2.84 at phi=0).
+- **Hourly data fixes measurement, not forecasting** — it recovers 2.2x more of the true crossing
+  count than daily bars, and still does not make tonight predictable.
+
+## RULING — ship the symmetric band at the delta cap
+
+Against a **risk-matched** symmetric band the ratchet pays `199*phi - 4` USD/night (R²=0.99,
+break-even phi=+0.02, significant only above phi=+0.10). In the agent's words, which the PM adopts:
+**it is a bet on phi, not a hedging improvement.** At phi=0.05 it would take **149 years** of nights
+to establish the edge at t=2.
+
+Cost of calling the regime wrong: **-25 USD/night at phi=-0.10, -69 at phi=-0.30 (5.7% of that
+night's gamma P&L)** — while carrying *more* delta (p95 |delta| 0.98mm vs 0.91mm matched) and binding
+the cap on **32-46% of nights against 9-18%**. Worse P&L and worse risk simultaneously.
+
+Time-and-state measures zero everywhere; a static persistence tilt never reaches |t|=2, consistent
+with the x6.97 blow-up. **Only book-skew asymmetry ships on.** The ratchet remains available,
+documented, and off.
+
+## Method note
+
+Three control bugs found and fixed in-flight, each of which would have manufactured a positive: the
+ratchet silently degenerating into a symmetric band; an unmatched comparison producing +27/night on a
+pure random walk (it was measuring band-widening, not the rule); and `vr = n*d²/qv` instead of
+`d²/qv`, **which would have declared a trend every single night**. Together with the two control bugs
+the forecasting agent found, that is five manufactured effects caught before they reached a
+conclusion. Any future positive result on this project should be assumed to be a bug until someone
+has tried to kill it.
