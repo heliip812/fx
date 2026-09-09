@@ -99,3 +99,75 @@ def measure_reversal_stats(hist, levels, *, horizon_h=12) -> pd.DataFrame
   control. No asserted efficacy.
 - Overnight variance uses **session variance time**, not clock time: the London-close-to-open window
   is not 14/24 of a day's variance, and treating it as such misprices every rung.
+
+---
+
+# AMENDMENT — PM ruling on the trader's desk spec (binding)
+
+Source: `docs/11_overnight_desk_spec.md`. The PM verified the load-bearing arithmetic before ruling.
+
+## The brief's own worked example (§1) is WITHDRAWN
+
+The trader found it wrong three ways and is right on all three. Verified:
+- It charged a **full day's theta (USD 2,870) against a 14-hour window**. The correct figure is
+  **USD 1,673**. This is the pro-rata theta error of W-14, made by the PM, in the brief that exists
+  to prevent such errors.
+- Its USD 900 cost implies ~1.7 pips all-in against the repo's own 0.12 pips table.
+- It labelled the result "expected capture", attributing P&L to the ladder. Under driftless spot the
+  expected P&L is the same with or without any ladder: hedging subtracts cost and reshapes the
+  distribution. Outputs must be labelled as realised-vs-unrealised conversion, cost, and variance
+  reduction — never as capture the ladder created.
+
+**Do not use it as a fixture.** The trader's §2 example replaces it.
+
+## The structural fact that reframes the feature — ACCEPTED, and it leads the screen
+
+Overnight you pay **~58% of a day's theta (14h/24h) for only ~30-40% of a day's variance**.
+PM-verified ratio: **1.72** at a 34% variance share (1.94 at 30%, 1.46 at 40%). On many nights,
+holding gamma overnight is negative carry in expectation and **the ladder is risk control, not
+monetisation**. The tool must not imply every night is worth trading.
+
+Required output: a **crossover vol** — the ATM at which the window breakeven equals the forecast
+range — as the go/no-go. More decision-useful than the band itself.
+
+## Rulings on the change requests
+
+- **CR-9/10 — `LadderRung` extended (approved).** It could not be typed into a platform. Add order
+  type, time-in-force and value date, and support grid re-entry: a one-shot ladder described with
+  grid economics overstates what it earns.
+- **CR-11 — `RangeForecast` extended (approved), and this is the deepest finding.** Range does not
+  determine fills; **path roughness does**. Two nights with identical range pay completely
+  differently — a smooth trend fills each rung once, a choppy night fills them repeatedly. Add an
+  efficiency ratio and an expected-crossings term, forecast and evaluated out-of-sample like vol.
+- **CR-12 — event-aware variance profile (approved).** A scalar `var_fraction` cannot describe a
+  night containing a BoJ decision, and **32% of shipped calendar events fall inside this window**.
+- **CR-14 — snapping is measured as fill quality against a distance-matched control (approved),**
+  not as reversal rate versus random levels. Fill quality is what the ladder actually cares about.
+- **CR-16 — data gaps, assigned to `data`.** No holiday calendar; no Tokyo 00:55 fix; and the
+  calendar asserts a precise 03:00 for BoJ, which has **no fixed announcement time**. Flag, do not
+  silently use.
+
+## Order type is derived, not chosen — ACCEPTED
+
+Per-rung from the local gamma sign: **long gamma takes limits** (an unfilled order is safe);
+**short gamma takes stop-markets** (an unfilled order *is* the loss). The trader's seven refusal
+conditions for an unattended short-gamma ladder are adopted, including any tier-3 event in the
+window and any weekend.
+
+## What actually matters — ACCEPTED, and it demotes the headline feature
+
+The trader's judgement, which the PM endorses: the whole band decision is worth roughly **USD 60 a
+night** on the reference book, while the **delta cap** — the most delta the user is willing to wake
+up holding — is worth thousands, and the clip floor binds before the analytic optimum does.
+So `max_overnight_delta` is a first-class input and the analytic band is a refinement inside it.
+**Ask the user for a delta cap, never for a risk-aversion coefficient.**
+
+Clip sizes come from the **repriced delta profile**, not `Γ₁ × spacing`. PM measurement: the linear
+approximation is only 1.9% off at 1W and 0.6% at 1M on a *symmetric* straddle, which is why it looks
+harmless — the trader's 13% figure is for a **skewed** book, exactly where a symmetric ladder built
+off a single Γ₁ fails. When a rung is snapped to a level, the clip must be recomputed, or the
+cumulative delta is wrong at every rung beyond it.
+
+`zones.COST_BP` is an interbank table and **this user has no OTC access**; the trader puts their
+real all-in cost 15-40x higher. Cost is an explicit input with a no-OTC default, and the ladder's
+sensitivity to it must be shown.
