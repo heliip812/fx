@@ -891,10 +891,28 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
     sd_spot = S * sigma_window
 
     # ---- spacing: cap first, optimum second, clip floor third -------------- #
-    cap = float(max_overnight_delta) if (max_overnight_delta and max_overnight_delta > 0) \
-        else (abs(rule.band_delta) if rule.band_delta else
-              abs(rule.band_pct) * (bg.gross_notional or 0.0))
+    # When the user does not name a cap, DERIVE it from the book rather than falling
+    # back to rule.band_pct. The 15%-of-gross default was measured to be wrong for
+    # overnight use: on the reference book it costs ~USD 10/night and improves
+    # CVaR-95 by exactly zero, i.e. it is dominated by having no cap at all.
+    # deltacap's R2 rule (half the delta accumulated over one overnight sigma)
+    # self-scales with notional, tenor and vol, and is vol-mark invariant -- which
+    # matters because this user cannot mark to a broker curve. See docs/13_delta_cap.md.
     cap_default = not (max_overnight_delta and max_overnight_delta > 0)
+    if not cap_default:
+        cap = float(max_overnight_delta)
+    else:
+        cap = 0.0
+        try:
+            from .deltacap import recommend_cap
+            dc = recommend_cap(book, mkt, pair, window=window, cost_bp=cost_bp,
+                               min_clip_base=min_clip_base)
+            cap = float(getattr(dc, "cap_base", 0.0) or 0.0)
+        except Exception:                      # never let sizing break the ladder
+            cap = 0.0
+        if cap <= 0:
+            cap = (abs(rule.band_delta) if rule.band_delta else
+                   abs(rule.band_pct) * (bg.gross_notional or 0.0))
     h_cap = cap / abs(bg.gamma) if cap > 0 else math.inf
     h_floor = float(min_clip_base) / abs(bg.gamma) if min_clip_base > 0 else 0.0
     if band_pips is not None:

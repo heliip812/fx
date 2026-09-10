@@ -372,3 +372,72 @@ pure random walk (it was measuring band-widening, not the rule); and `vr = n*d²
 the forecasting agent found, that is five manufactured effects caught before they reached a
 conclusion. Any future positive result on this project should be assumed to be a bug until someone
 has tried to kill it.
+
+---
+
+# AMENDMENT — the delta cap, derived and MEASURED (binding); the shipped default replaced
+
+Source: `docs/13_delta_cap.md`. This closes the last open input in the overnight feature.
+
+## The PM violated its own W-7 ruling
+
+The PM's candidate caps used `sigma/sqrt(365)`. W-7 — which the PM published two turns earlier —
+says **sqrt(365) is for ECONOMICS (theta, breakeven) and sqrt(252) for DISTANCE and probability**.
+A delta cap is a distance question. Verified: the correct daily sigma is 0.4977% not 0.4135%, so the
+PM's overnight sigma was **understated by 20.4%** and every candidate cap with it.
+
+## RULING — `cap = ½ · Γ₁ · σ_overnight` (rule `delta_equals_gamma`)
+
+**EUR 0.54mm** on the reference book (EURUSD 1M ATM, EUR 10mm/leg) = an **18-pip** ladder band;
+floor EUR 0.26mm, ceiling EUR 1.08mm. R2 and R3 turn out to be **one rule under two anchors** —
+`R3/R2` is exactly the night's carry ratio — which is why they converge.
+
+The rule self-scales with notional, tenor, vol and moneyness, and is **exactly vol-mark invariant**
+(`Γ₁` and `σ` move together). That last property matters a great deal for this user: they have **no
+OTC access**, so a cap that did not depend on the vol mark is the one parameter they can trust
+without a broker curve.
+
+## The objective is NOT flat in the cap — the consensus was right, and is now measured
+
+Stated in `docs/09` §5's own units so it is comparable: being **30% off the cap moves the night by
+1.2-16.3% of its gamma P&L**, against **0.1-0.9% for the band**. It holds at both cost tiers.
+Three workstreams asserted this; it is now measured, and the earlier 15/30/45-pip band sweep is
+revealed to have been a 0.5/1.0/1.5mm **cap** sweep all along — the right dial under the wrong name.
+
+**Frontier** (40k nights, 5-min bars, common random numbers, verified bit-for-bit against
+`run_backtest`). The cap's effect on the mean is *exactly minus its transaction cost* (paired, to
+0.4%). Two preference-free statements: **below EUR 0.30mm is strictly dominated** — worse mean *and*
+worse tail, argmin robust across p05/CVaR-90/95/99/p01, with a closed form `h* = S·sqrt(sqrt(2)/z ·
+lambda · sigma_on)` matching measurement to 10%; **above ~EUR 1.4mm is strictly dominated by having
+no cap at all**. Between them it is a **priced preference** — about USD 2 of mean per USD of tail —
+and the doc says so rather than declaring an optimum.
+
+## The shipped 15%-of-gross default is wrong overnight, and is REPLACED
+
+EUR 3.0mm costs **USD 10/night and improves CVaR-95 by exactly zero** — dominated by no cap.
+`overnight_ladder` now derives its default from `deltacap.recommend_cap` instead of falling back to
+`rule.band_pct`, with the old fallback kept only if the derivation fails. The user never types a
+number.
+
+## Two findings that cut AGAINST the project's framing — recorded, not buried
+
+1. **On a long-gamma book the delta you wake up holding is insured by the gamma that made it.**
+   Three unhedgeable hours, or a 60-pip gap, move the answer by **under USD 100**. The cap matters,
+   but not for the reason everyone assumed.
+2. **Short gamma inverts the sign and then defeats the remedy.** CVaR improves from -8,775 to -2,558,
+   but with realistic stop slippage the optimum moves **wider**, and most tightening is whipsaw.
+   The answer to short gamma overnight is **refusals and position reduction, not a cleverer cap** —
+   which vindicates the trader's seven refusal conditions over any amount of optimisation.
+
+## Sixth manufactured effect caught
+
+Filling at the resting level on close-observed bars produced a clean phantom cost of -430/-990
+USD/night **that scaled with the cap** — exactly the shape of a real result. The zero-cost null
+control read **t = -51**. Recorded in `docs/13` §3.2. Running a null control is what caught it.
+
+## Units hazard recorded
+
+`DeltaCap.binds_pct` holds **percent** (0-100), unlike `HedgeRule.band_pct` which is a **fraction**.
+Two identically-suffixed fields with different units in one codebase is how the 60x band error
+happened; the field is now documented in place. **RFC-3:** `docs/11` §4.4 states this user's cost
+two ways that differ 5x — assigned to the trader to reconcile.
