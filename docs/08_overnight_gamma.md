@@ -441,3 +441,55 @@ control read **t = -51**. Recorded in `docs/13` §3.2. Running a null control is
 Two identically-suffixed fields with different units in one codebase is how the 60x band error
 happened; the field is now documented in place. **RFC-3:** `docs/11` §4.4 states this user's cost
 two ways that differ 5x — assigned to the trader to reconcile.
+
+---
+
+# AMENDMENT — one canonical reference book and cost table (binding)
+
+Source: contradictions found by the author of `docs/14_how_it_works.md` while synthesising the
+project. Six were raised; the PM verified and resolved them.
+
+**C-1 — the "reference book" was three books, and one of them was impossible. FIXED.**
+`docs/12` §7 paired `gamma_1pct = EUR 3.91mm` with `theta = USD 3,978/day`. Those are not
+independent quantities: PM-verified, 3.91mm implies ~7.05% vol where theta is ~-3,083, while -3,978
+needs ~9% vol where gamma_1pct is ~3.05mm. **No book has both.** The section's conclusions survive
+because every comparison inside it is matched, so the error cancels — but it made `docs/12` imply
+-629/night of carry where `docs/09` prices -117.
+
+This is the **fourth duplication-drift bug** on this project, after `band_pct`, `COMPONENTS` and the
+Whalley-Wilmott policy constant. The fix is the one that worked the previous three times: a single
+importable source, `fxgamma/reference.py`, that documents cite and tests assert rather than retyping.
+`python -m fxgamma.reference` regenerates every figure:
+
+| | |
+|---|---|
+| `gamma_1pct` | **EUR 3,466,232** (3.47mm per 1%) |
+| `theta_day` | **USD -3,480** |
+| `theta_window` (14h) | **USD -2,030** |
+| `sigma_day` distance basis (252) | **0.5014%** |
+| `sigma_overnight` | **0.3099%** |
+| theta/variance ratio | **1.527** |
+| `delta_cap` (½·Γ₁·σ_on) | **EUR 537,121** |
+| ladder band | **18.05 pips** |
+
+Writing it exposed a fifth percent-vs-fraction slip — `cap/gamma_1pct` is a move in *percent* and
+needs dividing by 100 before it multiplies spot; without that the band reads **1,805 pips instead of
+18**. Caught immediately because the module prints its figures. That is the argument for the module.
+
+**C-2 — stale 1.72 ratio. FIXED** in `docs/09`. The ruled value is **1.53** (0.583 clock / 0.382
+variance); `reference_figures()` now derives it so it cannot drift again.
+
+**C-3 — RFC-3, cost stated four ways (~0.34-0.86bp, 3-8bp, 1.03bp, 5.0bp). RESOLVED as far as it
+honestly can be.** `reference.COST_TIERS` now defines interbank (0.2bp EURUSD, 0.3bp USDJPY) and
+retail (3.0 / **5.0 default** / 8.0bp). The user has **no OTC access**, so retail is their tier, and
+the trader's 15-40x-interbank estimate brackets that range. **Their actual all-in cost is their
+broker's and remains unconfirmed** — 5.0bp ships until they supply it, and it is an explicit input
+everywhere it matters rather than a buried constant.
+
+**C-4 — cap floor/ceiling quoted at two precisions.** Not a contradiction: **0.26/1.08mm** are
+`DeltaCap`'s floor and ceiling *fields*; **0.30/1.4mm** are the *frontier dominance bounds* from the
+sweep. Different quantities that read alike. Both stand; `docs/13` should name them distinctly.
+
+**C-5 — RFC-2 listed open in `docs/09` §10 but already fixed** per this document. Stale; closed.
+
+**C-6 — no dated green suite run post-v1.9.** Recorded with this commit.

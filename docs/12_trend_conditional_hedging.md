@@ -245,6 +245,16 @@ Read it in this order:
 
 ## 7. Conditional performance and regime misidentification — the centrepiece
 
+> **CORRECTION (PM).** The figures below pair `gamma_1pct = EUR 3.91mm` with
+> `theta = USD 3,978/day`, and those two are **not independent**: 3.91mm implies an ATM
+> of about 7.05%, at which theta is about USD 3,083; theta of 3,978 needs about 9% vol,
+> at which gamma_1pct is about 3.05mm. No book has both. The canonical reference book is
+> now defined once in `fxgamma/reference.py` (`python -m fxgamma.reference`):
+> **gamma_1pct EUR 3.466mm, theta USD -3,480/day, USD -2,030 over the window.**
+> This section's *conclusions* are unaffected — every comparison in it is matched, so the
+> error cancels — but the figures should be read as illustrative, not as this project's
+> reference book.
+
 The reference book: EURUSD 1M straddle, `gamma_1pct = EUR 3.91mm`, `G = 335.6mm`, spot 1.1650,
 delta per pip EUR 33.6k, theta USD 3,978/day (**USD 2,321 over the 14-hour window**). Window sigma
 0.2726% = 31.8 pips (0.382 of a day's variance, `docs/10` §3). Continuous-hedging gamma P&L over the

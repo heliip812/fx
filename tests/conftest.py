@@ -244,3 +244,68 @@ def mixed_book():
         spots=[SpotPosition(id="h1", pair="EURUSD", notional_base=-3.0e6,
                             entry_rate=1.1600, tag="hedge")],
         name="qa-mixed")
+
+
+# --------------------------------------------------------------------------- #
+# overnight-feature fixtures  (docs/08, docs/09, docs/10, docs/11, docs/12, docs/13)
+# --------------------------------------------------------------------------- #
+#: THE reference book of the whole overnight workstream: EURUSD 1M ATM straddle,
+#: EUR 10mm a leg.  Every headline number in ``docs/13_delta_cap.md`` -- the EUR
+#: 0.54mm cap, the 18-pip band, the 0.26mm floor and the 1.08mm ceiling -- is quoted
+#: on exactly this book, so it is built once, here, and never restated in a test.
+REF_TENOR_DAYS = 30
+REF_LEG_BASE = 10e6
+
+
+def _straddle(pair: str, spot: float, *, days: int = REF_TENOR_DAYS,
+              leg: float = REF_LEG_BASE, direction: int = +1,
+              strike: float | None = None, prefix: str = ""):
+    from fxgamma.types import Book, OptionPosition
+    K = float(strike) if strike is not None else float(spot)
+    exp = in_days(days)
+    return Book(
+        options=[
+            OptionPosition(id=f"{prefix}c", pair=pair, cp=+1, strike=K, expiry=exp,
+                           notional_base=leg, direction=direction),
+            OptionPosition(id=f"{prefix}p", pair=pair, cp=-1, strike=K, expiry=exp,
+                           notional_base=leg, direction=direction),
+        ], spots=[], name=f"{prefix or 'ref'}-{pair}")
+
+
+@pytest.fixture(scope="session")
+def on_mkt(provider):
+    """One snapshot for the whole overnight suite (the pricer is the slow part)."""
+    return provider.snapshot(["EURUSD", "USDJPY", "GBPUSD", "AUDUSD"], asof=ASOF)
+
+
+@pytest.fixture(scope="session")
+def ref_book(on_mkt):
+    """EURUSD 1M ATM straddle, EUR 10mm/leg, long.  The reference book of docs/13."""
+    return _straddle("EURUSD", on_mkt.spot["EURUSD"])
+
+
+@pytest.fixture(scope="session")
+def short_book(on_mkt):
+    """The same book with the sign flipped: short gamma, where stops and refusals live."""
+    return _straddle("EURUSD", on_mkt.spot["EURUSD"], direction=-1, prefix="s")
+
+
+@pytest.fixture(scope="session")
+def skewed_book(on_mkt):
+    """A one-sided risk reversal: up-side and down-side delta accumulation differ.
+
+    This is the book the PM's amendment says a symmetric ladder built off a single
+    ``Gamma_1pct`` fails on (13% out, against 0.6% on the symmetric straddle), so it
+    is the book every asymmetry and repricing claim must be checked against.
+    """
+    from fxgamma.types import Book, OptionPosition
+    S = on_mkt.spot["EURUSD"]
+    return Book(
+        options=[
+            OptionPosition(id="k1", pair="EURUSD", cp=+1, strike=S * 1.020,
+                           expiry=in_days(30), notional_base=20e6, direction=+1),
+            OptionPosition(id="k2", pair="EURUSD", cp=-1, strike=S * 0.975,
+                           expiry=in_days(30), notional_base=6e6, direction=+1),
+            OptionPosition(id="k3", pair="EURUSD", cp=+1, strike=S * 1.045,
+                           expiry=in_days(30), notional_base=12e6, direction=-1),
+        ], spots=[], name="qa-skewed")

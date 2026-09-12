@@ -190,7 +190,7 @@ as they were. So: **the EURUSD level is measured; every pair tilt and every othe
 is not.** A user-supplied or `estimate_hour_profile` profile is used verbatim — the calibration
 factor applies only to the shipped defaults.
 
-*(An earlier PM note quoted 0.34 / 1.72 for this row; 0.583/0.382 = 1.53 and the forecaster's own
+*(An earlier PM note quoted 0.34 / 1.53 for this row; 0.583/0.382 = 1.53 and the forecaster's own
 sigma multiplier of 1.236 is consistent with 1.53, so 1.53 is what the code and this document
 use. The qualitative conclusion is unchanged and still leads the screen.)*
 
