@@ -377,8 +377,9 @@ def sample_payload(*, rows: int = 30, seed: int = 11, granularity: str = "1h",
                                "low": [round(v, 6) for v in lo],
                                "close": [round(v, 6) for v in px],
                                "volume": [0] * rows}
-    for k in ("open", "high", "low", "close"):     # an hour with no ticks
-        q[k][7] = None
+    null_ix = 7 if rows > 7 else rows // 2         # an hour with no ticks
+    for k in ("open", "high", "low", "close"):     # (index was hard-coded at 7, so any
+        q[k][null_ix] = None                       #  fixture with rows < 8 raised)
     ts.append(ts[-1])                              # a duplicate timestamp
     for k in q:
         q[k].append(q[k][-1])

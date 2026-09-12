@@ -671,6 +671,21 @@ def run_rule(prices: Sequence[float], rule: TriggerRule, *,
     touch = str(fill).lower() == "touch"
     if touch and (high is None or low is None):
         raise ValueError("fill='touch' needs high and low arrays")
+    if touch:
+        # Presence is not enough. Passing close-only bars as high/low (so the range
+        # is degenerate) lets the fill logic pretend it dealt AT the trigger level on
+        # a bar that never traded there, which manufactures a cost that scales with
+        # how tight the band is -- the exact signature of the phantom recorded in
+        # docs/13 s3.2, measured here at -9,868/-6,250/-3,900 USD/night at 8/16/32
+        # pips on a zero-cost driftless null. Refuse rather than silently pay it.
+        _hi = np.asarray(high, float)
+        _lo = np.asarray(low, float)
+        if np.allclose(_hi, _lo, rtol=0, atol=1e-12):
+            raise ValueError(
+                "fill='touch' needs bars with a real high-low range; these are "
+                "degenerate (high == low), which would fill at levels that never "
+                "traded. Use fill='close' for close-only data."
+            )
     hi_arr = np.asarray(high, float) if high is not None else p
     lo_arr = np.asarray(low, float) if low is not None else p
     capv = float(cap) if cap is not None else math.inf

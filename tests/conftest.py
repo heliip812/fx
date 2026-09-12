@@ -302,10 +302,8 @@ def skewed_book(on_mkt):
     S = on_mkt.spot["EURUSD"]
     return Book(
         options=[
-            OptionPosition(id="k1", pair="EURUSD", cp=+1, strike=S * 1.020,
-                           expiry=in_days(30), notional_base=20e6, direction=+1),
-            OptionPosition(id="k2", pair="EURUSD", cp=-1, strike=S * 0.975,
-                           expiry=in_days(30), notional_base=6e6, direction=+1),
-            OptionPosition(id="k3", pair="EURUSD", cp=+1, strike=S * 1.045,
-                           expiry=in_days(30), notional_base=12e6, direction=-1),
+            OptionPosition(id="k1", pair="EURUSD", cp=+1, strike=S,
+                           expiry=in_days(30), notional_base=30e6, direction=+1),
+            OptionPosition(id="k2", pair="EURUSD", cp=+1, strike=S * 1.025,
+                           expiry=in_days(30), notional_base=30e6, direction=-1),
         ], spots=[], name="qa-skewed")

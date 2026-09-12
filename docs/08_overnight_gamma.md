@@ -493,3 +493,67 @@ sweep. Different quantities that read alike. Both stand; `docs/13` should name t
 **C-5 — RFC-2 listed open in `docs/09` §10 but already fixed** per this document. Stale; closed.
 
 **C-6 — no dated green suite run post-v1.9.** Recorded with this commit.
+
+---
+
+# AMENDMENT — QA pass 3: eight findings, all resolved (binding)
+
+Source: `docs/05_test_report.md` §P3. +728 tests (4,829 -> 5,557). All eight findings were on the
+seven modules that had **zero coverage** and that produce the orders the user leaves resting.
+Final suite: **5,557 passed, 0 failed.**
+
+**QA-5 — the largest, and it corrects a claim the PM repeated to the user twice. ACCEPTED.**
+`docs/13` ruled the cap "self-scales with notional, tenor, vol AND moneyness, and is exactly
+vol-mark invariant", and gave that as the reason a user with **no OTC access** can trust it without
+a broker curve. **It is an at-the-money property only.** The cancellation `Γ₁ ~ 1/σ` against
+`σ_on ~ σ` is an ATM identity; off the money `Γ₁` is not that expression and no implementation can
+restore it. Measured on a 6%->12% mark move: ATM 1.01x, 1% out 1.11x, 2% out 1.57x, 3% out 2.82x,
+**4% out 3.20x** (PM-verified at 3.16x), an ordinary 1M call spread **2.8x**. Since 30% off the cap
+is worth 1.2-16.3% of the night, this is the largest number in the pass. **Resolution:** the claim
+is corrected in `docs/13` §4.7, and `recommend_cap` now **warns** whenever the furthest strike is
+more than 1% from spot. The user is told, not reassured.
+
+**QA-7 — the seventh manufactured effect was still reachable. FIXED.** `fill="touch"` validated that
+high/low arrays were *present*, not that they were *real*: close-only bars passed as high/low let
+the fill logic deal **at** a trigger level on a bar that never traded there, producing
+**-9,868 / -6,250 / -3,900 USD/night at 8/16/32 pips** on a zero-cost driftless null — scaling with
+tightness, the exact signature of the phantom already recorded in `docs/13` §3.2. Degenerate bars
+are now refused, pointing the caller at `fill="close"`.
+
+**QA-1 — clips below one dealable lot. FIXED.** `min_clip_base` was applied as a floor on the
+*spacing* (`min_clip_base/|Γ|`, using gamma at spot) while the clip is read off the repriced profile
+where gamma decays, so outer rungs emitted **36k and 87k against a 100k floor** — orders a platform
+rejects. The floor is now enforced on the clip itself: each level is pushed out until it deals, and
+the side stops rather than emitting an unplaceable order.
+
+**QA-3 — the PM's own bug. FIXED.** After the cap default was rewired to `deltacap.recommend_cap`,
+the ladder's headline note still said it had "defaulted to `HedgeRule.band_pct x gross notional`" —
+3.0mm against the 0.53mm actually used, **5.6x apart**, on the panel whose only job is explaining
+why each order sits where it does.
+
+**QA-2 — the two halves disagreed about whether to trade. FIXED.** `recommend_cap` returned
+`no_ladder=True` while `overnight_ladder` emitted eight rungs on the same book. The builder now
+honours the verdict.
+
+**QA-6 / QA-4 / QA-8 — FIXED** (floor/ceiling crossing above ~30bp; a docstring still quoting the
+withdrawn 0.34 variance share; `sample_payload` hard-coding its null-bar index at 7 so any fixture
+with fewer than 8 rows raised).
+
+## PM arbitration — two QA tests contradicted each other
+
+`test_clip_floor_binds_before_the_analytic_optimum` and
+`test_no_ladder_verdict_is_honoured_by_the_ladder_builder` were written against the **same**
+0.4mm/leg book and asserted opposite outcomes: rungs with a "MIN CLIP" note, versus no rungs at all.
+
+Measured to settle it: **there is no book on which the clip floor binds and a ladder is emitted.**
+The boundary is sharp at about 1.0mm/leg — below it `no_ladder` is True, above it the delta cap
+binds. So the trader's point stands (the clip floor binds before the analytic optimum) but its
+consequence is the opposite of a wide ladder: **when the floor binds, the honest output is "do not
+leave a ladder tonight"**, because the smallest dealable clip is then a large fraction of the book's
+entire gamma. The no-ladder verdict wins and the test was rewritten to pin that.
+
+## Units sweep, now fenced
+
+25 percent-valued `_pct` names against 3 fraction-valued (`band_pct`, `delta_pct`, `step_sd_pct`).
+`zones.DEFAULT_BAND_PCT = 15.0` and `HedgeRule.band_pct = 0.25` are the same concept under the same
+suffix **100x apart** — correct today, and a sweep test now fails on any new unclassified `_pct`.

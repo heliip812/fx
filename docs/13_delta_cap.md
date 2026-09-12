@@ -24,7 +24,7 @@ ships the derivation as `deltacap.recommend_cap`.
 | What *is* preference-free? | The **floor**. Below EUR 0.26mm a tighter cap makes the expected P&L **and** the tail worse. That region is strictly dominated, it has a closed form (§4.4), and the argmin survives five different tail measures (§4.15). And the **ceiling**: above EUR 1.08mm the cap improves CVaR-95 by exactly zero. |
 | Is the shipped `hedge_bands` 15%-of-gross default wrong for overnight? | **Yes, plainly.** EUR 3.0mm here — 5.6x the derived cap and 2.8x the delta the *unhedged* book accumulates in a whole one-sigma night. Measured: it costs USD 10/night and improves CVaR-95 by **zero**. It is **strictly dominated by having no cap at all**. It is an intraday default. §4.8. |
 | What costs the most to be wrong about? | **The cost assumption, not the cap.** At the trader's own 1.03bp the cap costs USD 107/night and buys tail at 0.31; at the repo's 5bp retail default it costs USD 533 and the rate is 2.03. The cost tier changes the *character* of the recommendation. §4.11. |
-| Does the vol mark matter? | **Not to the cap.** R1/R2/R3 are *exactly* invariant to the vol level and move <0.1% for a full vol point of mark error. The money moves by ~USD 375/vol point; the cap does not move at all. §4.7. |
+| Does the vol mark matter? | **Not to the cap AT THE MONEY — but it does away from it.** R1/R2/R3 are exactly vol-invariant for an ATM book, moving <0.1% for a full vol point. **That is an at-the-money property and does not extend across moneyness** (QA-5). Moving the mark 6%→12%: ATM 1.01x, 2% out **1.57x**, 4% out **3.20x**, an ordinary 1M call spread **2.8x** (PM-verified at 3.16x for the 4% case). Since being 30% off the cap is worth 1.2-16.3% of the night, a no-OTC user with a skewed or wing-heavy book cannot treat the cap as mark-free. §4.7, and the panel now warns. |
 | Short gamma? | **A different object.** CVaR-95 runs USD -8,775 uncapped to -2,558 capped, ten times the long-gamma effect — but with realistic stop slippage most tightening is whipsaw, and the trader's refusal conditions, not a cleverer cap, are the answer. §5. |
 
 **One sentence for the screen:** *"Your cap is EUR 0.54mm. It costs about USD 530 a night at your
@@ -112,7 +112,7 @@ D = 50 * Gamma_1pct * sigma_on(dec)  =  0.5 * Gamma_1pct * sigma_on(%)
 bet you did.** No loss limit, no risk aversion, no view on how long you cannot deal — the fewest
 assumptions of any rule here, which is why it is the shipped default.
 
-*Scaling.* Exactly R1/2, so identical: linear in notional, `1/√T`, **vol-invariant**.
+*Scaling.* Exactly R1/2, so identical: linear in notional, `1/√T`, and **vol-invariant at the money only** — see the QA-5 correction above; away from ATM the cap moves with the mark, by 3.2x at 4% out for a 6%→12% move.
 
 ### R3 — theta-anchored. `cap = θ_window / (σ_on · S)` = **EUR 0.57mm**
 

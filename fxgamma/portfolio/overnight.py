@@ -907,6 +907,11 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
             from .deltacap import recommend_cap
             dc = recommend_cap(book, mkt, pair, window=window, cost_bp=cost_bp,
                                min_clip_base=min_clip_base)
+            # If the sizing step concludes there is no ladder worth leaving tonight,
+            # honour it. Emitting rungs anyway meant the panel could say "no ladder"
+            # and hand over eight orders on the same book (QA-2).
+            if bool(getattr(dc, "no_ladder", False)):
+                return []
             cap = float(getattr(dc, "cap_base", 0.0) or 0.0)
         except Exception:                      # never let sizing break the ladder
             cap = 0.0
@@ -939,9 +944,9 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
     h = min(h_opt, h_cap)
     which = src if h == h_opt else (
         f"DELTA CAP {cap / 1e6:,.2f}mm ({h_cap / spec.pip:,.1f} pips) over {src}"
-        + ("  [cap NOT supplied -- defaulted to HedgeRule.band_pct x gross notional; "
-           "set max_overnight_delta to the delta you are actually willing to wake up "
-           "holding]" if cap_default else ""))
+        + ("  [cap NOT supplied -- DERIVED from the book by deltacap.recommend_cap "
+           "(half the delta accumulated over one overnight sigma); pass "
+           "max_overnight_delta to override]" if cap_default else ""))
     if h < h_floor:
         h = h_floor
         which = (f"MIN CLIP {min_clip_base / 1e6:,.2f}mm ({h_floor / spec.pip:,.1f} pips) "
@@ -997,6 +1002,38 @@ def overnight_ladder(book: Book, mkt: MarketSnapshot, pair: str, *,
             d_here = delta_at(level)
             trade = -(d_here - prev_delta)          # base ccy, + = buy base
             clip = abs(trade)
+            # QA-1: `min_clip_base` is a floor on the CLIP, but it was being applied as
+            # a floor on the SPACING (`min_clip_base / |gamma|`) using gamma at spot.
+            # The clip is read off the repriced profile, where gamma decays as you move
+            # away, so the outer rungs came out under one dealable lot -- 36k on a
+            # 0.4mm/leg book against a 100k floor, i.e. orders the platform rejects.
+            # Push the level out until the clip is actually dealable.
+            if min_clip_base > 0 and clip < float(min_clip_base):
+                step = max(abs(h_side[sgn]), spec.pip)
+                far = level
+                ok = False
+                for _ in range(400):
+                    far = far + sgn * step
+                    if far <= 0:
+                        break
+                    if abs(delta_at(far) - prev_delta) >= float(min_clip_base):
+                        ok = True
+                        break
+                if not ok:
+                    # no dealable clip exists further out: stop this side rather than
+                    # emitting an order that cannot be placed.
+                    break
+                near = level
+                for _ in range(60):                 # bisect to the nearest level that deals
+                    mid = 0.5 * (near + far)
+                    if abs(delta_at(mid) - prev_delta) >= float(min_clip_base):
+                        far = mid
+                    else:
+                        near = mid
+                level = far
+                d_here = delta_at(level)
+                trade = -(d_here - prev_delta)
+                clip = abs(trade)
             cum_hedge += trade
             spacing = abs(level - prev_level)
             x = abs(level - S)

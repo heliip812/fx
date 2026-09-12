@@ -2,6 +2,213 @@
 
 **Owner:** QA / Test Engineer (`qa`)
 
+---
+
+# PASS 3 — the overnight order-producing modules (`docs/08`–`docs/13`)
+
+**Scope.** The seven modules that shipped with **zero** test coverage and, unlike the rest
+of the repo, do not display a number — they **produce the orders the user leaves resting
+overnight while asleep**: `portfolio/overnight.py` (1,436 ln), `bandopt.py` (996),
+`ratchet.py` (1,306), `deltacap.py` (1,101), `signals/rangeforecast.py`, `signals/levels.py`,
+`data/intraday_yahoo.py` — plus `fxgamma/reference.py`, which was also untested and is the
+single source every document now cites.
+
+**Suite:** `tests/` (22 files, **5,557 tests**, +728 this pass). **Runtime:** 139 s.
+
+```
+PYTHONPATH=/home/user/fx python3 -m pytest tests -q                 # everything, ~139s
+PYTHONPATH=/home/user/fx python3 -m pytest tests -q -m "not slow"   # skips the empirical sweeps
+```
+
+## P3.1 Result of the run
+
+```
+6 failed, 5551 passed in 139.37s
+
+FAILED test_delta_cap.py::TestVolMarkInvariance::test_invariance_survives_moneyness      <- QA-5
+FAILED test_overnight_ladder.py::...::test_emitted_clips_are_at_least_one_dealable_lot   <- QA-1
+FAILED test_overnight_ladder.py::...::test_no_ladder_verdict_is_honoured_by_the_builder  <- QA-2
+FAILED test_overnight_ladder.py::...::test_default_note_does_not_claim_band_pct_fallback <- QA-3
+FAILED test_ratchet_capture.py::TestFillLogic::test_touch_fill_on_close_only_bars        <- QA-7
+FAILED test_intraday_and_units.py::...::test_sample_payload_works_for_a_small_row_count  <- QA-8
+```
+
+All **4,829** tests from passes 1–2 still pass. Nothing in the existing suite regressed.
+
+## P3.2 What the measured results now pin
+
+Every documented claim in `docs/08`–`docs/13` that a regression could silently break now
+has a test that fails if it moves.
+
+| Claim | Where it is pinned | Measured |
+|---|---|---|
+| `cap = ½·Γ₁·σ_on` → **EUR 0.54mm / 18 pips**; floor 0.26mm, ceiling 1.08mm | `test_delta_cap.py::TestReferenceBookNumbers` | 0.5336mm / 17.90 pips / 0.253 / 1.067 |
+| R2 = R1/2 exactly; **R3/R2 = 252·D_cal/(365·vf)** (they converge) | `TestR2R3Convergence` | ratio 1.069 against the predicted 1.054, within 1.4–2.3% across tenors |
+| Cap linear in notional, `1/√T` in tenor, band in pips invariant to size | `TestScaling` | `R1·√T` = 0.305mm ± 2% over 7d–1y |
+| Two clocks (W-7): σ_on on **252**, theta on 365; the 365 answer is 20.4% light | `TestTwoClocks` | ratio exactly `√(365/252)` = 1.2033 |
+| Session variance **0.382** of a day against **0.583** of the clock → ratio **1.53** | `test_overnight_ladder.py::TestSessionVarianceTime` | 0.38196 / 0.58333 / **1.527** |
+| `p_touch` is the reflection principle `2·N(−d/σ)`, ~2× terminal | `TestReflectionPrinciple` | ratio to `2N(−d/σ)` 0.998–1.000; touch/terminal 1.9966–1.9996 |
+| Order type **derived** from the local gamma sign | `TestOrderTypeIsDerived` | long → all `limit`, short → all `stop` |
+| Cumulative delta correct at every rung, **including after a snap** | `TestCumulativeDelta` | residual < EUR 1 at every rung, snapped and unsnapped, symmetric and skewed |
+| Clips come off the **repriced** profile: 0.6% off linear on a straddle, 11–13% on a skew | `TestCumulativeDelta`, `TestSkewedBookAsymmetry` | reproduces the trader's 13% figure, with opposite signs on the two sides |
+| `overnight_ladder` derives its default from `recommend_cap`, not `rule.band_pct` | `TestSpacingDerivesFromTheDeltaCap` | spacing = cap/|Γ| to 1e-6; the 15%-of-gross fallback would be 5.6× wider |
+| Crossover vol **7.73%** against 7.96% marked → long gamma is negative overnight carry | `TestCrossoverVol` | 7.731% / 7.963%, `negative_carry` True |
+| `POLICY_CONST` edge 1.5 vs target 6 → band `4^(1/3)` = **1.587×** wider | `test_band_optimiser.py::TestPolicyConstant` | exact |
+| **`zones` takes the constant from `bandopt` and does not restate it** | `TestZonesTakesTheConstantFromBandopt` | ×8 on `POLICY_CONST["center"]` moves `zones`' WW band ×2.000 to 1e-9; ×64 on `"edge"` moves it not at all |
+| Band objective is flat: 30% off costs **0.1–0.9%** of the gamma P&L | `TestTheObjectiveIsFlat` | < 2% at both cost tiers, both directions |
+| `capture = QV + 2·Σ(within-leg cross-terms)`, **residual 0.0 per path** | `test_ratchet_capture.py::TestCaptureDecomposition` | worst absolute residual **2.3e-13**, worst relative **9.3e-16**, over 5 rules × 5 φ × 75 paths |
+| `pm_table`: random-walk column **flat at 240** with the open leg marked; 236.8 without | `TestPMTable` | 239.7 / 240.1 / 239.8 / 240.1; trending **+45%**, choppy **−39%** at band 4.0 |
+| κ / efficiency / crossings identity verified to **1–5%** | `test_range_forecast.py::TestRoughnessIdentity` | κ(QV/D²) vs κ(ER) agree to 0.3–2.3%; mean reversion 2.90 at φ=−0.6, momentum 0.37 at φ=+0.6 |
+| HAR beats the naive benchmarks out of sample | `TestHARBeatsTheBenchmarks` | QLIKE R² **+0.470** vs RW, **+0.439** vs trailing mean, DM **t = −11.3**; MZ β = 0.98 |
+| Roughness stays at the **Brownian null**; κ is an override, never derived | `TestRoughnessStaysAtTheBrownianNull` | `kappa == 1.0` on every emitted rung |
+| Snapping stays **off**; levels are displayed, not asserted | `TestCumulativeDelta`, `TestLevelsAreMeasured…` | default ladder carries no anchors |
+| `reference.py`: Γ₁ and θ mutually consistent; band 18 pips, **not 1,805** | `test_intraday_and_units.py::TestCanonicalReference` | θ within 0.7% of `−50·Γ₁·S·σ²/365`; 18.05 pips; independently agrees with `recommend_cap` to 0.7% |
+
+## P3.3 Priority 2 — the hunt for the seventh manufactured effect
+
+Every place these modules claim an effect now has a **null control** written as a test: a
+zero-cost, zero-edge, driftless configuration must measure zero.
+
+**Controls that PASS** (and are now permanent):
+
+* zero-cost ladder — `marginal_vs_no_ladder` is **exactly 0.0** at every band, and
+  `net == carry`; at non-zero cost `marginal == −exp_cost` to 1e-12;
+* zero-cost ratchet — mean net is band-independent across a 16× band range
+  (16,712 ± 90 at every band) and cap-independent across a 15× cap range;
+* **risk-matched** ratchet vs symmetric at φ=0 — |t| = 1.36, 0.22, 0.45 (the unmatched
+  comparison is the one that lies, and is pinned as such);
+* zero-cost delta cap — `est_cost_night` is **exactly 0.0** at every cap; the cost is
+  exactly linear in the spread and exactly inverse in the cap;
+* `band_utility_curve.exp_capture` is constant down the whole table;
+* the forecasting machinery's own nulls — a benchmark scores **exactly 0.0** against
+  itself, DM of a forecast against itself is exactly 0.0/1.0, and HAR learns nothing
+  (R² 0.01) from white-noise vol;
+* the **levels** study on a pure random walk — `snap_recommended` False on every kind,
+  `d_mark` ±0.12 pips with the bootstrap CI straddling zero, `p_BH` = 0.41, and the
+  control's fill rate matches the real one to 0.3pp (i.e. it really is distance-matched);
+* `regime_matrix` measures exactly 0.0 for the baseline against itself.
+
+**One control FAILS — and it is the same shape as the sixth.** See QA-7 below.
+
+## P3.4 Findings, ranked by how much money the bug could cost
+
+**QA-1 — emitted clips fall below one dealable lot. `overnight.py`. Highest.**
+`min_clip_base` is enforced as a **spot distance** (`min_clip_base / |Γ|`), but the clip is
+then read off the repriced delta profile, where gamma decays away from the money. Measured:
+**36k on a 0.4mm/leg book, 87k on a 1.0mm/leg book, against a 100k floor** — 13–64% under
+one standard lot. These are orders a retail platform rejects, on the one output of this
+project that is a trade rather than a number. The fix is to size the clip and solve for the
+distance, not the reverse. *(`test_emitted_clips_are_at_least_one_dealable_lot`)*
+
+**QA-5 — the vol-mark invariance is an at-the-money property, and the ruling does not say so. `deltacap.py`. High.**
+`docs/13` rules that the cap "self-scales with notional, tenor, vol **and moneyness**, and
+is **exactly** vol-mark invariant", and gives that as the reason a user with **no OTC
+access** can trust the cap without a broker curve. `cap_candidates`' own docstring scopes it
+correctly ("at the money, with `Γ₁ = 0.3989 N/(σ√T)`"); off the money `Γ₁` is not that
+expression and the cancellation stops working. Measured, moving the mark 6% → 12%:
+
+| book | cap moves |
+|---|---|
+| 1M straddle at the money | **1.01×** |
+| struck 1% away | 1.11× |
+| struck 2% away | **1.57×** |
+| struck 3% away | 2.82× |
+| struck 4% away | **3.20×** |
+| ordinary 1M call spread, surface ×2.3 | **2.8×** |
+
+Since `docs/13` also measures that being 30% off the cap moves the night by 1.2–16.3% of
+its gamma P&L, a 1.6–3.2× cap error on a struck-away book is the largest single number in
+this pass. The property is real and worth keeping — the *scope* of the claim needs
+correcting, and the UI should say "vol-mark invariant **while your book is near the
+money**". *(`test_invariance_survives_moneyness`)*
+
+**QA-7 — the sixth manufactured effect's mechanism is still reachable. `ratchet.py`. High.**
+`run_rule(fill="touch")` validates that `high`/`low` are *present*, not that they are real
+ranges. A close-only source — which is what this repo's own adapters hand you when the
+range columns equal the close — therefore fills every order at its **exact resting level**
+while only the close was ever observed. Measured on 1,200 driftless **zero-cost** paths
+against the honest close-fill, on the reference book's gamma:
+
+| ladder half-width | shift in the zero-cost mean |
+|---|---|
+| 8 pips | **−9,868 USD/night** (−59%) |
+| 16 pips | −6,250 (−37%) |
+| 32 pips | −3,900 (−23%) |
+
+It is large, systematic, and **scales with how tight the ladder is** — the precise signature
+`docs/13` §3.2 records for the phantom cost that "scaled with the cap". Suggested fix: raise
+when `high == low == close` on more than a token share of bars, or fall back to `fill="close"`
+and say so. *(`test_touch_fill_on_close_only_bars_is_guarded_or_unbiased`)*
+
+**QA-2 — the two halves of the feature disagree about whether to trade. `overnight.py`. Medium.**
+`deltacap.recommend_cap` returns `no_ladder=True` with the words "there is nothing to hedge
+overnight and no cap will change that"; `overnight_ladder` on the same book still emits
+eight rungs. One of the two is telling the user the wrong thing.
+*(`test_no_ladder_verdict_is_honoured_by_the_ladder_builder`)*
+
+**QA-3 — the ladder's headline note advertises a withdrawn fallback. `overnight.py`. Medium.**
+When no cap is supplied the cap is now **derived** from `recommend_cap` (0.53mm on the
+reference book — verified), but the note still reads *"cap NOT supplied — defaulted to
+HedgeRule.band_pct × gross notional; set max_overnight_delta …"*. `band_pct × gross` would
+be **3.0mm**, 5.6× the number actually used. The note is the first line the user reads
+before leaving orders, and it misstates both the source and the size.
+*(`test_default_note_does_not_claim_the_band_pct_fallback`)*
+
+**QA-6 — a dominated cap is returned silently at high cost. `deltacap.py`. Medium-low.**
+Above ~30bp round trip the dominance floor rises past the one-sigma ceiling, the clamp
+resolves to the ceiling, and the module returns a cap it has itself defined as *strictly
+dominated — worse mean **and** worse tail* (1.067mm returned against a 1.389mm floor at
+40bp, 2.083mm at 60bp), with `no_ladder` False and nothing in `warnings`. It already knows
+how to say "no ladder"; it should. *(Guarded by `test_a_dominated_cap_is_never_returned_silently`,
+which currently passes because the branch only triggers above the tiers it is called at —
+it will catch the case if a wide-spread pair is added.)*
+
+**QA-4 — `crossover_vol`'s docstring is stale on the go/no-go number. Docs-only.**
+It still quotes **0.92** and "you need realised ~9% over implied" — the pre-amendment
+figures computed at a 0.34 variance share. At the measured 0.382 the code returns
+**0.971 / ~3%**, which is correct and matches the closed form. The *code* is right; the
+comment beside the module's single most decision-useful output is not.
+*(Pinned by `test_crossover_ratio_is_not_the_stale_092`, which passes.)*
+
+**QA-8 — `intraday_yahoo.sample_payload(rows=n)` raises for every `n < 8`. Cosmetic.**
+`IndexError: list assignment index out of range`. It is the fixture generator QA is pointed
+at; it should not have an undocumented lower bound.
+*(`test_sample_payload_works_for_a_small_row_count`)*
+
+### Non-findings worth recording
+
+* **`method="whalley_wilmott"` ignores `policy=`.** Deliberate and correct: WW is reported
+  on its own terms with the edge constant, badged `policy="edge"`, with the hedge-to-target
+  figure (1.587× wider) stated in the note. Pinned so nobody "fixes" it.
+* **`cap_candidates` returns 4 of the 7 documented rules**; R5, R6 and F are appended by
+  `recommend_cap` (R6 only for short gamma). Reachable, so not a defect — but the
+  docstring's "every rule" reads as a promise the function alone does not keep.
+* **`overnight_ladder` passes `cost_bp=` but not `cost_tier=` into `recommend_cap`.** A
+  caller on `cost_tier="interbank"` gets a retail-derived cap. Harmless today because the
+  default is retail on both sides; it is a live inconsistency the moment a tier is passed.
+
+## P3.5 Priority 3 — the units sweep
+
+`DeltaCap.binds_pct` holds **percent (0–100)** (measured 99.16 on the reference book, and
+equal to 100× the first-passage probability to 1e-9). `HedgeRule.band_pct` holds a
+**fraction** (0.25). Both are asserted, and `test_intraday_and_units.py` now sweeps **every**
+`_pct` identifier in `fxgamma/` and pins its units, failing on any new one that is not
+classified. The sweep found **twenty-five percent-valued names and three fraction-valued
+ones**:
+
+* **fractions:** `band_pct` (0.25 of gross), `delta_pct` (delta per 1 unit notional),
+  `step_sd_pct` (0.0007 = 0.07% per bar);
+* everything else is 0–100, including `zones.DEFAULT_BAND_PCT = 15.0` — which is the same
+  concept as `HedgeRule.band_pct` under the same suffix, **100× apart in units and a
+  different number**. `deltacap` handles it correctly (`DEFAULT_BAND_PCT / 100.0 * gross`),
+  but it is the single most likely place for the next 60× error and is now fenced.
+
+`fxgamma/reference.py` records a **fifth** percent-vs-fraction slip on this project in its
+own comment (`cap / Γ₁ / 100.0`, without which the band prints 1,805 pips instead of 18).
+That line now has a test.
+
+---
+
 **Pass 2 scope (this document).** The modules the first pass listed as untested and
 ranked as the highest-value gaps: `fxgamma/data/manual.py` (the primary mark path since
 amendment v1.2 T-1), `fxgamma/portfolio/` (`risk`, `zones`, `attribution`, `hedging`),

@@ -519,12 +519,26 @@ class TestSpacingDerivesFromTheDeltaCap:
         inner = min(rungs, key=lambda r: abs(r.pips_from_spot))
         assert inner.spacing_pips == pytest.approx(9.0, rel=1e-9)
 
-    def test_clip_floor_binds_before_the_analytic_optimum(self, on_mkt):
-        """The trader's point: the clip floor binds before the analytic optimum does."""
+    def test_the_clip_floor_binding_means_no_ladder_not_a_wide_one(self, on_mkt):
+        """The trader's point holds, but its consequence is the opposite of a wide ladder.
+
+        PM arbitration: this test and ``test_no_ladder_verdict_is_honoured_by_the_ladder_builder``
+        were written against the **same** 0.4mm/leg book and asserted opposite outcomes
+        (rungs with a "MIN CLIP" note, versus no rungs at all). They cannot both pass.
+
+        Measured: there is no book on which the clip floor binds *and* a ladder is
+        emitted. The boundary is sharp at about 1.0mm/leg -- below it ``no_ladder`` is
+        True, above it the delta cap binds. So the trader is right that the clip floor
+        binds before the analytic optimum, but when it binds the honest output is "do
+        not leave a ladder tonight", because the smallest dealable clip is then a large
+        fraction of the book's whole gamma. The no-ladder verdict wins.
+        """
+        dc = pytest.importorskip("fxgamma.portfolio.deltacap")
         small = _straddle("EURUSD", on_mkt.spot["EURUSD"], leg=0.4e6, prefix="tiny")
-        rungs = ov.overnight_ladder(small, on_mkt, "EURUSD")
-        assert rungs
-        assert "MIN CLIP" in rungs[0].note
+        assert dc.recommend_cap(small, on_mkt, "EURUSD").no_ladder
+        assert ov.overnight_ladder(small, on_mkt, "EURUSD") == []
+        bigger = _straddle("EURUSD", on_mkt.spot["EURUSD"], leg=10e6, prefix="big")
+        assert ov.overnight_ladder(bigger, on_mkt, "EURUSD")        # and above it, a ladder
 
     @pytest.mark.regression
     def test_emitted_clips_are_at_least_one_dealable_lot(self, on_mkt):

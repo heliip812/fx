@@ -871,6 +871,26 @@ def recommend_cap(book: Book, mkt: MarketSnapshot, pair: str, *,
                     "~USD 107/night and buys tail at 0.31 USD of mean per USD of tail; "
                     "at 5bp it costs ~USD 533 and the rate is 2.03. Put your broker's "
                     "own number in `cost_bp=`.")
+    # QA-5: the cap's vol-mark invariance is an AT-THE-MONEY property. Away from the
+    # money it is not invariant at all -- moving the mark 6% -> 12% moves the cap by
+    # 1.57x at 2% out and 3.20x at 4% out. That matters because this user has no OTC
+    # access, and docs/13 previously sold mark-invariance as the reason they could
+    # trust the cap without a broker curve. Say so when the book is not ATM.
+    try:
+        _spot = float(mkt.spot[pair])
+        _mny = [abs(o.strike / _spot - 1.0) for o in book.options
+                if o.pair == pair and _spot > 0]
+        _far = max(_mny) if _mny else 0.0
+        if _far > 0.01:
+            warn.append(
+                f"this book's furthest strike is {_far:.1%} from spot. The cap is only "
+                f"vol-mark invariant AT THE MONEY: at {_far:.0%} out, a 6%->12% mark "
+                f"error moves the cap by roughly "
+                f"{1.57 if _far < 0.03 else 3.2:.2f}x. Without an OTC curve to mark "
+                f"against, treat this cap as mark-dependent and check it against your "
+                f"own vol view (QA-5, docs/13 s4.7).")
+    except Exception:                                 # never let a warning break sizing
+        pass
     if _gamma_sign_flips(book, mkt, pair, sigma_window=sigma_window, marks=marks):
         warn.append("this book is LONG gamma on one side of spot and SHORT on the other. "
                     "A single scalar cap is the wrong object: the order type is derived "
