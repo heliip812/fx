@@ -670,14 +670,15 @@ class TestLabellingAndTheDriftlessNull:
 # =========================================================================== #
 # 8.  Crossover vol -- the go/no-go
 # =========================================================================== #
+@pytest.fixture(scope="module")
+def xo(ref_book, on_mkt):
+    return ov.crossover_vol(ref_book, on_mkt, "EURUSD")
+
+
 class TestCrossoverVol:
     """Required output per the amendment: the ATM at which the window breakeven
     equals the forecast range.  docs/09 measures EURUSD at **7.73%** against 7.96%
     marked, i.e. long gamma is negative overnight carry."""
-
-    @pytest.fixture(scope="class")
-    def xo(self, ref_book, on_mkt):
-        return ov.crossover_vol(ref_book, on_mkt, "EURUSD")
 
     def test_eurusd_weeknight_crossover_is_773pct(self, xo):
         assert xo["crossover_vol"] == pytest.approx(0.0773, abs=0.0008)
